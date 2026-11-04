@@ -22,6 +22,15 @@ Use those files when an exact default or allowed range matters; this document
 records the decisions behind the settings rather than copying a second mutable
 inventory.
 
+## Custom VM executor
+
+`EXECUTOR_KIND=kata` opts newly opened workspaces into the persistent VM backend;
+`docker` retains the upstream executor. Existing workspace backend choices remain
+persisted. The Kata shim must be installed on the Docker host; there is no runc
+fallback. `VM_MEMORY_MIB` and `VM_CPUS` configure new VM limits. See the
+[custom fork guide](custom-fork.md#persistent-vm-executor) for lifecycle and storage
+semantics and the tracked installation/smoke scripts.
+
 ## Authentication and request policy
 
 `AUTH_MODE` selects one mutually exclusive deployment contract:

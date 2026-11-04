@@ -175,8 +175,8 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
       return { ok: true, message: 'Workspace status retrieved', data: await this.describe(member), truncated: false };
     }
 
-    if (operation === 'workspace_recover' && input.mode === 'recreate') {
-      return failure('NOT_SUPPORTED', 'Local workspaces have no executor container to recreate');
+    if (operation === 'workspace_recover' && (input.mode === 'recreate' || input.mode === 'stop')) {
+      return failure('NOT_SUPPORTED', 'Local workspaces have no remote executor to stop or recreate');
     }
     if (operation === 'workspace_recover' && member.backend.closed) {
       member = this.pool.reopen(member);

@@ -76,3 +76,18 @@ and the errors you may see are in [Troubleshooting](/troubleshooting#_32-agent-s
 1. **Keep Secrets Local:** Never paste API keys into prompts, git commits, or shared project configs.
 2. **Use Environment Variables:** Reference tokens via environment variable substitution (e.g. `$CLOUD_HARNESS_MCP_TOKEN`) in tool config files whenever supported.
 3. **Approval Modes:** For tools modifying the filesystem or Git (`files_write`, `git_push`), configure your AI client to require interactive confirmation before execution.
+
+## Custom fork VM workspaces
+
+When `workspace_status` reports `executorKind: "kata"`, install project tools and
+dependencies directly with `exec_run`, including guest `sudo apt-get`. Managed
+package approval and executor recreation are not needed for these installs.
+The reported network profile still applies: dependency-access permits public
+DNS and HTTP/S; network-none remains offline.
+
+Finish active tasks and terminals, then use `workspace_recover` with `mode: "stop"`
+to retain the VM and its installed software. `mode: "resume"` starts that same
+machine. Compute expiry retains disks; `workspace_close` explicitly deletes them.
+Existing Docker workspaces keep their previous lifecycle. Read the skill shipped
+with the custom server and check the live schema; a cached upstream tool catalog
+may not expose the new stop mode.

@@ -13,6 +13,32 @@
 
 ## Added behavior
 
+### Persistent VM executor
+
+The opt-in `EXECUTOR_KIND=kata` backend uses Docker's Kata shim with a separate
+guest kernel, writable root, guest sudo and retained installed software. New
+workspaces snapshot the backend; existing Docker workspaces are not converted.
+Use direct guest package-manager commands without per-package managed approval.
+The existing host-attested network profiles still apply. Root privileges inside
+the guest do not grant the host Docker socket or control-plane credentials.
+
+`workspace_recover` mode `stop` retains a VM; `resume` starts it. Compute expiry
+stops rather than deletes a VM, and a resumed stopped VM gets a new compute
+lease. `recreate` refuses VM replacement. Explicit `workspace_close` deletes the
+retained executor and workspace. Resource ceilings include the writable root
+layer plus workspace mounts; the storage ceiling remains soft, with periodic
+measurement, not a block-device reservation. Stopped VMs consume host disk.
+
+`VM_MEMORY_MIB` and `VM_CPUS` bound new VM executors. Source defaults are 4096 MiB
+and 2 CPUs; Docker and toolbox limits remain unchanged. The separate-kernel
+probe and exact Kata runtime check fail closed. Missing retained machines require
+operator recovery rather than creating an empty replacement.
+
+Operator artifacts are `custom/install-kata-runtime.sh`,
+`custom/prepare-vm-network.sh`, and `custom/smoke-kata-runtime.sh`. Runtime
+installation and a smoke pass alone do not activate this backend in production.
+
+
 ### Approved project dependency downloads
 
 The custom branch also supports `dependencies_plan`, `dependencies_apply` and

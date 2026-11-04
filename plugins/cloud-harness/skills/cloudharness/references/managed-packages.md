@@ -1,5 +1,12 @@
 # Managed toolbox packages
 
+For custom workspaces reporting `executorKind: "kata"`, install tools and project
+dependencies directly through `exec_run` in the VM (`sudo apt-get`, `pnpm install`,
+`go mod download`, `cargo`, etc.). These guest-local installs need no managed
+package plan, mount refresh or Dependency downloads approval. Check the actual
+network profile and command exit code. The approval workflows below remain for
+Docker workspaces and the shared toolbox; they do not install into a VM.
+
 Use these for a CLI tool you want in every new workspace and in the `bash`
 toolbox target, kept across workspace recreation and redeploys. For a
 project dependency, use the approved Go/pnpm cache workflow below when the

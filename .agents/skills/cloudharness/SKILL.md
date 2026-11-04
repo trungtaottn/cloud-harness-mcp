@@ -11,6 +11,19 @@ This skill guides effective and safe tool use; it does not grant credentials,
 host access, Docker authority, deployment authority, or permission to weaken
 network isolation.
 
+## Custom persistent VM workspaces
+
+Inspect `workspace_status` first. When `executorKind` is `kata`, the workspace
+has a separate guest kernel and writable retained root filesystem. Use ordinary
+`exec_run` for `sudo apt-get`, project package managers and toolchain installs;
+per-package managed approval is not required for those guest-local installs.
+Use the reported network profile: dependency-access permits public DNS and TCP
+80/443; network-none remains offline. Never change a profile to fix installation.
+Finish tasks and terminals before `workspace_recover` mode `stop`; `resume` starts
+the same retained VM. Expiry stops compute and preserves files and installs.
+`recreate` is refused for VMs; `workspace_close` explicitly deletes retained state.
+Existing Docker workspaces keep the managed-package and recreation workflow below.
+
 ## Read the relevant reference
 
 | Need | Read |

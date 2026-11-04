@@ -514,9 +514,9 @@ export class LocalWorkspaceBackend implements OperationBackend {
         };
       }
       const mode = (input.mode as string | undefined) ?? 'resume';
-      if (mode === 'recreate') {
-        return { ok: false, message: 'Local workspaces have no executor container to recreate',
-          error: { code: 'NOT_SUPPORTED', message: 'Local workspaces have no executor container to recreate', retryable: false }, truncated: false };
+      if (mode === 'recreate' || mode === 'stop') {
+        return { ok: false, message: 'Local workspaces have no remote executor to stop or recreate',
+          error: { code: 'NOT_SUPPORTED', message: 'Local workspaces have no remote executor to stop or recreate', retryable: false }, truncated: false };
       }
       if (mode === 'resume') {
         return {

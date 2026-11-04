@@ -10,6 +10,7 @@ COPY packages/contracts/src ./packages/contracts/src
 RUN npm run build -w @cloud-harness/contracts && npm run build -w @cloud-harness/runner && npm prune --omit=dev
 
 FROM node:24.11.0-alpine3.22
+LABEL io.cloud-harness.vm-workspaces="1"
 RUN apk add --no-cache docker-cli tini
 ENV NODE_ENV=production
 WORKDIR /app

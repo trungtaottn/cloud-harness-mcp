@@ -20,7 +20,11 @@ does not prove production activation; verify the deployed image and contract.
   Managed npm/uv packages, the separate Go/Rust executor and dependency egress
   are separate concerns. The custom storage setting is a soft workspace disk
   ceiling, not a RAM limit or a hard filesystem reservation.
-- For missing project dependencies, use the custom `dependencies_plan` →
+- First check the workspace backend. Custom `executorKind: kata` workspaces
+  install directly through guest package managers and guest sudo; do not request
+  managed-package mounts or dependency approvals for these installs. Use recover
+  stop/resume for retained compute, never recreate. Explicit close deletes data.
+- For missing project dependencies in Docker workspaces, use the custom `dependencies_plan` →
   Dashboard approval → `dependencies_apply`/`dependencies_status` workflow.
   Keep the workspace network profile unchanged; ordinary dependency updates
   require a new approved plan, not an operator image rebuild. CLI packages and

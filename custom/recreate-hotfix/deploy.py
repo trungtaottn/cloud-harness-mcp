@@ -53,7 +53,7 @@ def update_settings(text, settings):
     return kept.rstrip('\n') + '\n' + ''.join(f'{key}={value}\n' for key, value in settings.items())
 
 
-def dependency_configuration(runtime_text, proxy_text):
+def dependency_configuration(runtime_text, proxy_text, vm=False):
     if setting_value(runtime_text, 'AUTH_MODE') != 'cloudflare-access':
         raise RuntimeError('Dependency activation requires Dashboard approval-capable cloudflare-access authentication')
     settings = {'MAX_WORKSPACE_BYTES': '10737418240', 'DEPENDENCIES_ENABLED': 'true'}
@@ -65,6 +65,9 @@ def dependency_configuration(runtime_text, proxy_text):
         if not re.fullmatch(r'[0-9]+', raw) or not minimum <= int(raw) <= maximum:
             raise RuntimeError(f'Invalid configuration range for {key}')
         settings[key] = str(int(raw))
+    if vm:
+        settings.update({'EXECUTOR_KIND': 'kata', 'VM_MEMORY_MIB': '4096', 'VM_CPUS': '2',
+                         'WORKSPACE_NETWORK_PROFILE': 'dependency-access'})
     hosts = {host.strip().lower() for host in setting_value(proxy_text, 'PACKAGES_PROXY_HOSTS').split(',') if host.strip()}
     label = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
     if any(len(host) > 253 or not re.fullmatch(label + r'(?:\.' + label + r')+', host)
@@ -118,6 +121,11 @@ def rollback(*, acquire_lock=True):
         return
     saved = json.loads(MARKER.read_text())
     backup = Path(saved['backup'])
+    if saved.get('vm_activation'):
+        retained = run('docker', 'ps', '-a', '--filter', 'label=cloud-harness.executor=kata',
+                       '--filter', 'label=cloud-harness.managed=true', '--format', '{{.Names}}', capture=True).stdout.strip()
+        if retained:
+            raise RuntimeError('Rollback to a pre-VM runner is blocked while retained VMs exist. Keep the new runner and recover forward; do not remove VM disks.')
     run('systemctl', 'stop', UNIT)
     replace_file(CONFIG, (backup / 'runtime.env').read_text())
     # Old recovery markers predate proxy changes and must leave that configuration alone.
@@ -158,16 +166,22 @@ def apply():
             if path.is_symlink():
                 raise RuntimeError('Refusing symlinked deployment configuration or metadata')
         proxy_existed = PROXY_CONFIG.exists()
-        runtime_text, proxy_text = dependency_configuration(CONFIG.read_text(), PROXY_CONFIG.read_text() if proxy_existed else '')
+        runtime_text, proxy_text = dependency_configuration(CONFIG.read_text(), PROXY_CONFIG.read_text() if proxy_existed else '', vm='--vm' in sys.argv)
+        if '--vm' in sys.argv:
+            run('bash', str(Path(__file__).with_name('smoke-kata-runtime.sh')), setting_value(runtime_text, 'EXECUTOR_IMAGE') or 'cloud-harness-executor:local')
         for image in images.values():
             run('docker', 'image', 'inspect', image, capture=True)
         # Do not interrupt an executor with active commands or interactive sessions.
         containers = run('docker', 'ps', '--filter', 'name=cloud-harness-ws-', '--format', '{{.Names}}', capture=True).stdout.splitlines()
         for container in containers:
             # Docker needs PID to associate host processes with this container.
-            rows = run('docker', 'top', container, '-eo', 'pid,args', capture=True).stdout.splitlines()[1:]
+            runtime = run('docker', 'inspect', container, '--format', '{{.HostConfig.Runtime}}', capture=True).stdout.strip()
+            if runtime == 'io.containerd.kata.v2':
+                rows = run('docker', 'exec', container, 'ps', '-eo', 'pid,args', capture=True).stdout.splitlines()[1:]
+            else:
+                rows = run('docker', 'top', container, '-eo', 'pid,args', capture=True).stdout.splitlines()[1:]
             commands = [row.strip().split(None, 1)[1] for row in rows]
-            if any(command.strip() not in ('sleep infinity', '/usr/bin/tini -- sleep infinity', 'tini -- sleep infinity') for command in commands):
+            if any(command.strip() not in ('sleep infinity', '/usr/bin/tini -- sleep infinity', 'tini -- sleep infinity', 'ps -eo pid,args') for command in commands):
                 raise RuntimeError('A workspace has live processes; pause work and close its terminals before deployment')
         for label in ('cloud-harness.agent-container=true', 'cloud-harness.ephemeral=true'):
             active_sidecars = run(
@@ -197,9 +211,19 @@ def apply():
                 metadata.append(name)
         previous = {service: run('docker', 'inspect', f'cloud-harness-mcp-{service}-1', '--format', '{{.Image}}', capture=True).stdout.strip() for service in images}
         MARKER.write_text(json.dumps({'backup': str(backup), 'images': previous, 'metadata': metadata,
-                                      'managed_metadata': list(RELEASE_METADATA), 'proxy_existed': proxy_existed}))
+                                      'managed_metadata': list(RELEASE_METADATA), 'proxy_existed': proxy_existed, 'vm_activation': '--vm' in sys.argv}))
         print(f'Backup: {backup}', flush=True)
         try:
+            if '--vm' in sys.argv:
+                guard_dir = Path('/usr/local/lib/cloud-harness')
+                guard_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+                for source, target in (('guard-vm-runner.py', 'guard-vm-runner.py'), ('setup-vm-firewall.sh', 'setup-vm-firewall.sh')):
+                    shutil.copy2(Path(__file__).with_name(source), guard_dir / target)
+                    os.chmod(guard_dir / target, 0o755)
+                dropin = Path('/etc/systemd/system/cloud-harness-mcp.service.d')
+                dropin.mkdir(mode=0o755, parents=True, exist_ok=True)
+                replace_file(dropin / 'vm-compatibility.conf', '[Service]\nExecStartPre=/usr/bin/python3 /usr/local/lib/cloud-harness/guard-vm-runner.py\n')
+                run('systemctl', 'daemon-reload')
             replace_file(CONFIG, runtime_text)
             replace_file(PROXY_CONFIG, proxy_text)
             for service, image in images.items():
@@ -213,7 +237,7 @@ def apply():
             run('docker', 'exec', 'cloud-harness-mcp-api-1', 'node', '--input-type=module', '-e',
                 "import {TOOL_SCHEMA_BY_NAME as t} from '@cloud-harness/contracts';"
                 "const workspaceId='ws_'+ 'a'.repeat(32),planId='dep_'+ 'a'.repeat(32),planDigest='a'.repeat(64);"
-                "t.workspace_recover.parse({mode:'recreate'});"
+                "t.workspace_recover.parse({mode:'recreate'});t.workspace_recover.parse({mode:'stop'});"
                 "for(const ecosystem of ['go','pnpm'])t.dependencies_plan.parse({workspaceId,ecosystem});"
                 "t.dependencies_apply.parse({workspaceId,planId,planDigest});"
                 "t.dependencies_status.parse({workspaceId});console.log('recreate and dependency schemas: ready')")
@@ -225,6 +249,9 @@ def apply():
                 "s.shape.dependenciesMaxBytes.parse(e.DEPENDENCIES_MAX_BYTES);"
                 "s.shape.dependenciesTimeoutMs.parse(e.DEPENDENCIES_TIMEOUT_MS);"
                 "console.log('dependency configuration and 10 GiB workspace quota: ready')")
+            if '--vm' in sys.argv:
+                run('docker', 'exec', 'cloud-harness-mcp-runner-1', 'node', '-e',
+                    "if(process.env.EXECUTOR_KIND!=='kata'||process.env.VM_MEMORY_MIB!=='4096'||process.env.VM_CPUS!=='2')process.exit(1);console.log('VM executor configuration ready')")
             run('docker', 'exec', 'cloud-harness-mcp-provisioning-proxy-1', 'node', '-e',
                 "const hosts=new Set((process.env.PACKAGES_PROXY_HOSTS||'').split(','));"
                 "if(!['registry.npmjs.org','proxy.golang.org','sum.golang.org','storage.googleapis.com'].every(h=>hosts.has(h)))process.exit(1);"
@@ -239,7 +266,7 @@ def apply():
             # The upstream source revision stays unchanged; record this local overlay separately.
             (STATE / 'workspace-recreate-hotfix.json').write_text(json.dumps({'upstream': RELEASE, 'images': images, 'backup': str(backup)}))
             MARKER.unlink()
-            print('Local recreate and approved dependency workflow active; workspace storage ceiling is 10 GiB.', flush=True)
+            print('Custom overlay active; VM backend enabled for new workspaces.' if '--vm' in sys.argv else 'Local recreate and approved dependency workflow active; workspace storage ceiling is 10 GiB.', flush=True)
         except BaseException:
             rollback(acquire_lock=False)
             raise
@@ -261,10 +288,15 @@ def launch():
         installed.mkdir(mode=0o700, exist_ok=True)
         for name in ('deploy.py', 'verified-images.json'):
             shutil.copy2(Path(__file__).with_name(name), installed / name)
+        smoke_source = Path(__file__).parent.parent / 'smoke-kata-runtime.sh'
+        if '--vm' in sys.argv:
+            shutil.copy2(smoke_source, installed / 'smoke-kata-runtime.sh')
+            shutil.copy2(Path(__file__).parent.parent / 'guard-vm-runner.py', installed / 'guard-vm-runner.py')
+            shutil.copy2(Path(__file__).parent.parent.parent / 'deploy/scripts/setup-dependency-firewall.sh', installed / 'setup-vm-firewall.sh')
         run('systemd-run', '--wait', '--collect', '--unit=cloud-harness-workspace-recreate',
             '--property=KillMode=mixed', '--property=TimeoutStopSec=300',
             f'--property=ExecStopPost=/usr/bin/python3 {installed}/deploy.py --recover',
-            '/usr/bin/python3', str(installed / 'deploy.py'), '--apply')
+            '/usr/bin/python3', str(installed / 'deploy.py'), '--apply', *(['--vm'] if '--vm' in sys.argv else []))
 
 
 def main():

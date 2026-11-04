@@ -753,7 +753,7 @@ const schemas = {
   workspace_capabilities: z.object(workspace),
   workspace_close: z.object(workspace),
   workspace_lease_renew: z.object({ ...workspace, extensionSeconds: z.number().int().min(60).max(86_400).optional() }),
-  workspace_recover: z.object({ ...workspace, mode: z.enum(['resume', 'recreate', 'status', 'patch', 'export']).default('resume'), targetBranch: gitArgument.optional() }),
+  workspace_recover: z.object({ ...workspace, mode: z.enum(['resume', 'recreate', 'stop', 'status', 'patch', 'export']).default('resume'), targetBranch: gitArgument.optional() }),
   workspace_context: z.object({
     ...workspace,
     clientProfile: z.enum(['all', 'claude', 'codex', 'cursor', 'aider']).default('all'),
@@ -1232,7 +1232,7 @@ const descriptions: Record<RunnerOperation, string> = {
   workspace_capabilities: 'Inspect workspace and repository authorization capabilities (including issue and pull request operations mapped to github_action) without modifying state or minting tokens. githubRepositoryCreate reports whether github_repository_create is available and for which organizations; called without a workspaceId when no workspace is active, it returns only that principal-level block (workspaceId: null).',
   workspace_close: 'Stop a workspace executor and permanently remove all workspace files, including unpushed commits.',
   workspace_lease_renew: 'Explicitly renew the workspace idle lease duration or reactivate a recoverable expired workspace. Renewal never passes hardExpiresAt; when the requested extension would pass it, the result sets leaseCapped: true with requestedExpiresAt and a leaseWarnings entry.',
-  workspace_recover: 'Recover a retained workspace, explicitly recreate an idle executor to mount current packages, or inspect, patch, or export unpushed work. mode recreate preserves files, package scope and network profile, rejects busy workspaces, and discards ephemeral container and terminal state.',
+  workspace_recover: 'Recover a retained workspace. For a Kata VM, mode stop retains installed software and files, resume starts the same VM, and recreate is unsupported; install tools directly inside the VM. For a Docker workspace, explicitly recreate an idle executor to mount current packages, or inspect, patch, or export unpushed work. mode recreate preserves files, package scope and network profile, rejects busy workspaces, and discards ephemeral container and terminal state.',
   workspace_context: 'Read the active workspace ID, branch, lease time, Git identity, and repository overview.',
   workspace_set_active: 'Set the caller preferred active workspace when multiple workspaces exist.',
   workspace_finalize: 'Transactionally stage changes, run preflights, commit with default or explicit identity, and push to remote in one call.',

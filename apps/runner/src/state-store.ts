@@ -158,6 +158,7 @@ export type WorkspaceRecord = {
   environmentId: string | null;
   status: 'CREATING' | 'ACTIVE' | 'REAPING' | 'CLOSED' | 'FAILED' | 'EXPIRED_RECOVERABLE' | 'NETWORK_QUARANTINED';
   networkProfile: ExecutorNetworkProfile;
+  executorKind?: 'kata';
   createdAt: number;
   lastActivityAt: number;
   expiresAt: number;
@@ -179,7 +180,7 @@ export type WorkspaceRecord = {
 };
 
 /** Changes a fenced lifecycle write may apply to one workspace row. */
-type FencedWorkspaceChanges = Partial<Pick<WorkspaceRecord, 'containerName' | 'status' | 'lastActivityAt' | 'expiresAt' | 'generation' | 'error' | 'expiredAt' | 'recoverableUntil'>>;
+type FencedWorkspaceChanges = Partial<Pick<WorkspaceRecord, 'containerName' | 'status' | 'lastActivityAt' | 'expiresAt' | 'hardExpiresAt' | 'generation' | 'error' | 'expiredAt' | 'recoverableUntil'>>;
 
 /** Dashboard overrides of the workspace lifecycle policy. `null` means the runner configuration applies. */
 export type WorkspaceLifecycleOverrides = {
@@ -293,6 +294,7 @@ const fromPrivilegeGrantRow = (row: PrivilegeGrantRow): PrivilegeGrantRecord => 
 });
 
 type Row = {
+  executor_kind?: string;
   id: string; owner_id: string; idempotency_key: string; repository_url: string; repository_ref: string | null;
   container_name: string | null; workspace_path: string; environment_id?: string | null; status: WorkspaceRecord['status']; network_profile: ExecutorNetworkProfile;
   created_at: number; last_activity_at: number; expires_at: number; hard_expires_at?: number | null;
@@ -343,6 +345,7 @@ function withRecoverableWindow(current: WorkspaceRecord, changes: Partial<Worksp
 }
 
 const fromRow = (row: Row): WorkspaceRecord => ({
+  ...(row.executor_kind === 'kata' ? { executorKind: 'kata' as const } : {}),
   id: row.id, ownerId: row.owner_id, idempotencyKey: row.idempotency_key, repositoryUrl: row.repository_url,
   repositoryRef: row.repository_ref, containerName: row.container_name, workspacePath: row.workspace_path,
   environmentId: row.environment_id ?? null,
@@ -534,6 +537,10 @@ export class StateStore {
       this.database.exec('ALTER TABLE comment_idempotency ADD COLUMN fingerprint TEXT;');
     }
     migratePrincipalSchema(this.database);
+    const executorColumns = this.database.prepare('PRAGMA table_info(workspaces)').all() as { name: string }[];
+    if (!executorColumns.some((column) => column.name === 'executor_kind')) {
+      this.database.exec("ALTER TABLE workspaces ADD COLUMN executor_kind TEXT NOT NULL DEFAULT 'docker' CHECK(executor_kind IN ('docker','kata'));");
+    }
     // One-way migration. A database written by an earlier release may still carry
     // the retired single-active index, including via the former v5->v6 upgrade
     // path, and it cannot be re-created once an owner legally holds two counted
@@ -558,8 +565,8 @@ export class StateStore {
 
   create(record: WorkspaceRecord): void {
     this.database.prepare(`INSERT INTO workspaces
-      (id, owner_id, idempotency_key, repository_url, repository_ref, container_name, workspace_path, environment_id, status, network_profile, created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, generation, error, request_fingerprint, idle_ttl_seconds, recoverable_grace_seconds, expired_at, recoverable_until)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      (id, owner_id, idempotency_key, repository_url, repository_ref, container_name, workspace_path, environment_id, status, network_profile, created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, generation, error, request_fingerprint, idle_ttl_seconds, recoverable_grace_seconds, expired_at, recoverable_until, executor_kind)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) `)
       .run(
         record.id,
         record.ownerId,
@@ -584,7 +591,8 @@ export class StateStore {
         record.idleTtlSeconds ?? null,
         record.recoverableGraceSeconds ?? null,
         record.expiredAt ?? null,
-        record.recoverableUntil ?? null
+        record.recoverableUntil ?? null,
+        record.executorKind ?? 'docker'
       );
   }
 
@@ -1103,7 +1111,7 @@ export class StateStore {
    * first. Each one costs a close check, so a reaper pass takes a bounded batch and the rest wait.
    */
   listAutoCloseDue(now: number, limit = 10): Array<{ id: string; generation: number }> {
-    return this.database.prepare(`SELECT id, generation FROM workspaces WHERE status = 'EXPIRED_RECOVERABLE'
+    return this.database.prepare(`SELECT id, generation FROM workspaces WHERE status = 'EXPIRED_RECOVERABLE' AND executor_kind != 'kata'
       AND (mutation_locked_until IS NULL OR mutation_locked_until <= ?)
       AND COALESCE(recoverable_until, last_activity_at + COALESCE(recoverable_grace_seconds, ?) * 1000) <= ?
       ORDER BY COALESCE(recoverable_until, last_activity_at) ASC LIMIT ?`)
@@ -1298,9 +1306,9 @@ export class StateStore {
     const next = withRecoverableWindow(current, changes);
     // The status allowlist travels as one parameter and is expanded by SQLite, so the statement text is
     // constant no matter how many statuses are passed and nothing is ever interpolated into it.
-    const result = this.database.prepare(`UPDATE workspaces SET container_name=?, status=?, last_activity_at=?, expires_at=?, generation=?, error=?, expired_at=?, recoverable_until=?
+    const result = this.database.prepare(`UPDATE workspaces SET container_name=?, status=?, last_activity_at=?, expires_at=?, hard_expires_at=?, generation=?, error=?, expired_at=?, recoverable_until=?
       WHERE id=? AND generation=? AND status IN (SELECT value FROM json_each(?))`)
-      .run(next.containerName, next.status, next.lastActivityAt, next.expiresAt, next.generation, next.error, next.expiredAt ?? null, next.recoverableUntil ?? null, id, expectedGeneration, JSON.stringify(expectedStatuses));
+      .run(next.containerName, next.status, next.lastActivityAt, next.expiresAt, next.hardExpiresAt, next.generation, next.error, next.expiredAt ?? null, next.recoverableUntil ?? null, id, expectedGeneration, JSON.stringify(expectedStatuses));
     return result.changes === 1 ? next : undefined;
   }
 

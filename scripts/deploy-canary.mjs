@@ -130,6 +130,20 @@ try {
     arguments: { workspaceId, command: 'id -u && test ! -w /etc', cwd: '.', timeoutMs: 10_000, maxOutputBytes: 65_536 }
   }), 'exec_run');
   if (!JSON.stringify(execution).includes('10001')) throw new Error('canary executor user mismatch');
+  if (opened.executorKind === 'kata') {
+    const installed = toolData(await rpc('tools/call', {
+      name: 'exec_run', arguments: { workspaceId, command: "sudo -n sh -c 'echo vm-retained > /usr/local/share/ch-canary'", timeoutMs: 10000 }
+    }), 'exec_run');
+    if (installed.exitCode !== 0) throw new Error('VM canary guest install failed');
+    toolData(await rpc('tools/call', { name: 'workspace_recover', arguments: { workspaceId, mode: 'stop' } }), 'workspace_recover');
+    toolData(await rpc('tools/call', { name: 'workspace_recover', arguments: { workspaceId, mode: 'resume' } }), 'workspace_recover');
+    const retained = toolData(await rpc('tools/call', {
+      name: 'exec_run', arguments: { workspaceId, command: 'cat /usr/local/share/ch-canary', timeoutMs: 10000 }
+    }), 'exec_run');
+    if (retained.exitCode !== 0 || !retained.output.includes('vm-retained')) throw new Error('VM canary root disk was not retained');
+    console.log('deploy-canary-vm=retained-root-pass');
+  }
+
   toolData(await rpc('tools/call', { name: 'workspace_close', arguments: { workspaceId } }), 'workspace_close');
   workspaceId = undefined;
 } finally {

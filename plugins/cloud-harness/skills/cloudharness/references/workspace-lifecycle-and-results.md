@@ -3,9 +3,16 @@
 Every operation outside workspace listing/opening requires the exact opaque
 `workspaceId` returned by Cloud Harness. A workspace is owner-bound, and a
 principal may hold several concurrent counted workspaces up to the instance's
-configured `MAX_ACTIVE_WORKSPACES_PER_OWNER` limit; each is removed by close or TTL
-expiry. Pass `workspaceId` on every operation whenever more than one workspace is
+configured `MAX_ACTIVE_WORKSPACES_PER_OWNER` limit. Docker executors expire under
+the lease policy; custom Kata VMs stop compute and retain their disks. Pass `workspaceId` on every operation whenever more than one workspace is
 counted: an implicit target is refused with `CONFLICT` when it would be ambiguous.
+
+## Persistent VM lifecycle in the custom fork
+`executorKind: "kata"` means installs and files persist across compute expiry.
+Use guest package managers directly; see the [VM guidance](../SKILL.md#custom-persistent-vm-workspaces).
+After tasks/terminals finish, recover mode `stop` retains the VM; `resume` starts it with a new compute lease.
+`recreate` is refused; `workspace_close` explicitly deletes the retained VM and data.
+Missing VMs or quota-stopped VMs may need operator recovery. Docker/local behavior below is unchanged.
 
 ## Local workspaces
 

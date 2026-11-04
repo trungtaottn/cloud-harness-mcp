@@ -40,6 +40,7 @@ import {
   type WorkspaceLifecycleSettingsView,
   TERMINAL_MAX_INPUT_BYTES
 } from '@cloud-harness/contracts';
+import { assertVmExecutor, stopVmExecutor, VM_RUNTIME, vmLaunchArgs, vmWritableBytes } from './vm-executor.js';
 import { inspectContainer, removeContainer, runDocker, terminateContainerProcessGroup } from './docker-engine.js';
 import { EXECUTOR_HARDENING_ARGS, EXECUTOR_RESOURCE_CEILINGS, TOOLBOX_STALE_AFTER_MS, managedPathEnvArgs, reapStaleToolboxContainers, runToolboxCommand, toolboxContainerName, withManagedBins, type ToolboxRunResult } from './toolbox-runner.js';
 import { DependencyBuilder } from './dependency-builder.js';
@@ -221,13 +222,13 @@ function publicRecord(record: WorkspaceRecord, capabilities?: WorkspaceCapabilit
   const now = Date.now();
   const remainingLeaseMs = Math.max(0, record.expiresAt - now);
   const hardRemainingMs = Math.max(0, record.hardExpiresAt - now);
-  const canRenewLease = (record.status === 'ACTIVE' || record.status === 'EXPIRED_RECOVERABLE') && hardRemainingMs > 60_000;
+  const canRenewLease = (record.status === 'ACTIVE' || record.status === 'EXPIRED_RECOVERABLE') && (record.executorKind === 'kata' || hardRemainingMs > 60_000);
   let leaseState: 'ACTIVE' | 'WARNING' | 'EXPIRED_RECOVERABLE' | 'EXPIRED' = 'ACTIVE';
   const leaseWarnings: string[] = [];
 
   if (record.status === 'EXPIRED_RECOVERABLE') {
     leaseState = 'EXPIRED_RECOVERABLE';
-    leaseWarnings.push('Workspace lease has expired. Work is retained in recoverable grace state.');
+    leaseWarnings.push(record.executorKind === 'kata' ? 'VM compute lease ended. Installed software and files remain until explicit workspace_close; use resume to start.' : 'Workspace lease has expired. Work is retained in recoverable grace state.');
   } else if (record.status === 'NETWORK_QUARANTINED') {
     leaseState = 'EXPIRED';
     leaseWarnings.push('Workspace is quarantined due to network security policy drift. Work is retained and recoverable after policy reconciliation.');
@@ -248,6 +249,7 @@ function publicRecord(record: WorkspaceRecord, capabilities?: WorkspaceCapabilit
     ref: record.repositoryRef,
     status: record.status,
     networkProfile: record.networkProfile,
+    ...(record.executorKind === 'kata' ? { executorKind: 'kata', installedSoftwareRetained: true } : {}),
     createdAt: new Date(record.createdAt).toISOString(),
     lastActivityAt: new Date(record.lastActivityAt).toISOString(),
     expiresAt: new Date(record.expiresAt).toISOString(),
@@ -555,6 +557,43 @@ export class WorkspaceService {
     }
   }
 
+  private async reconcileVmWorkspace(record: WorkspaceRecord): Promise<void> {
+    if (record.status === 'REAPING') {
+      await this.suspendVmWorkspace(record, 'interrupted VM stop');
+      return;
+    }
+    if (record.status === 'CREATING' || !record.containerName || !(await inspectContainer(record.containerName))) {
+      this.store.updateFenced(record.id, record.generation, [record.status], {
+        status: 'EXPIRED_RECOVERABLE',
+        error: 'VM startup was interrupted or retained executor is missing; operator recovery required'
+      });
+      return;
+    }
+    if (record.status === 'NETWORK_QUARANTINED') {
+      await stopVmExecutor(record.containerName);
+      return;
+    }
+
+    const networkReady = record.networkProfile === 'network-none'
+      || (await this.networkProfileManager.checkAttestation().catch(() => ({ ok: false }))).ok;
+    if (!networkReady) {
+      this.store.updateFenced(record.id, record.generation, ['ACTIVE'], {
+        status: 'NETWORK_QUARANTINED',
+        error: 'dependency-access firewall unavailable'
+      });
+      await stopVmExecutor(record.containerName);
+      return;
+    }
+
+    // Lost task handles must not leave old commands running after a runner restart.
+    await stopVmExecutor(record.containerName);
+    if (record.expiresAt <= Date.now() || record.hardExpiresAt <= Date.now()) {
+      await this.suspendVmWorkspace(record, 'compute lease expired');
+    } else {
+      await this.resumeVmExecutor(record, false);
+    }
+  }
+
   async start(): Promise<void> {
     if (isMultiPrincipal(this.config.authMode)) {
       const legacyOwners = this.store.legacyWorkspaceOwnerIds();
@@ -577,6 +616,10 @@ export class WorkspaceService {
     }
     await mkdir(this.config.jobsRoot, { recursive: true, mode: 0o700 });
     for (const record of this.store.active()) {
+      if (record.executorKind === 'kata') {
+        await this.reconcileVmWorkspace(record);
+        continue;
+      }
       if (record.status === 'NETWORK_QUARANTINED') {
         if (record.containerName) {
           try {
@@ -738,7 +781,7 @@ export class WorkspaceService {
       const [name, workspaceId] = line.split('\t');
       if (!name) continue;
       const record = workspaceId ? this.store.byId(workspaceId) : undefined;
-      if (!record || !activeStatus.has(record.status) || record.containerName !== name) await removeContainer(name);
+      if (!record || (!activeStatus.has(record.status) && !(record.executorKind === 'kata' && record.status === 'EXPIRED_RECOVERABLE')) || record.containerName !== name) await removeContainer(name);
     }
 
     const helpers = await runDocker([
@@ -813,10 +856,10 @@ export class WorkspaceService {
   private markExpiredRecoverable(claimed: WorkspaceRecord, now: number): WorkspaceRecord | undefined {
     return this.store.updateFenced(claimed.id, claimed.generation, ['REAPING'], {
       status: 'EXPIRED_RECOVERABLE',
-      containerName: null,
+      containerName: claimed.executorKind === 'kata' ? claimed.containerName : null,
       lastActivityAt: now,
       expiredAt: now,
-      recoverableUntil: now + this.recoverableGraceSecondsFor(claimed) * 1_000
+      recoverableUntil: claimed.executorKind === 'kata' ? null : now + this.recoverableGraceSecondsFor(claimed) * 1_000
     });
   }
 
@@ -848,10 +891,11 @@ export class WorkspaceService {
         const claimed = this.store.claimForExpiry(record.id, record.generation);
         if (claimed) {
           this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
-          if (claimed.containerName) {
-            await removeContainer(claimed.containerName).catch(() => undefined);
+          if (claimed.executorKind === 'kata') await this.suspendVmWorkspace(claimed, 'workspace compute lease expired');
+          else {
+            if (claimed.containerName) await removeContainer(claimed.containerName).catch(() => undefined);
+            this.markExpiredRecoverable(claimed, now);
           }
-          this.markExpiredRecoverable(claimed, now);
         }
       }
     }
@@ -912,10 +956,11 @@ export class WorkspaceService {
   }
 
   private async resourceViolation(record: WorkspaceRecord): Promise<string | undefined> {
-    const bytes = await this.workspaceBytes(record);
+    let bytes = await this.workspaceBytes(record);
     if (bytes === undefined) {
       throw new HarnessError('UNAVAILABLE', 'workspace size could not be measured safely', 503, true);
     }
+    if (record.executorKind === 'kata' && record.containerName) bytes += await vmWritableBytes(record.containerName);
     if (bytes > this.config.maxWorkspaceBytes) return 'workspace soft size ceiling exceeded';
     const info = await statfs(this.config.jobsRoot);
     const freeBytes = Number(info.bavail) * Number(info.bsize);
@@ -925,6 +970,10 @@ export class WorkspaceService {
   private async enforceActiveLimits(record: WorkspaceRecord): Promise<void> {
     const violation = await this.resourceViolation(record);
     if (!violation) return;
+    if (record.executorKind === 'kata') {
+      await this.suspendVmWorkspace(record, violation);
+      throw new HarnessError('LIMIT_EXCEEDED', `${violation}; workspace execution stopped`, 507, false);
+    }
     await this.closeRecord(record, violation);
     throw new HarnessError('LIMIT_EXCEEDED', `${violation}; workspace was closed`, 507, false);
   }
@@ -1064,12 +1113,21 @@ export class WorkspaceService {
 
   private async createExecutor(record: WorkspaceRecord, repositoryPath: string, environment: Record<string, string> = {}): Promise<string> {
     const name = `cloud-harness-ws-${record.id.slice(3, 19).toLowerCase()}`;
+    const isVm = record.executorKind === 'kata';
+    const home = isVm ? '/home/harness' : '/tmp/cloud-harness-home';
     await removeContainer(name).catch(() => undefined);
     const { toolsPath, cachePath, ownerSkillsPath } = await this.provisionMountDirectories(record);
     // Recorded as the workspace's profile; later binding changes apply only when the executor is recreated.
-    const packageProfile = this.config.packagesEnabled === true
+    const packageProfile = !isVm && this.config.packagesEnabled === true
       ? this.packages.profileFor(record.ownerId, record.id)
       : { mounts: [], binDirs: [] };
+    const resolverMount: string[] = [];
+    if (isVm && record.networkProfile === 'dependency-access') {
+      // Docker's 127.0.0.11 resolver lives in the host netns, not in the guest.
+      const resolverFile = join(record.workspacePath, 'vm-resolv.conf');
+      await writeFile(resolverFile, (this.config.dependencyDnsResolvers ?? ['8.8.8.8', '1.1.1.1']).map((ip) => `nameserver ${ip}\n`).join(''), { mode: 0o644 });
+      resolverMount.push('--volume', `${resolverFile}:/etc/resolv.conf:ro`);
+    }
     const envEntries = Object.entries(environment);
     const envFilePath = join(record.workspacePath, `.env.injected-${randomBytes(6).toString('hex')}`);
     let useEnvFile = false;
@@ -1085,17 +1143,18 @@ export class WorkspaceService {
         'create', '--name', name,
         '--label', 'cloud-harness.managed=true', '--label', `cloud-harness.instance=${this.instanceId}`,
         '--label', `cloud-harness.workspace=${record.id}`,
-        ...EXECUTOR_HARDENING_ARGS, '--workdir', '/workspace',
+        ...(isVm ? vmLaunchArgs(this.config) : EXECUTOR_HARDENING_ARGS), '--workdir', '/workspace',
         ...networkArgs,
+        ...resolverMount,
         '--volume', `${repositoryPath}:/workspace:rw`,
         '--volume', `${toolsPath}:/opt/user-tools:rw`,
         '--volume', `${cachePath}:/var/cache/harness:rw`,
         '--volume', `${ownerSkillsPath}:/opt/cloud-harness/owner-skills:ro`,
         ...builtinSkillsMountArgs(this.config.builtinSkillsRoot),
         ...packageProfile.mounts.flatMap((mount) => ['--volume', `${mount.source}:${mount.target}:ro`]),
-        '--env', 'HOME=/tmp/cloud-harness-home',
+        '--env', `HOME=${home}`,
         '--env', 'GIT_CONFIG_NOSYSTEM=1',
-        '--env', 'XDG_CONFIG_HOME=/tmp/cloud-harness-home/.config',
+        '--env', `XDG_CONFIG_HOME=${home}/.config`,
         '--env', 'XDG_CACHE_HOME=/var/cache/harness',
         '--env', 'XDG_DATA_HOME=/opt/user-tools/data',
         '--env', 'NPM_CONFIG_PREFIX=/opt/user-tools',
@@ -1116,6 +1175,10 @@ export class WorkspaceService {
         await removeContainer(name);
         throw new HarnessError('UNAVAILABLE', `executor start failed: ${started.stderr}`.slice(0, 2_000), 502, true);
       }
+      if (isVm) {
+        try { await assertVmExecutor(name); }
+        catch (error) { await removeContainer(name); throw error; }
+      }
       return name;
     } finally {
       if (useEnvFile) {
@@ -1125,6 +1188,7 @@ export class WorkspaceService {
   }
 
   private async ensureActiveExecutor(record: WorkspaceRecord, recreate = false): Promise<WorkspaceRecord> {
+    if (record.executorKind === 'kata') return this.resumeVmExecutor(record, recreate);
     // Dependency-access requires a fresh attestation before reuse; a quarantined
     // record must never resume its existing container. Force removal and rebuild
     // through createExecutor (which re-attests) instead of reusing a container
@@ -1194,6 +1258,53 @@ export class WorkspaceService {
     return updated;
   }
 
+  private async resumeVmExecutor(record: WorkspaceRecord, recreate: boolean): Promise<WorkspaceRecord> {
+    if (recreate) throw new HarnessError('NOT_SUPPORTED', 'VM root disks are retained; use resume instead of recreate', 400, false);
+    if (!record.containerName) throw new HarnessError('UNAVAILABLE', 'Retained VM is missing; operator recovery is required', 503, false);
+    const inspection = await inspectContainer(record.containerName);
+    const host = inspection?.HostConfig as { Runtime?: string; NetworkMode?: string; Privileged?: boolean } | undefined;
+    const labels = (inspection?.Config as { Labels?: Record<string, string> } | undefined)?.Labels;
+    const expectedNetwork = record.networkProfile === 'network-none' ? 'none' : (this.config.dependencyNetworkName ?? 'cloud-harness-dependency-access');
+    if (host?.Runtime !== VM_RUNTIME || host.Privileged || host.NetworkMode !== expectedNetwork
+      || labels?.['cloud-harness.workspace'] !== record.id || labels?.['cloud-harness.instance'] !== this.instanceId) {
+      throw new HarnessError('UNAVAILABLE', 'Retained VM identity, runtime or network does not match; refusing replacement', 503, false);
+    }
+    await this.networkProfileManager.ensureProfileReady(record.networkProfile);
+    const violation = await this.resourceViolation(record);
+    if (violation) throw new HarnessError('LIMIT_EXCEEDED', `${violation}; retained VM was not resumed`, 507, false);
+    const wasRunning = (inspection?.State as { Running?: boolean } | undefined)?.Running === true;
+    if (!wasRunning) {
+      const started = await runDocker(['start', record.containerName], { timeoutMs: 60_000 });
+      if (started.exitCode !== 0) throw new HarnessError('UNAVAILABLE', 'Retained VM could not start', 503, true);
+    }
+    try {
+      await assertVmExecutor(record.containerName);
+      const updated = this.store.activateWithLimit(record.id, record.generation,
+        ['ACTIVE', 'EXPIRED_RECOVERABLE', 'NETWORK_QUARANTINED'],
+        { status: 'ACTIVE', error: null }, this.configuredActiveWorkspaceLimit());
+      if (!updated) throw new HarnessError('CONFLICT', 'VM lifecycle changed during resume', 409, true);
+      return updated;
+    } catch (error) {
+      if (!wasRunning) await stopVmExecutor(record.containerName);
+      if (error instanceof ActiveWorkspaceLimitReachedError) throw this.activeWorkspaceLimitError(error.active, error.limit);
+      throw error;
+    }
+  }
+
+  private async suspendVmWorkspace(record: WorkspaceRecord, reason: string): Promise<void> {
+    let claimed: WorkspaceRecord | undefined;
+    if (record.status === 'REAPING') {
+      claimed = record;
+    } else if (this.store.claimForReaping(record.id, record.generation, true)) {
+      claimed = this.store.byId(record.id);
+    }
+    if (!claimed) return;
+    this.operations.stopWorkspaceTerminals(claimed.id, reason);
+    if (claimed.containerName) await stopVmExecutor(claimed.containerName);
+    const stopped = this.markExpiredRecoverable(claimed, Date.now());
+    if (stopped) this.store.updateFenced(stopped.id, stopped.generation, ['EXPIRED_RECOVERABLE'], { error: reason });
+  }
+
   async open(ownerId: string, input: Record<string, unknown>): Promise<RunnerResponse> {
     const parsed = TOOL_SCHEMA_BY_NAME.workspace_open.parse(input);
     const requestFingerprint = computeWorkspaceOpenFingerprint(parsed);
@@ -1214,6 +1325,7 @@ export class WorkspaceService {
     const policy = this.effectiveLifecyclePolicy();
     const hardExpiresAt = now + policy.wallTtlSeconds * 1_000;
     const record: WorkspaceRecord = {
+      ...(this.config.executorKind === 'kata' ? { executorKind: 'kata' as const } : {}),
       id: workspaceId, ownerId, idempotencyKey: parsed.idempotencyKey, repositoryUrl: url.toString(),
       repositoryRef: parsed.ref ?? null, containerName: null, workspacePath: join(this.config.jobsRoot, workspaceId),
       environmentId: parsed.environmentId ?? null,
@@ -1742,10 +1854,11 @@ export class WorkspaceService {
       const claimed = this.store.claimForExpiry(record.id, record.generation);
       if (claimed) {
         this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
-        if (claimed.containerName) {
-          void removeContainer(claimed.containerName).catch(() => undefined);
+        if (claimed.executorKind === 'kata') void this.suspendVmWorkspace(claimed, 'workspace compute lease expired').catch(() => undefined);
+        else {
+          if (claimed.containerName) void removeContainer(claimed.containerName).catch(() => undefined);
+          this.markExpiredRecoverable(claimed, now);
         }
-        this.markExpiredRecoverable(claimed, now);
         throw new HarnessError('EXPIRED', 'workspace expired', 410);
       }
       return this.store.byId(record.id) ?? record;
@@ -2919,6 +3032,9 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   }
 
   private async recreateExecutor(record: WorkspaceRecord): Promise<RunnerResponse> {
+    if (record.executorKind === 'kata') {
+      throw new HarnessError('NOT_SUPPORTED', 'Persistent VM installs need no recreation. Use resume to start the retained VM; recreation would discard installed software.', 400, false);
+    }
     const now = Date.now();
     if (record.hardExpiresAt <= now) {
       throw new HarnessError('EXPIRED', 'Workspace hard lease limit reached; export retained work instead of recreating', 410);
@@ -3210,7 +3326,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         throw new HarnessError('CONFLICT', `workspace is ${rec.status.toLowerCase()}`, 409, true);
       }
       const now = Date.now();
-      if (rec.hardExpiresAt <= now) {
+      if (rec.executorKind !== 'kata' && rec.hardExpiresAt <= now) {
         throw new HarnessError('EXPIRED', 'Workspace hard lease limit reached and cannot be renewed', 410);
       }
       const isRecoverable = rec.status === 'EXPIRED_RECOVERABLE';
@@ -3230,7 +3346,8 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       try {
         const extSec = (validated.extensionSeconds as number) ?? this.idleTtlSecondsFor(rec);
         const requestedExpires = now + extSec * 1000;
-        const newExpires = Math.min(rec.hardExpiresAt, requestedExpires);
+        const hardExpiresAt = rec.executorKind === 'kata' && (isRecoverable || rec.hardExpiresAt <= now) ? now + this.config.wallTtlSeconds * 1000 : rec.hardExpiresAt;
+        const newExpires = Math.min(hardExpiresAt, requestedExpires);
         let activeRecord = rec;
         if (isRecoverable) {
           activeRecord = await this.ensureActiveExecutor(rec);
@@ -3241,7 +3358,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
             activeRecord.id,
             activeRecord.generation,
             ['ACTIVE', 'EXPIRED_RECOVERABLE'],
-            { status: 'ACTIVE', lastActivityAt: now, expiresAt: newExpires },
+            { status: 'ACTIVE', lastActivityAt: now, expiresAt: newExpires, hardExpiresAt },
             this.configuredActiveWorkspaceLimit()
           );
         } catch (error) {
@@ -3268,11 +3385,21 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       if (rec.status === 'CREATING' || rec.status === 'REAPING') {
         throw new HarnessError('CONFLICT', `workspace is ${rec.status.toLowerCase()}`, 409, true);
       }
-      const mode = (validated.mode as 'resume' | 'recreate' | 'status' | 'patch' | 'export') ?? 'resume';
+      const mode = (validated.mode as 'resume' | 'recreate' | 'stop' | 'status' | 'patch' | 'export') ?? 'resume';
+      if (mode === 'stop') {
+        if (rec.executorKind !== 'kata') throw new HarnessError('NOT_SUPPORTED', 'Retained stop is supported only for VM workspaces', 400, false);
+        if (rec.status === 'EXPIRED_RECOVERABLE') return { ok: true, message: 'VM is already stopped; files and installed software retained', data: publicRecord(rec), truncated: false };
+        if ((this.workspaceRequests.get(rec.id) ?? 0) > 1 || (rec.mutationLockedUntil ?? 0) > Date.now()
+          || this.operations.hasActiveWorkspaceWork(rec.id) || this.agentManager?.hasActiveAgents(rec.ownerId, rec.id)) {
+          throw new HarnessError('CONFLICT', 'VM is busy; finish tasks and close terminals before stopping', 409, true);
+        }
+        await this.suspendVmWorkspace(rec, 'VM stopped by owner');
+        return { ok: true, message: 'VM stopped; files and installed software retained', data: publicRecord(this.store.byId(rec.id)!), truncated: false };
+      }
       if (mode === 'recreate') return this.recreateExecutor(rec);
       if (mode === 'resume') {
         const now = Date.now();
-        if (rec.hardExpiresAt <= now) {
+        if (rec.executorKind !== 'kata' && rec.hardExpiresAt <= now) {
           throw new HarnessError('EXPIRED', 'Workspace hard lease limit reached and cannot be recovered to active state; use mode: export to save work', 410);
         }
         const isRecoverable = rec.status === 'EXPIRED_RECOVERABLE';
@@ -3292,14 +3419,15 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         try {
           const activeRecord = await this.ensureActiveExecutor(rec);
           const extSec = this.idleTtlSecondsFor(activeRecord);
-          const newExpires = Math.min(activeRecord.hardExpiresAt, now + extSec * 1000);
+          const hardExpiresAt = rec.executorKind === 'kata' && (rec.status !== 'ACTIVE' || rec.hardExpiresAt <= now) ? now + this.config.wallTtlSeconds * 1000 : activeRecord.hardExpiresAt;
+          const newExpires = Math.min(hardExpiresAt, now + extSec * 1000);
           let updated: WorkspaceRecord | undefined;
           try {
             updated = this.store.activateWithLimit(
               activeRecord.id,
               activeRecord.generation,
               ['ACTIVE', 'EXPIRED_RECOVERABLE', 'NETWORK_QUARANTINED'],
-              { status: 'ACTIVE', lastActivityAt: now, expiresAt: newExpires, error: null },
+              { status: 'ACTIVE', lastActivityAt: now, expiresAt: newExpires, hardExpiresAt, error: null },
               this.configuredActiveWorkspaceLimit()
             );
           } catch (error) {
@@ -5144,7 +5272,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
    */
   private async autoCloseRecoverable(id: string, generation: number): Promise<void> {
     const record = this.store.byId(id);
-    if (!record || record.generation !== generation || record.status !== 'EXPIRED_RECOVERABLE') return;
+    if (!record || record.executorKind === 'kata' || record.generation !== generation || record.status !== 'EXPIRED_RECOVERABLE') return;
     try {
       this.store.acquireRecoverableMutationLease(id, generation, Date.now() + 120_000);
     } catch {
@@ -5203,7 +5331,9 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       settings,
       reaperIntervalSeconds: this.config.reaperIntervalSeconds,
       usage: { ...this.store.workspaceLifecycleUsage(ownerId), limit: effective.maxActiveWorkspacesPerOwner },
-      executorCeilings: { ...EXECUTOR_RESOURCE_CEILINGS }
+      executorCeilings: this.config.executorKind === 'kata'
+        ? { memoryBytes: (this.config.vmMemoryMiB ?? 4096) * 1048576, cpus: this.config.vmCpus ?? 2, pids: 2048 }
+        : { ...EXECUTOR_RESOURCE_CEILINGS }
     };
   }
 
@@ -5316,12 +5446,13 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
             let allRemoved = true;
             for (const name of names) {
               try {
-                await removeContainer(name);
+                if (record.executorKind === 'kata' && name === record.containerName) await stopVmExecutor(name);
+                else await removeContainer(name);
               } catch {
                 allRemoved = false;
               }
             }
-            if (allRemoved) {
+            if (allRemoved && record.executorKind !== 'kata') {
               this.store.update(record.id, { containerName: null });
             }
 
@@ -5354,31 +5485,40 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         let allRemoved = true;
         for (const name of names) {
           try {
-            await removeContainer(name);
+            if (record.executorKind === 'kata' && name === record.containerName) await stopVmExecutor(name);
+            else await removeContainer(name);
           } catch {
             allRemoved = false;
           }
         }
-        if (allRemoved && record.containerName) {
+        if (allRemoved && record.containerName && record.executorKind !== 'kata') {
           this.store.update(record.id, { containerName: null });
         }
       }
     }
     for (const record of this.store.active()) {
+      if (record.executorKind === 'kata' && record.status === 'REAPING') {
+        await this.suspendVmWorkspace(record, 'retry VM stop').catch(() => undefined);
+        continue;
+      }
       if (record.status === 'ACTIVE' && (record.expiresAt <= now || record.hardExpiresAt <= now)) {
         const claimed = this.store.claimForExpiry(record.id, record.generation);
         if (claimed) {
           this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
-          if (claimed.containerName) {
-            await removeContainer(claimed.containerName).catch(() => undefined);
+          if (claimed.executorKind === 'kata') await this.suspendVmWorkspace(claimed, 'workspace compute lease expired');
+          else {
+            if (claimed.containerName) await removeContainer(claimed.containerName).catch(() => undefined);
+            this.markExpiredRecoverable(claimed, now);
           }
-          this.markExpiredRecoverable(claimed, now);
         }
       } else if (record.status === 'ACTIVE' && !this.dependencyWorkspaces.has(record.id)) {
         // A paused dependency import makes the size probe fall back to host paths,
         // including temporary staging. The dependency service checks its own limits.
         const violation = await this.resourceViolation(record).catch(() => undefined);
-        if (violation && !this.dependencyWorkspaces.has(record.id)) await this.closeRecord(record, violation).catch(() => undefined);
+        if (violation && !this.dependencyWorkspaces.has(record.id)) {
+          if (record.executorKind === 'kata') await this.suspendVmWorkspace(record, violation).catch(() => undefined);
+          else await this.closeRecord(record, violation).catch(() => undefined);
+        }
       }
     }
     for (const due of this.store.listAutoCloseDue(now)) {
@@ -5484,7 +5624,8 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     }
     const violation = await this.resourceViolation(after);
     if (violation) {
-      void this.closeRecord(after, violation).catch(() => undefined);
+      if (after.executorKind === 'kata') await this.suspendVmWorkspace(after, violation);
+      else void this.closeRecord(after, violation).catch(() => undefined);
       throw new HarnessError('LIMIT_EXCEEDED', `${violation}; workspace cleanup started`, 507, false);
     }
     return result;

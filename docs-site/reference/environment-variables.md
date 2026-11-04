@@ -130,6 +130,9 @@ Copy `.env.example` to `.env` and replace all `change-me` placeholder secrets be
 | `CLOUDFLARE_ACCESS_OAUTH_MAX_GRANT_SECONDS` | `2592000` | Optional | Longest grant the provider accepts, in seconds. Defaults to 2592000 (30 days). |
 | `GITHUB_APP_PRIVATE_KEY_FILE` | `/run/cloud-harness-secrets/github-app-private-key.pem` | Optional | Production host file: /etc/cloud-harness-mcp/github-app-private-key.pem |
 | `SECRET_KEYRING_FILE` | `/run/cloud-harness-secrets/secret-keyring.json` | Optional | Versioned AES-256-GCM keyring JSON. Prefer the runner-only file form. |
+| `EXECUTOR_KIND` | `docker` | Optional | Custom persistent VM backend; requires Kata on the Docker host. Existing workspaces keep their backend. |
+| `VM_MEMORY_MIB` | `4096` | Optional | Optional configuration. |
+| `VM_CPUS` | `2` | Optional | Optional configuration. |
 
 ## Security Guidelines
 

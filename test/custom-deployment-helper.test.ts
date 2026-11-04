@@ -1,4 +1,7 @@
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 function python(body: string): void {
@@ -18,6 +21,16 @@ assert 'DEPENDENCIES_MAX_BYTES=2147483648\n' in runtime
 assert 'MAX_WORKSPACE_BYTES=10737418240\n' in runtime
 hosts = set(scope['setting_value'](proxy, 'PACKAGES_PROXY_HOSTS').split(','))
 assert hosts == scope['DEPENDENCY_HOSTS'] | {'pypi.org', 'files.pythonhosted.org'}
+`);
+  });
+  it('opts only new workspaces into VM execution without replacing the selected executor image', () => {
+    python(String.raw`
+runtime, _ = scope['dependency_configuration']('AUTH_MODE=cloudflare-access\nEXECUTOR_IMAGE=custom-executor\n', '', vm=True)
+assert 'EXECUTOR_IMAGE=custom-executor\n' in runtime
+assert 'EXECUTOR_KIND=kata\n' in runtime
+assert 'VM_MEMORY_MIB=4096\n' in runtime
+assert 'VM_CPUS=2\n' in runtime
+assert 'WORKSPACE_NETWORK_PROFILE=dependency-access\n' in runtime
 `);
   });
   it('preserves configured limits and rejects conflicting or unsafe inputs', () => {
@@ -86,5 +99,46 @@ with tempfile.TemporaryDirectory() as directory:
         assert proxy_metadata.read_text() == 'new metadata'
     assert not any('executor' in str(call) for call in calls)
 `);
+  });
+});
+
+
+describe('persistent VM service compatibility guard', () => {
+  it('parses quoted configuration and forwards the configured network without unrelated credentials', () => {
+    python(String.raw`
+import runpy
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+vm = runpy.run_path('custom/guard-vm-runner.py')
+with tempfile.TemporaryDirectory() as directory:
+    config = Path(directory) / 'fixture.conf'
+    config.write_text('export EXECUTOR_KIND = "kata"\nDEPENDENCY_NETWORK_NAME=private-dev\nDEPENDENCY_BRIDGE_INTERFACE=dev-egress0\nDEPENDENCY_BRIDGE_SUBNET=172.29.230.0/24\nDEPENDENCY_DNS_RESOLVERS="9.9.9.9,1.1.1.1"\nUNRELATED_SECRET=must-not-forward\n')
+    settings = vm['read_settings'](config)
+    assert settings['EXECUTOR_KIND'] == 'kata'
+    assert 'UNRELATED_SECRET' not in settings
+    calls = []
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(stdout='1' if args[:3] == ['docker', 'image', 'inspect'] else '')
+    vm['guard'].__globals__['subprocess'] = SimpleNamespace(run=run)
+    vm['guard'].__globals__['os'] = SimpleNamespace(access=lambda *_: True, X_OK=1, environ={})
+    vm['guard'](settings)
+    env = calls[-1][1]['env']
+    assert env == {key: value for key, value in settings.items() if key.startswith('DEPENDENCY_')}
+    assert env['DEPENDENCY_BRIDGE_INTERFACE'] == 'dev-egress0'
+`);
+  });
+  it.each(['running-vm', 'stopped-vm'])('blocks an unaware runner while retaining %s', name => {
+    const directory = mkdtempSync(join(tmpdir(), 'ch-vm-guard-'));
+    try {
+      writeFileSync(join(directory, 'docker'), '#!/bin/sh\nif [ "$1" = ps ]; then echo "$VM_TEST_NAME"; else echo "$VM_TEST_AWARE"; fi\n', { mode: 0o755 });
+      for (const aware of ['', '<no value>', '0', '1']) {
+        const result = spawnSync('python3', ['-c', "import runpy; runpy.run_path('custom/guard-vm-runner.py')['guard']({}, check_only=True)"], {
+          env: { ...process.env, PATH: `${directory}:${process.env.PATH}`, VM_TEST_NAME: name, VM_TEST_AWARE: aware }, encoding: 'utf8'
+        });
+        expect(result.status, result.stderr).toBe(aware === '1' ? 0 : 1);
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 });
