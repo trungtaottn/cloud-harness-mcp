@@ -24,6 +24,7 @@ COPY --from=build /app/apps/runner/dist ./apps/runner/dist
 COPY --from=build --chmod=0444 /app/packages/contracts/package.json ./packages/contracts/package.json
 COPY --from=build /app/packages/contracts/dist ./packages/contracts/dist
 COPY --chmod=0444 worker/remote-executor.mjs worker/harness-worker.mjs worker/workspace-transfer.mjs worker/git-transfer-helper.sh ./worker/
+RUN chmod 0755 /app/worker
 EXPOSE 3001
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "apps/runner/dist/index.js"]
