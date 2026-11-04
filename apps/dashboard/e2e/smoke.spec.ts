@@ -18,10 +18,10 @@ async function expectNoSeriousA11yViolations(page: Page) {
   expect(serious.map((violation) => `${violation.id}: ${violation.nodes.map((node) => `${node.target.join(' ')} ${node.failureSummary ?? ''} ${node.html}`).join(', ')}`)).toEqual([]);
 }
 
-// The sidebar approvals badge reads two runner-backed endpoints on Overview; the e2e server
+// The sidebar approvals badge reads three runner-backed endpoints on Overview; the e2e server
 // has no runner, so answer them with an empty inbox rather than a 503 in the console.
 test.beforeEach(async ({ page }) => {
-  for (const path of ['/privilege-grants', '/package-plans']) {
+  for (const path of ['/privilege-grants', '/package-plans', '/dependency-plans']) {
     await page.route(`**/dashboard/api/v1${path}`, (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ data: { grants: [], plans: [] } }) }));
   }
 });

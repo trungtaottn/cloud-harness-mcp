@@ -60,8 +60,8 @@ test('labels live rows apart from retained ones, links only to known in-app rout
   await expect(page.locator('main [style]')).toHaveCount(0);
   await expectNoSeriousA11yViolations(page);
 
-  // The classic page made exactly these three reads: no duplicate, no extra fan-out.
-  expect([...reads].sort()).toEqual(['/activity', '/package-plans', '/privilege-grants']);
+  // Timeline plus all three approval sources: no duplicate, no extra fan-out.
+  expect([...reads].sort()).toEqual(['/activity', '/dependency-plans', '/package-plans', '/privilege-grants']);
 
   await open.click();
   await expect(page).toHaveURL(new RegExp(`/dashboard/agents/${AGENT_ID}$`));
@@ -142,9 +142,13 @@ test('loading, empty and error states', async ({ page }) => {
   expect(problems).toEqual([]);
 });
 
-test('a failed approvals read says so without hiding the timeline', async ({ page }) => {
+test('all failed approvals reads say so without hiding the timeline', async ({ page }) => {
   const problems = watchConsole(page, { allow: [/Failed to load resource/] });
-  await stubActivity(page, { '/privilege-grants': answer(403, { error: 'forbidden' }), '/package-plans': answer(403, { error: 'forbidden' }) });
+  await stubActivity(page, {
+    '/privilege-grants': answer(403, { error: 'forbidden' }),
+    '/package-plans': answer(403, { error: 'forbidden' }),
+    '/dependency-plans': answer(403, { error: 'forbidden' })
+  });
   await page.goto('/dashboard/activity');
   await expectPage(page, 'activity');
   await expect(page.getByTestId('activity-event')).toHaveCount(5);
