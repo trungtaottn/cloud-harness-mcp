@@ -1,5 +1,39 @@
 # Cloud Harness MCP collaborator guide
 
+## Custom fork instructions
+
+These instructions extend the upstream guide below for the `custom` branch.
+Read [custom fork guidance](docs/custom-fork.md) for source provenance, operator
+artifacts and agent handoff. Keep custom development on `custom`, verify remotes
+before pushing, and do not reset these changes to upstream. Publishing source
+does not prove production activation; verify the deployed image and contract.
+
+- Use this checkout's Cloud Harness skill and references when operating the
+  custom server. An installed upstream skill may omit `workspace_recover`
+  mode `recreate`; a stale client schema may omit it even after reconnect.
+  Distinguish server support, client tool discovery and actual executor state.
+- Never call `workspace_close` to activate a package. Finish active work, use
+  explicit `recreate` when the live tool supports it, then verify package status,
+  CLI version, retained checkout and Git state. Ordinary `resume` is not a
+  guaranteed mount refresh. Keep package scope and network policy unchanged.
+- Do not broaden a workspace package installation to owner scope to fix mounts.
+  Managed npm/uv packages, the separate Go/Rust executor and dependency egress
+  are separate concerns. The custom storage setting is a soft workspace disk
+  ceiling, not a RAM limit or a hard filesystem reservation.
+- Diagnose empty lists and denied pushes against the authenticated principal,
+  workspace owner and current GitHub installation binding. Do not merge
+  identities or replace credentials just to make an operation succeed.
+- Keep the tracked scripts under `custom/` aligned with the owning operational
+  guide. Their host-specific paths and tested image manifests are not a portable
+  installer; upstream deployment can replace the custom API/runner overlay.
+- Use Node 24 for reproducing this fork's verification baseline. Host Node 26
+  has produced Dashboard browser-storage failures; establish whether a failure
+  is environmental before changing tests or application behavior.
+
+Keep existing safety and verification rules below. Do not copy private host
+state, account identifiers, credentials or retained workspace artifacts into
+this public guide.
+
 ## Purpose and authority
 
 Cloud Harness MCP is intentionally a private, single-owner remote coding
@@ -123,8 +157,9 @@ current:
   waiting on an external decision or prerequisite (comment what blocks it),
   `in review` during isolated code review, `done` once the PR is open and green,
   and `shipped` after it merges to `main`.
-- `main` is the integration branch; merging to it triggers `Deploy production`,
-  so a merge is a live operation that needs owner authorization.
+- In the upstream release workflow, `main` is the integration branch and merging
+  to it triggers `Deploy production`. Keep this fork's custom work on `custom`;
+  any production merge or deployment needs owner authorization.
 - When you find a related or duplicate issue, comment on it with a reference to
   the issue you are working on instead of duplicating work. File an unrelated
   defect you discover as its own issue rather than widening the current PR.
