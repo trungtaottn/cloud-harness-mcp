@@ -92,6 +92,14 @@ instead of copying behavior, defaults, command inventories, or configuration.
   `docs/security-model.md` own the resolution order, the per-start attestation
   requirement, and the fail-closed `DEPENDENCY_EGRESS_UNAVAILABLE` behaviour. No
   raw `bridge` profile is selectable, and egress is never a silent downgrade.
+- The custom InstaBox backend is disabled unless the operator configures its
+  runner-only file credential, exact machine allowlist, canonical principal, and
+  explicit public-network consent. When enabled, remote-first selection applies
+  only when `workspace_open` omits `networkProfile` and no persisted instance
+  default exists; explicit network profiles stay local. Remote networking is
+  provider-managed, not host-firewall-attested. Stop/resume retains the borrowed
+  machine and workspace; explicit close is the destructive release path and does
+  not delete a provider machine. See [custom fork guidance](docs/custom-fork.md).
 - Preserve credential-free HTTPS repository URLs, host/address validation, and
   constrained cloning. Private-clone credentials stay in the trusted broker
   and must never persist in the checkout, remote URL, logs, fixtures, or command

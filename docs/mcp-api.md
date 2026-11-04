@@ -1044,9 +1044,12 @@ ChatGPT subscription (see
 - `workspace_lease_renew` and `workspace_recover` allow inspecting, extending,
   and restoring workspaces across their lifecycle states:
   - **`ACTIVE` → `EXPIRED_RECOVERABLE` → `CLOSED` Lifecycle:** When an active
-    workspace's idle lease expires, its container executor is reaped to release CPU
-    and memory, but its repository files, unpushed commits, branches, and working-tree
-    modifications are retained during a recoverable grace period (`EXPIRED_RECOVERABLE`).
+    workspace's idle lease expires, a disposable Docker executor is reaped to release
+    CPU and memory, while a retained Kata or InstaBox executor is stopped. In all
+    cases repository files, unpushed commits, branches, and working-tree
+    modifications are retained. Docker workspaces use the configured recoverable
+    grace period (`EXPIRED_RECOVERABLE`); retained executors remain reserved until
+    explicit close.
     The grace window starts at expiry. Its length, like the idle and wall TTLs, is
     instance configuration snapshotted when the workspace opens, so a later
     setting change never shortens or extends an open workspace
@@ -1058,17 +1061,33 @@ ChatGPT subscription (see
     stashes, or commits not on any remote ref (including a worktree's detached
     `HEAD`) keep it `EXPIRED_RECOVERABLE`, with `error`
     starting `auto-close deferred:`, until it is recovered or explicitly closed.
+  - **Retained remote workspaces:** InstaBox selection is remote-first only when
+    `workspace_open` omits `networkProfile` and no persisted instance default exists;
+    explicit network profiles remain local. Remote capabilities report
+    `provider-managed` networking, direct guest installation, and
+    explicit-close-only retention. `workspace_recover` mode `stop` stops the
+    borrowed machine while retaining its allocation, checkout, and installed
+    software; `resume` starts that same machine. `recreate` is unsupported, and
+    local Kata remains the fallback only when remote capacity is unavailable.
+    The provider's Free policy is no-billing, with a 30-minute idle pause,
+    eight-hour maximum run, and start cooldowns. A single archive upload is
+    capped at 5 GiB, separately from the soft workspace-size limit. Explicit
+    remote close may need a provider start for scoped cleanup and then stop it
+    again; if close fails, retry close after reconciliation or cooldown and do
+    not resume while cleanup intent is pinned.
   - **`workspace_recover`:** Restores or exports work from active or `EXPIRED_RECOVERABLE`
     workspaces. In `resume` mode (default), it restores the workspace to `ACTIVE` state,
-    recreates and starts the executor container on demand, and refreshes the idle lease
-    while preserving all local Git and file state. In `status` and `patch` modes, it
-    does not replace the executor. Explicit `recreate` replaces an idle remote
-    executor with current package mounts while retaining workspace ID, checkout,
-    tools/cache volumes, secret snapshot, package scope, network profile and hard
-    expiry. Busy workspaces and concurrent calls return `CONFLICT`; ephemeral
-    container state is lost. A failed replacement leaves files recoverable for
-    another `recreate` attempt. Local mode returns `NOT_SUPPORTED`. The default
-    `resume` continues to reuse an existing running network-none container.
+    recreates and starts a disposable Docker executor on demand, or starts the same
+    retained Kata/InstaBox executor, and refreshes the idle lease while preserving
+    all local Git and file state. In `status` and `patch` modes, it does not replace
+    the executor. Explicit `recreate` replaces an idle Docker executor with current
+    package mounts while retaining workspace ID, checkout, tools/cache volumes,
+    secret snapshot, package scope, network profile and hard expiry. It is refused
+    for retained Kata/InstaBox executors. Busy workspaces and concurrent calls
+    return `CONFLICT`; disposable container state is lost. A failed replacement
+    leaves files recoverable for another `recreate` attempt. Local mode returns
+    `NOT_SUPPORTED`. The default `resume` continues to reuse an existing running
+    executor and does not refresh mounts.
     In `status` and `patch` modes, it
     non-destructively returns unpushed changes or unified diffs. In `export` mode, it
     creates a recovery snapshot commit and pushes it to a target remote branch as a

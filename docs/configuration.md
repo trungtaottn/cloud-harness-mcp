@@ -31,6 +31,35 @@ fallback. `VM_MEMORY_MIB` and `VM_CPUS` configure new VM limits. See the
 [custom fork guide](custom-fork.md#persistent-vm-executor) for lifecycle and storage
 semantics and the tracked installation/smoke scripts.
 
+## Optional InstaBox remote executor
+
+`INSTABOX_ENABLED=true` enables the custom remote backend only when the runner
+also receives `INSTABOX_API_KEY_FILE`, an exact `INSTABOX_MACHINE_IDS` allowlist,
+the canonical `INSTABOX_PRINCIPAL_ID`, and
+`INSTABOX_ALLOW_PUBLIC_NETWORK=true`. Inline `INSTABOX_API_KEY` is rejected.
+The key file is runner-only; the production runner's existing read-only mount is
+available under `/run/cloud-harness-secrets`, while the API and guests receive
+neither the key nor its path. Leave the feature disabled unless the operator has
+accepted the provider-managed public-network boundary; source changes do not
+claim production activation.
+
+Guests require Node.js, Bash and Python 3 with standard-library `ctypes` and
+Linux child-subreaper support. Bootstrap verifies the kernel capability before
+creating runtime files and fails with `kernel_subreaper_unavailable` if missing.
+The subreaper keeps detached and reparented descendants owned by their job so
+cancellation, timeout and completion cannot leave those processes running.
+
+When configured, remote admission is attempted only for `workspace_open` calls
+that omit `networkProfile` and when no persisted instance default overrides the
+runner. Explicit `network-none` or `dependency-access` requests stay local, as
+does any open under a persisted instance default. If the allowlisted remote pool
+has no eligible capacity, local Kata is the fallback when configured; normal
+active-workspace quota still applies. Remote capabilities identify
+`provider-managed` networking, retained software, explicit-close-only retention,
+direct guest installation, and no managed package/dependency mounts. See the
+[custom fork guide](custom-fork.md#opt-in-instabox-remote-executor) for lifecycle,
+provider limits, and the terminal reconnect boundary.
+
 ## Authentication and request policy
 
 `AUTH_MODE` selects one mutually exclusive deployment contract:
@@ -345,6 +374,11 @@ the persisted default and its reset semantics by
 [`apps/runner/src/state-store.ts`](../apps/runner/src/state-store.ts) and
 [`apps/api/src/dashboard-router.ts`](../apps/api/src/dashboard-router.ts).
 Runner-owned remote Git helpers do not depend on the executor network profile.
+
+The remote InstaBox backend is a separate path: its `provider-managed` network
+is explicitly public and is not represented as host-attested
+`dependency-access`. An explicit network restriction therefore remains local;
+the backend never silently relaxes it to obtain remote capacity.
 
 `WORKSPACE_WALL_TTL_SECONDS`, `WORKSPACE_IDLE_TTL_SECONDS`,
 `WORKSPACE_RECOVERABLE_GRACE_SECONDS`, and `REAPER_INTERVAL_SECONDS` define

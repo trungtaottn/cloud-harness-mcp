@@ -169,6 +169,20 @@ content and user-supplied commands are untrusted execution input.
   repository-controlled code can exfiltrate it: prefer a fine-grained token
   scoped to the repositories the workspace needs, or keep the instance or the
   workspace on `network-none`.
+- The optional InstaBox backend is remote-first only when `workspace_open` omits
+  `networkProfile` and no persisted instance default exists. Explicit
+  `network-none` and `dependency-access` opens stay local; remote capabilities
+  report provider-managed public networking, not host-firewall-attested egress.
+  The runner binds remote allocations to the exact operator machine allowlist
+  and canonical principal. Its API key is file-based and runner-only under the
+  existing `/run/cloud-harness-secrets` mount; inline keys and guest/API copies
+  are forbidden.
+- Remote stop/resume retains the borrowed machine, checkout, and installed
+  software. Close is explicit and destructive for scoped workspace data, never
+  provider-machine deletion; a failed close pins cleanup, so retry close after
+  reconciliation or cooldown instead of resuming. Direct guest installation is
+  supported, while managed package mounts and approved project dependency
+  caches are not.
 
 ## Repository and Git credential boundary
 

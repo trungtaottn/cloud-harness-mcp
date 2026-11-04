@@ -5,16 +5,23 @@ import os
 from pathlib import Path
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 
-KEYS = {'EXECUTOR_KIND', 'DEPENDENCY_NETWORK_NAME', 'DEPENDENCY_BRIDGE_INTERFACE',
+STATE_DB = Path('/var/lib/cloud-harness/state/cloud-harness.db')
+
+KEYS = {'INSTABOX_ENABLED', 'EXECUTOR_KIND', 'DEPENDENCY_NETWORK_NAME', 'DEPENDENCY_BRIDGE_INTERFACE',
         'DEPENDENCY_BRIDGE_SUBNET', 'DEPENDENCY_DNS_RESOLVERS'}
 
 
 def read_settings(path):
+    return parse_settings(Path(path).read_text())
+
+
+def parse_settings(text):
     settings = {}
-    for line in Path(path).read_text().splitlines():
+    for line in text.splitlines():
         match = re.match(r'^\s*(?:export\s+)?([A-Z_]+)\s*=(.*)$', line)
         if not match or match[1] not in KEYS:
             continue
@@ -25,6 +32,8 @@ def read_settings(path):
         if match[1] in settings and settings[match[1]] != value:
             raise RuntimeError('Conflicting VM network settings')
         settings[match[1]] = value
+    if settings.get('INSTABOX_ENABLED', 'false') not in ('true', 'false'):
+        raise RuntimeError('Invalid InstaBox enable setting')
     if settings.get('EXECUTOR_KIND', 'docker') not in ('docker', 'kata'):
         raise RuntimeError('Unknown executor kind')
     for key, pattern in [('DEPENDENCY_NETWORK_NAME', r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}'),
@@ -43,7 +52,31 @@ def read_settings(path):
     return settings
 
 
-def guard(settings, check_only=False):
+def retained_instabox(database=STATE_DB):
+    database = Path(database)
+    if not database.exists():
+        return False
+    try:
+        with sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'workspaces' in tables:
+                columns = {row[1] for row in db.execute('PRAGMA table_info(workspaces)')}
+                if 'executor_kind' in columns and db.execute("SELECT 1 FROM workspaces WHERE executor_kind='instabox' LIMIT 1").fetchone():
+                    return True
+            if 'executor_allocations' in tables:
+                return db.execute('SELECT 1 FROM executor_allocations WHERE released=0 LIMIT 1').fetchone() is not None
+            return False
+    except sqlite3.Error:
+        raise RuntimeError('Cannot verify retained InstaBox state; refusing runner startup') from None
+
+
+def guard(settings, check_only=False, database=STATE_DB):
+    if settings.get('INSTABOX_ENABLED') == 'true' or retained_instabox(database):
+        aware = subprocess.run(['docker', 'image', 'inspect', 'cloud-harness-runner:local', '--format',
+                                '{{index .Config.Labels "io.cloud-harness.instabox-workspaces"}}'],
+                               check=True, text=True, capture_output=True).stdout.strip()
+        if aware != '1':
+            raise RuntimeError('Refusing a runner without InstaBox support; retained remote allocations require an InstaBox-aware runner')
     retained = subprocess.run(['docker', 'ps', '-a', '--filter', 'label=cloud-harness.executor=kata',
                                '--filter', 'label=cloud-harness.managed=true', '--format', '{{.Names}}'],
                               check=True, text=True, capture_output=True).stdout.strip()

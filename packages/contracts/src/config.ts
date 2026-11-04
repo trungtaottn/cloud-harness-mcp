@@ -379,6 +379,13 @@ export const RunnerConfigSchema = z.object({
   stateDb: z.string().min(1),
   executorImage: z.string().min(1),
   executorKind: z.enum(['docker', 'kata']).optional(),
+  instabox: z.object({
+    apiKey: z.string().min(1).max(4096).regex(/^[^\s\0]+$/),
+    machineIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,128}$/)).min(1)
+      .refine(values => new Set(values).size === values.length, 'machine IDs must be unique'),
+    principalId: z.string().min(1).max(512).refine(value => value.trim() === value, 'principal ID must be canonical'),
+    allowPublicNetwork: z.literal(true)
+  }).strict().optional(),
   vmMemoryMiB: z.number().int().min(1024).max(16384).optional(),
   vmCpus: z.number().int().min(1).max(8).optional(),
   networkGuardImage: z.string().min(1).default('cloud-harness-network-guard:local'),

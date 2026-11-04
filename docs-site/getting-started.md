@@ -107,9 +107,25 @@ Push to origin (requires GitHub App installation):
 
 ---
 
-### Step 4: Close the Workspace
+### Step 4: Finish or retain the Workspace
 
-Always close your workspace when finished to release container and memory resources:
+Close a disposable Docker workspace only after preserving the work you need.
+For a retained Kata or InstaBox workspace, finish tasks and terminals, then
+stop it so the checkout and installed software remain available for the same
+workspace to resume. If work is incomplete, save or checkpoint what is useful
+before stopping; do not close the workspace as a checkpoint operation.
+
+Stop a retained workspace with `workspace_recover`:
+
+```json
+// Tool: workspace_recover
+{
+  "workspaceId": "ws_abcdef1234567890abcdef123456",
+  "mode": "stop"
+}
+```
+
+Use `workspace_close` only when you intend to release the workspace data:
 
 ```json
 // Tool: workspace_close
@@ -118,4 +134,11 @@ Always close your workspace when finished to release container and memory resour
 }
 ```
 
-Unclosed workspaces are automatically terminated when their idle TTL (5 min) or wall TTL (15 min) expires.
+Disposable workspaces are automatically terminated when their idle or wall TTL
+expires. Retained Kata and InstaBox workspaces stop compute and remain reserved
+until an explicit close. Remote InstaBox networking is provider-managed and is
+not the local host-firewall-attested `dependency-access` profile.
+
+Operators enabling InstaBox must prepare guests with Node.js, Bash and Python 3
+with Linux child-subreaper support. Bootstrap checks this prerequisite so
+cancelled or completed jobs cannot leave detached child processes running.

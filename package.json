@@ -71,6 +71,7 @@
     "@modelcontextprotocol/client": "2.0.0",
     "@types/express": "5.0.6",
     "@types/node": "24.13.3",
+    "@types/ws": "8.18.2",
     "eslint": "9.39.5",
     "eslint-plugin-react-hooks": "7.1.1",
     "conventional-changelog-conventionalcommits": "10.3.0",

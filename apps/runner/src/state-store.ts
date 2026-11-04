@@ -158,7 +158,7 @@ export type WorkspaceRecord = {
   environmentId: string | null;
   status: 'CREATING' | 'ACTIVE' | 'REAPING' | 'CLOSED' | 'FAILED' | 'EXPIRED_RECOVERABLE' | 'NETWORK_QUARANTINED';
   networkProfile: ExecutorNetworkProfile;
-  executorKind?: 'kata';
+  executorKind?: 'kata' | 'instabox';
   createdAt: number;
   lastActivityAt: number;
   expiresAt: number;
@@ -180,7 +180,7 @@ export type WorkspaceRecord = {
 };
 
 /** Changes a fenced lifecycle write may apply to one workspace row. */
-type FencedWorkspaceChanges = Partial<Pick<WorkspaceRecord, 'containerName' | 'status' | 'lastActivityAt' | 'expiresAt' | 'hardExpiresAt' | 'generation' | 'error' | 'expiredAt' | 'recoverableUntil'>>;
+type FencedWorkspaceChanges = Partial<Pick<WorkspaceRecord, 'executorKind' | 'containerName' | 'status' | 'lastActivityAt' | 'expiresAt' | 'hardExpiresAt' | 'generation' | 'error' | 'expiredAt' | 'recoverableUntil'>>;
 
 /** Dashboard overrides of the workspace lifecycle policy. `null` means the runner configuration applies. */
 export type WorkspaceLifecycleOverrides = {
@@ -345,7 +345,7 @@ function withRecoverableWindow(current: WorkspaceRecord, changes: Partial<Worksp
 }
 
 const fromRow = (row: Row): WorkspaceRecord => ({
-  ...(row.executor_kind === 'kata' ? { executorKind: 'kata' as const } : {}),
+  ...(row.executor_kind === 'kata' || row.executor_kind === 'instabox' ? { executorKind: row.executor_kind } : {}),
   id: row.id, ownerId: row.owner_id, idempotencyKey: row.idempotency_key, repositoryUrl: row.repository_url,
   repositoryRef: row.repository_ref, containerName: row.container_name, workspacePath: row.workspace_path,
   environmentId: row.environment_id ?? null,
@@ -539,7 +539,16 @@ export class StateStore {
     migratePrincipalSchema(this.database);
     const executorColumns = this.database.prepare('PRAGMA table_info(workspaces)').all() as { name: string }[];
     if (!executorColumns.some((column) => column.name === 'executor_kind')) {
-      this.database.exec("ALTER TABLE workspaces ADD COLUMN executor_kind TEXT NOT NULL DEFAULT 'docker' CHECK(executor_kind IN ('docker','kata'));");
+      this.database.exec("ALTER TABLE workspaces ADD COLUMN executor_kind TEXT NOT NULL DEFAULT 'docker' CHECK(executor_kind IN ('docker','kata','instabox'));");
+    }
+    const workspaceSchema = this.database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'workspaces'").get() as { sql: string };
+    if (!workspaceSchema.sql.includes("'instabox'")) {
+      this.database.exec(`BEGIN IMMEDIATE;
+        ALTER TABLE workspaces ADD COLUMN executor_kind_next TEXT NOT NULL DEFAULT 'docker' CHECK(executor_kind_next IN ('docker','kata','instabox'));
+        UPDATE workspaces SET executor_kind_next = executor_kind;
+        ALTER TABLE workspaces DROP COLUMN executor_kind;
+        ALTER TABLE workspaces RENAME COLUMN executor_kind_next TO executor_kind;
+        COMMIT;`);
     }
     // One-way migration. A database written by an earlier release may still carry
     // the retired single-active index, including via the former v5->v6 upgrade
@@ -1111,7 +1120,7 @@ export class StateStore {
    * first. Each one costs a close check, so a reaper pass takes a bounded batch and the rest wait.
    */
   listAutoCloseDue(now: number, limit = 10): Array<{ id: string; generation: number }> {
-    return this.database.prepare(`SELECT id, generation FROM workspaces WHERE status = 'EXPIRED_RECOVERABLE' AND executor_kind != 'kata'
+    return this.database.prepare(`SELECT id, generation FROM workspaces WHERE status = 'EXPIRED_RECOVERABLE' AND executor_kind NOT IN ('kata', 'instabox')
       AND (mutation_locked_until IS NULL OR mutation_locked_until <= ?)
       AND COALESCE(recoverable_until, last_activity_at + COALESCE(recoverable_grace_seconds, ?) * 1000) <= ?
       ORDER BY COALESCE(recoverable_until, last_activity_at) ASC LIMIT ?`)
@@ -1306,9 +1315,9 @@ export class StateStore {
     const next = withRecoverableWindow(current, changes);
     // The status allowlist travels as one parameter and is expanded by SQLite, so the statement text is
     // constant no matter how many statuses are passed and nothing is ever interpolated into it.
-    const result = this.database.prepare(`UPDATE workspaces SET container_name=?, status=?, last_activity_at=?, expires_at=?, hard_expires_at=?, generation=?, error=?, expired_at=?, recoverable_until=?
+    const result = this.database.prepare(`UPDATE workspaces SET container_name=?, status=?, last_activity_at=?, expires_at=?, hard_expires_at=?, generation=?, error=?, expired_at=?, recoverable_until=?, executor_kind=?
       WHERE id=? AND generation=? AND status IN (SELECT value FROM json_each(?))`)
-      .run(next.containerName, next.status, next.lastActivityAt, next.expiresAt, next.hardExpiresAt, next.generation, next.error, next.expiredAt ?? null, next.recoverableUntil ?? null, id, expectedGeneration, JSON.stringify(expectedStatuses));
+      .run(next.containerName, next.status, next.lastActivityAt, next.expiresAt, next.hardExpiresAt, next.generation, next.error, next.expiredAt ?? null, next.recoverableUntil ?? null, next.executorKind ?? 'docker', id, expectedGeneration, JSON.stringify(expectedStatuses));
     return result.changes === 1 ? next : undefined;
   }
 
@@ -1737,7 +1746,7 @@ export class StateStore {
 
   reconcileRunningTasks(currentBootId: string, now: number): number {
     return withEventSavepoint(this.database, () => {
-      const interrupted = this.database.prepare("SELECT id FROM durable_tasks WHERE status IN ('QUEUED', 'RUNNING') AND boot_id != ?")
+      const interrupted = this.database.prepare("SELECT id FROM durable_tasks WHERE status IN ('QUEUED', 'RUNNING') AND boot_id != ? AND workspace_id NOT IN (SELECT id FROM workspaces WHERE executor_kind = 'instabox')")
         .all(currentBootId) as { id: string }[];
       const result = this.database.prepare(`
         UPDATE durable_tasks
@@ -1745,6 +1754,7 @@ export class StateStore {
             error_message = 'Task execution interrupted by runner restart',
             finished_at = ?, generation = generation + 1
         WHERE status IN ('QUEUED', 'RUNNING') AND boot_id != ?
+          AND workspace_id NOT IN (SELECT id FROM workspaces WHERE executor_kind = 'instabox')
       `).run(now, currentBootId);
       for (const task of interrupted) emitTaskTerminalEvent(this.database, task.id, now);
       return Number(result.changes);

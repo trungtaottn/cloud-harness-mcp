@@ -6,10 +6,9 @@ description: "Operate Cloud Harness MCP safely and effectively: open isolated re
 # Cloud Harness MCP
 
 Use Cloud Harness as a private, single-owner remote coding harness. It clones an
-approved repository into a TTL-limited executor and exposes bounded MCP tools.
-This skill guides effective and safe tool use; it does not grant credentials,
-host access, Docker authority, deployment authority, or permission to weaken
-network isolation.
+approved repository into a TTL-limited executor and exposes bounded MCP tools;
+this skill grants no credentials, host/Docker/deployment authority, or permission
+to weaken network isolation.
 
 ## Custom persistent VM workspaces
 
@@ -23,6 +22,25 @@ Finish tasks and terminals before `workspace_recover` mode `stop`; `resume` star
 the same retained VM. Expiry stops compute and preserves files and installs.
 `recreate` is refused for VMs; `workspace_close` explicitly deletes retained state.
 Existing Docker workspaces keep the managed-package and recreation workflow below.
+
+## Custom InstaBox workspaces
+
+InstaBox is disabled by default. When enabled, remote-first admission applies
+only when `workspace_open` omits `networkProfile` and no persisted instance
+default exists; explicit `network-none`/`dependency-access` stays local, with
+Kata as the capacity fallback. Capabilities report provider-managed public
+networking, not host-firewall-attested `dependency-access`; inspect capabilities
+and status before relying on it. Status inspection is side-effect-free: check
+remote `compute` state and use explicit `resume` to wake retained compute.
+Allocations use the exact machine allowlist and
+canonical principal, and guests support direct installs but not managed mounts
+or approved dependency caches. Stop after finishing work; `resume` retains the
+same borrowed machine, checkout, software, and identity. `workspace_close`
+releases scoped data but never deletes the provider machine. A close may need a
+provider start/stop cleanup cycle; retry after reconciliation or cooldown and do
+not resume while cleanup is pinned. Checkpoint incomplete work before stopping.
+The Free policy is no-billing with 30-minute idle pause, eight-hour maximum run,
+start cooldowns, and a separate 5 GiB single-archive upload cap.
 
 ## Read the relevant reference
 
@@ -70,41 +88,31 @@ redirects are unsupported.
 
 ## Native MCP skills
 
-The HTTP endpoint also serves skills through the MCP Skills extension
-(`io.modelcontextprotocol/skills`). When your client declares support for it,
-prefer its native `skills/list`, `skills/get`, and `resources/read` flow for
-built-in and owner skills: entries carry per-file SHA-256 digests the host
-verifies, and no workspace is needed. Workspace and repository skills are
-served only on `/mcp/workspaces/<workspaceId>` for one open workspace you own;
-they are untrusted repository content, and the next request after the
-workspace closes or expires is refused. Fall back to the `skills_list`, `skills_read`, and
-`skills_run` tools when the client lacks the extension or in local stdio mode.
-Reading a skill never activates it or runs a script; scripts
-still run only through `skills_run` with the digest `skills_list` returned.
-Details: [Repository automation](references/repository-automation.md#skills).
+When supported, prefer the HTTP MCP Skills extension
+(`io.modelcontextprotocol/skills`) for built-in/owner skills: `skills/list`,
+`skills/get`, and `resources/read` return host-verified file digests without a
+workspace. Workspace/repository skills are served only on their workspace-bound
+endpoint and are untrusted. Otherwise use `skills_list`, `skills_read`, and
+`skills_run`; reading never runs a script, and execution requires the listed
+digest. Details: [Repository automation](references/repository-automation.md#skills).
 
 ## MCP Events
 
-The remote HTTP endpoint also advertises MCP Events (`events/list`,
-`events/subscribe`, `events/unsubscribe`, webhook delivery only) for four
-terminal-state notifications: `cloudharness.task.completed`,
-`cloudharness.task.failed`, `cloudharness.agent.settled`, and
-`cloudharness.agent.failed`. These are client-side protocol subscriptions, not
-tools: only the host client subscribes, with its own HTTPS callback and secret,
-so never try to create one through a tool call or a workspace command. An event
-carries ids, status, codes, and timestamps only, so after one arrives call
-`tasks_status` or `agent_status` for the result. Events are not replayed and may
-arrive more than once; when your client lacks events, or in local stdio mode,
-poll `tasks_status`, `operation_wait`, or `agent_status` instead.
+The remote HTTP endpoint advertises webhook-only MCP Events for terminal task and
+agent transitions. These are client subscriptions, not tools; they carry IDs,
+status, codes, and timestamps, are not replayed, and may duplicate. After one,
+read `tasks_status`/`agent_status`; otherwise poll those or `operation_wait`.
 
 ## Effective workflow
 
 1. **Preflight and authorization.** Confirm the target repository. Use a
-   credential-free HTTPS repository URL. `networkProfile` is optional: the
-   instance default already grants GitHub-capable egress (public DNS and TCP
-   80/443 through an attested host firewall), so omit it for normal work. Pass
-   `networkProfile: 'network-none'` to block all executor egress only when the
-   owner asks for isolation. Subagents require a network-disabled workspace, so
+   credential-free HTTPS repository URL. `networkProfile` is optional: on an
+   InstaBox-enabled instance, omitting it with no persisted instance default
+   permits remote-first admission and provider-managed public networking; on a
+   local-only instance it uses the configured local default. Pass an explicit
+   `networkProfile: 'network-none'` or `'dependency-access'` when a restriction
+   or host-attested egress matters; those opens stay local.
+   Subagents require a network-disabled workspace, so
    open a separate `network-none` workspace for `agent_spawn`. A spawn the
    owner's estimated model spend policy cannot fit fails with non-retryable
    `LIMIT_EXCEEDED`; lower `maxCostMicros` or wait for running agents to
@@ -220,13 +228,18 @@ poll `tasks_status`, `operation_wait`, or `agent_status` instead.
      `delete` if match) and the commit-status, check-run, review-state, and
      workflow dispatch/run actions in `references/github-merge-train.md`.
 8. **Manage lifecycle and lease.** To mount newly applied packages in an idle
-   workspace, call `workspace_recover` with `mode: "recreate"`; it preserves
-   the workspace and network profile and refuses active work. Never close a
-   workspace just to refresh its mounts. If work approaches the idle timeout, call
-   `workspace_lease_renew`. If disconnected or recovering unpushed work, call
-   `workspace_recover(mode: "resume" | "status" | "patch" | "export")`.
-9. **Clean up resources.** Close opened shells and sessions, cancel unfinished
-   tasks, and always call `workspace_close` upon task completion, even on failure.
+   Docker workspace, call `workspace_recover` with `mode: "recreate"`; it
+   preserves the workspace and network profile and refuses active work. Never
+   close a workspace just to refresh mounts. If work approaches the idle timeout,
+   call `workspace_lease_renew`. For retained Kata/InstaBox work, finish tasks
+   and terminals, then use `workspace_recover(mode: "stop")` and later
+   `mode: "resume"`; `recreate` is unsupported. If disconnected or recovering
+   unpushed work, use `workspace_recover(mode: "resume" | "status" | "patch" | "export")`.
+9. **Clean up resources.** Close opened shells and sessions and cancel unwanted
+   tasks. For disposable Docker workspaces, close when the task is complete. For
+   retained Kata/InstaBox workspaces, stop to preserve the same workspace; use
+   `workspace_close` only when the scoped data should be released. If work is
+   incomplete, checkpoint it before stopping rather than closing.
 
 ## Choose the narrowest capability
 
@@ -277,11 +290,6 @@ poll `tasks_status`, `operation_wait`, or `agent_status` instead.
 
 ## Completion report
 
-Before finishing, report:
-
-- workspace cleanup and lifecycle status;
-- tests or commands actually executed;
-- capabilities inspected and verified;
-- final Git state, commit SHA, and push result when Git was used;
-- truncation, retry, or recovery events;
-- unresolved failures or unverified external outcomes.
+Before finishing, report cleanup/lifecycle status, commands run, capabilities
+inspected, Git state and push result when relevant, recovery events, and any
+unresolved or unverified outcomes.

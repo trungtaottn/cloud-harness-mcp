@@ -11,15 +11,15 @@ The Workspaces panel lists all currently active and recently closed workspace en
 
 - **Status Indicators:** View workspace lifecycle phase (`ready`, `busy`, `closed`, `error`).
 - **TTL Countdown:** Inspect remaining wall-clock TTL and idle timer before automatic cleanup.
-- **Resource Details:** Check memory limits, container status, and the effective network profile (`dependency-access` or `network-none`).
-- **Force Close:** Immediately terminate a stuck container and permanently purge all temporary workspace files from the host disk.
+- **Resource Details:** Check memory limits, executor status, and the effective network profile (`dependency-access`, `network-none`, or provider-managed for an InstaBox workspace).
+- **Force Close:** Immediately terminate a stuck local executor and permanently purge scoped workspace files. For a retained InstaBox workspace, **Close** is the explicit release path; it does not delete the borrowed provider machine.
 
 ## Opening Workspaces
 
 Click **New workspace** on the Workspaces page to launch a new workspace. The wizard has
 three steps (Repository, Skills and toolkits, Review):
 - **Repository & Ref:** Enter an approved HTTPS Git repository and optional branch/tag.
-- **Network Profile (optional):** Override the instance default from [Settings](/dashboard/settings) for this workspace. Choose **No network (air-gapped isolation)** when the workspace must have no egress; otherwise dependency access permits only public DNS and TCP 80/443.
+- **Network Profile (optional):** Override the instance default from [Settings](/dashboard/settings) for this workspace. Choose **No network (air-gapped isolation)** when the workspace must have no egress; otherwise dependency access permits only public DNS and TCP 80/443. If the operator has enabled InstaBox, omitting this field with no persisted instance default permits remote-first admission; explicit profiles stay local.
 - **Skill Sets (optional):** Select the sets the workspace should resolve. Because the same skill name can exist at several tiers, a launch can produce a conflict; resolve each one with a radio choice, since launch stays disabled until every conflict has an override. See [Skills & Skill Sets](/dashboard/skills).
 - **Toolkits (optional):** Add preset toolkits and ready licensed kits for your owner scope. A licensed kit without a licence token is shown as not ready. The review step asks the runner to check the selection before launch.
 
@@ -29,7 +29,7 @@ never kept. If the launch answer is lost, pressing **Launch workspace** again se
 same request key, so the harness opens at most one workspace for it; changing any field
 starts a new request. **Cancel** discards the draft.
 ::: danger Data Purge on Close
-Closing a workspace unmounts the Docker filesystem and recursively deletes the job directory. Ensure any necessary changes have been committed and pushed to origin before closing.
+Closing a disposable workspace unmounts its filesystem and recursively deletes the job directory. For retained Kata or InstaBox workspaces, stop and resume to keep the same workspace; use Close only when you intend to release its retained data. Ensure necessary changes are committed, pushed, or checkpointed before closing.
 :::
 
 ## The workspace cockpit

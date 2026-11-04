@@ -37,7 +37,8 @@ MCP Events webhook delivery
 Dashboard Terminal (browser)
   -> /dashboard BFF on the API (session cookie, Origin, CSRF)
   -> runner internal terminal operation (service bearer, not an MCP tool)
-  -> Docker Engine API exec with a PTY over the runner's unix socket
+  -> Docker Engine API exec with a PTY over the runner's unix socket, or
+     provider terminal WebSocket for a retained InstaBox workspace
   -> interactive shell inside the workspace's existing executor
 
 Dashboard webchat (browser)
@@ -95,6 +96,17 @@ read-only root filesystem, receives one writable repository mount, and has no
 Docker socket or control-plane credentials. These controls reduce accidental
 impact; they do not create a hostile-tenant boundary because the executor
 shares the host kernel.
+
+The custom InstaBox backend is an opt-in remote execution path owned by the
+runner. It selects a machine only from the operator's exact allowlist and binds
+the allocation to one canonical principal. Remote-first admission applies only
+when `workspace_open` omits `networkProfile` and no persisted instance default
+exists; explicit `network-none` or `dependency-access` requests remain local.
+Remote work reports provider-managed networking rather than host-attested
+dependency egress, and stop/resume retains the same borrowed machine and
+workspace. Explicit close releases the scoped workspace data without deleting
+the provider machine. The key file is runner-only under the existing
+`/run/cloud-harness-secrets` mount; it never reaches API or guest processes.
 
 Remote Git is a runner-mediated boundary rather than executor egress. The
 runner pauses the executor while a no-network helper stages or imports a
@@ -159,11 +171,15 @@ engine. The browser never talks to the runner or Docker: the API BFF in
 rebuilds each request from the session and path, the runner dispatches it in
 [`apps/runner/src/workspace-service.ts`](../apps/runner/src/workspace-service.ts),
 and [`apps/runner/src/operation-manager.ts`](../apps/runner/src/operation-manager.ts)
-keeps the PTY beside the pipe-based shells and sessions over the transport in
-[`apps/runner/src/docker-pty.ts`](../apps/runner/src/docker-pty.ts). The runner
-talks to the Engine API directly because the Docker CLI cannot allocate a TTY
-without a local one. The browser pulls output with long-poll reads over
-ordinary dashboard requests. [ADR 0003](adr/0003-terminal-bash-and-managed-toolbox.md) records
+keeps the PTY beside the pipe-based shells and sessions. Local Docker/Kata
+terminals use [`apps/runner/src/docker-pty.ts`](../apps/runner/src/docker-pty.ts);
+InstaBox terminals use the provider WebSocket through
+[`apps/runner/src/executors/instabox-pty.ts`](../apps/runner/src/executors/instabox-pty.ts).
+The runner talks to the Engine API directly for local PTYs because the Docker
+CLI cannot allocate a TTY without a local one. The browser pulls output with
+long-poll reads over ordinary dashboard requests. Browser reconnect can reuse a
+live provider terminal, but a provider transport loss cannot be transparently
+reconnected or replay input; open a fresh terminal. [ADR 0003](adr/0003-terminal-bash-and-managed-toolbox.md) records
 the decision; the [security model](security-model.md#dashboard-terminal) records
 its boundary.
 

@@ -139,3 +139,7 @@ describe('workspace cockpit', () => {
     expect(dialog).toContain('Stages the changes');
   });
 });
+
+it('labels remote provider networking without claiming isolation', () => {
+  expect(renderWorkspaceCockpitHeader({ ...base, networkProfile: 'provider-managed' })).toContain('Provider-managed network');
+});

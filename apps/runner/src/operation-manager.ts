@@ -11,6 +11,7 @@ import {
   type TerminalStatus,
   type TerminalView
 } from '@cloud-harness/contracts';
+import type { RemoteExecutionAccess, RemoteExecutorRef } from './executors/execution-backend.js';
 import { spawnDocker, terminateContainerProcessGroup } from './docker-engine.js';
 import { DockerPtyClient, type PtyConnection, type PtyEnd, type PtyTransport } from './docker-pty.js';
 import type { DurableTaskStatus, StateStore } from './state-store.js';
@@ -25,6 +26,7 @@ type Managed = {
   status: ManagedStatus;
   createdAt: number;
   idempotencyKey: string;
+  remote?: { ref: RemoteExecutorRef; offset: number; replayBytes: number; activityAt: number; outputFailed?: boolean | undefined; cancelled?: boolean | undefined; cancelling?: Promise<void> | undefined; redaction?: RedactionStream | undefined; pending: Promise<void>; timer?: NodeJS.Timeout | undefined; polling?: Promise<void> | undefined } | undefined;
   child?: ChildProcessWithoutNullStreams | undefined;
   container?: string | undefined;
   exitCode?: number | undefined;
@@ -45,6 +47,7 @@ type Managed = {
   finishedAt?: number | undefined;
 };
 export type TrackedOperation = {
+  cancelRemote?: (() => Promise<void>) | undefined;
   id: string;
   workspaceId?: string | undefined;
   /**
@@ -95,6 +98,7 @@ export const DEFAULT_TERMINAL_LIMITS: TerminalLimits = {
 };
 
 export type TerminalOptions = {
+  remoteExecution?: RemoteExecutionAccess | undefined;
   transport?: PtyTransport | undefined;
   limits?: { [Key in keyof TerminalLimits]?: TerminalLimits[Key] | undefined } | undefined;
 };
@@ -198,6 +202,9 @@ export class TerminalOutput {
 }
 
 type TerminalRecord = {
+  remoteRef?: RemoteExecutorRef | undefined;
+  activityTimer?: NodeJS.Timeout | undefined;
+  transport: PtyTransport;
   id: string;
   workspaceId: string;
   ownerId: string;
@@ -285,6 +292,7 @@ export class OperationManager {
   terminalWorkspaceLease?: (workspaceId: string) => TerminalWorkspaceLease | undefined;
   private readonly terminals = new Map<string, TerminalRecord>();
   private readonly terminalLimits: TerminalLimits;
+  private readonly remoteExecution?: RemoteExecutionAccess | undefined;
   private terminalTransport?: PtyTransport | undefined;
 
   constructor(
@@ -298,6 +306,7 @@ export class OperationManager {
     }
     this.terminalLimits = limits;
     this.terminalTransport = terminalOptions.transport;
+    this.remoteExecution = terminalOptions.remoteExecution;
   }
 
   hasTaskKey(key: string, ownerId?: string, workspaceId?: string): boolean {
@@ -475,6 +484,16 @@ export class OperationManager {
       idempotencyKey: mapKey,
       ...(name ? { name } : {})
     };
+    if (this.remoteExecution?.resolve(workspaceId)) {
+      record.cwd = cwd;
+      record.maxBytes = maxBytes;
+      record.timeoutMs = this.terminalLimits.maxLifetimeMs;
+      record.startedAt = Date.now();
+      map.set(record.id, record);
+      this.idempotency.set(mapKey, record.id);
+      this.startRemote(record, 'shell');
+      return record;
+    }
     const child = spawnDocker([
       'exec', '-i', '-w', `/workspace/${cwd === '.' ? '' : cwd}`,
       container, '/usr/bin/setsid', '--wait', '/opt/harness/shell-runner.sh', recordId
@@ -492,7 +511,13 @@ export class OperationManager {
   private interactiveIo(map: Map<string, Managed>, workspaceId: string, recordId: string, input?: string): Managed {
     const record = map.get(recordId);
     if (!record || record.workspaceId !== workspaceId) throw new HarnessError('NOT_FOUND', 'interactive session not found', 404, false);
-    if (input && record.status === 'running') record.child?.stdin.write(input);
+    if (input && record.status === 'running') {
+      if (record.remote) {
+        const remote = record.remote;
+        remote.pending = remote.pending.then(() => this.remoteExecution!.backend.writeJob(remote.ref, record.id, input));
+        void remote.pending.catch(() => { record.errorCode = 'UNAVAILABLE'; record.errorMessage = 'Remote input delivery could not be confirmed'; });
+      } else record.child?.stdin.write(input);
+    }
     return record;
   }
 
@@ -503,7 +528,8 @@ export class OperationManager {
   private async closeInteractive(map: Map<string, Managed>, workspaceId: string, recordId: string): Promise<Managed> {
     const record = this.interactiveIo(map, workspaceId, recordId);
     if (record.status !== 'running') return record;
-    await terminateContainerProcessGroup(record.container!, `/tmp/cloud-harness-shells/${record.id}.pid`);
+    if (record.remote) await this.cancelRemote(record);
+    else await terminateContainerProcessGroup(record.container!, `/tmp/cloud-harness-shells/${record.id}.pid`);
     record.status = 'cancelled';
     record.child?.stdin.end();
     record.child?.kill();
@@ -674,7 +700,216 @@ export class OperationManager {
     return record;
   }
 
+  private persistRemote(record: Managed): void {
+    if (!this.store || !record.ownerId || !this.tasks.has(record.id)) return;
+    const current = this.store.getDurableTask(record.ownerId, record.workspaceId, record.id);
+    if (!current) throw new HarnessError('CONFLICT', 'Durable remote task no longer exists', 409, false);
+    if (!['RUNNING', 'QUEUED'].includes(current.status) || current.generation !== (record.generation ?? 1)) {
+      record.generation = current.generation;
+      const live = this.tasks.get(record.id)!;
+      live.generation = current.generation;
+      if (!['RUNNING', 'QUEUED'].includes(current.status)) {
+        live.status = current.status.toLowerCase() as ManagedStatus;
+        live.exitCode = current.exitCode ?? undefined;
+        live.finishedAt = current.finishedAt ?? undefined;
+        if (live.remote) live.remote.cancelled = true;
+        this.reconcileQueued(record.workspaceId);
+        this.settleTask(live);
+      }
+      throw new HarnessError('CONFLICT', 'Durable remote task changed during reconciliation', 409, true);
+    }
+    const updates = {
+      status: record.status.toUpperCase() as DurableTaskStatus,
+      ...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
+      ...(record.finishedAt !== undefined ? { finishedAt: record.finishedAt } : {}),
+      ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
+      ...(record.errorCode !== undefined ? { errorCode: record.errorCode } : {}),
+      outputBytes: record.outputBytes ?? 0
+    };
+    if (Object.entries(updates).every(([key, value]) => current[key as keyof typeof current] === value)) return;
+    if (!this.store.updateDurableTaskStatus(record.id, current.generation, updates)) {
+      const refreshed = this.store.getDurableTask(record.ownerId, record.workspaceId, record.id);
+      if (refreshed) { record.generation = refreshed.generation; this.tasks.get(record.id)!.generation = refreshed.generation; }
+      throw new HarnessError('CONFLICT', 'Remote task transition lost its durable fence', 409, true);
+    }
+    record.generation = current.generation + 1;
+  }
+
+  private startRemote(record: Managed, kind: 'task' | 'shell', recovering = false): void {
+    const access = this.remoteExecution!;
+    const ref = access.resolve(record.workspaceId)!;
+    // Raw offsets cannot be reconstructed from redacted byte counts. Replay through the
+    // redactor after restart and skip exactly the bytes already committed to the spool.
+    const replayBytes = recovering && record.logPath && existsSync(record.logPath) ? statSync(record.logPath).size : 0;
+    record.outputBytes = replayBytes;
+    const remote = record.remote = {
+      ref, offset: 0, replayBytes, activityAt: 0,
+      redaction: this.redactorProvider?.(record.workspaceId)?.createStream(),
+      pending: Promise.resolve()
+    } as NonNullable<Managed['remote']>;
+    if (!recovering) {
+      remote.pending = access.backend.startJob(ref, {
+        id: record.id, kind, ...(record.command !== undefined ? { command: record.command } : {}),
+        cwd: record.cwd ?? '.', timeoutMs: record.timeoutMs ?? this.terminalLimits.maxLifetimeMs,
+        maxBytes: record.maxBytes!, fingerprint: createHash('sha256').update(JSON.stringify({
+          id: record.id, command: record.command, cwd: record.cwd, timeoutMs: record.timeoutMs, maxBytes: record.maxBytes
+        })).digest('hex')
+      });
+    }
+    // A lost response is not evidence of failure and must never trigger a second start.
+    void remote.pending.catch(() => undefined).then(() => this.pollRemote(record));
+  }
+
+  private appendRemote(record: Managed, chunk: Buffer): void {
+    const remote = record.remote!;
+    if (remote.replayBytes > 0) {
+      const skip = Math.min(remote.replayBytes, chunk.length);
+      remote.replayBytes -= skip;
+      chunk = chunk.subarray(skip);
+    }
+    if (!chunk.length) return;
+    const remaining = Math.max(0, record.maxBytes! - (record.outputBytes ?? 0));
+    if (record.logPath && remaining) appendFileSync(record.logPath, chunk.subarray(0, remaining));
+    record.outputBytes = (record.outputBytes ?? 0) + chunk.length;
+    const next = Buffer.concat([record.output, chunk]);
+    const removed = Math.max(0, next.length - record.maxBytes!);
+    record.output = next.subarray(removed);
+    record.offset += removed;
+    this.enforceOutputBudget(record.workspaceId);
+  }
+
+  private pollRemote(record: Managed): Promise<void> {
+    const remote = record.remote!;
+    if (remote.polling) return remote.polling;
+    if (record.status !== 'running' || remote.cancelled || remote.cancelling) return Promise.resolve();
+    remote.polling = (async () => {
+      try {
+        const backend = this.remoteExecution!.backend;
+        if (!record.errorCode && Date.now() - (record.startedAt ?? record.createdAt) > record.timeoutMs!) {
+          await backend.cancelJob(remote.ref, record.id);
+          record.errorCode = 'TIMEOUT';
+        }
+        const observation = await backend.readJob(remote.ref, record.id, remote.offset, 65_536);
+        if (record.status !== 'running' || remote.cancelled || remote.cancelling) return;
+        if (observation.status === 'unknown') return;
+        if (observation.nextOffset !== remote.offset + observation.output.length || observation.output.length > 65_536) {
+          throw new HarnessError('UNAVAILABLE', 'Invalid remote output cursor', 503, true);
+        }
+        try {
+          if (remote.outputFailed) throw new Error('Task output spool failed');
+          this.appendRemote(record, remote.redaction ? remote.redaction.processChunk(observation.output) : observation.output);
+          if (observation.status === 'exited' && observation.output.length === 0 && observation.exitCode !== undefined && remote.redaction) {
+            this.appendRemote(record, remote.redaction.flush());
+          }
+        } catch {
+          remote.outputFailed = true;
+          await backend.cancelJob(remote.ref, record.id);
+          await this.finishRemote(record, 1, 'INTERNAL_ERROR');
+          return;
+        }
+        remote.offset = observation.nextOffset;
+        // Drain the bounded guest spool before publishing the terminal state.
+        if (observation.status === 'exited' && observation.output.length === 0) {
+          if (observation.exitCode === undefined) return;
+          await this.finishRemote(record, observation.exitCode, observation.errorCode ?? record.errorCode);
+        } else {
+          this.persistRemote(record);
+          if ((observation.status === 'running' || observation.status === 'starting') && Date.now() - remote.activityAt >= 30_000) {
+            await backend.activity(remote.ref, record.id, true);
+            remote.activityAt = Date.now();
+          }
+        }
+      } catch {
+        // Network errors and ambiguous guest state leave the durable intent active.
+        // The next observation reconciles it without dispatching the command again.
+      } finally {
+        remote.polling = undefined;
+        if (record.status === 'running' && !remote.cancelled && !remote.cancelling) {
+          remote.timer = setTimeout(() => { void this.pollRemote(record); }, 250);
+          remote.timer.unref();
+        }
+      }
+    })();
+    return remote.polling;
+  }
+
+  private async finishRemote(record: Managed, exitCode: number, errorCode?: string): Promise<void> {
+    const completed: Managed = { ...record, exitCode, errorCode,
+      status: exitCode === 0 && !errorCode ? 'succeeded' : 'failed', finishedAt: Date.now() };
+    // Publish completion only after the durable transition commits.
+    this.persistRemote(completed);
+    Object.assign(record, completed);
+    await this.remoteExecution!.backend.activity(record.remote!.ref, record.id, false).catch(() => undefined);
+    this.reconcileQueued(record.workspaceId);
+    if (this.tasks.has(record.id)) this.settleTask(record);
+  }
+
+  /** Stop host observation without cancelling durable guest jobs during runner shutdown. */
+  async detachRemoteOperations(): Promise<void> {
+    const pending: Promise<unknown>[] = [];
+    for (const record of [...this.tasks.values(), ...this.shells.values(), ...this.sessions.values()]) {
+      if (!record.remote) continue;
+      record.remote.cancelled = true;
+      clearTimeout(record.remote.timer);
+      pending.push(record.remote.pending.catch(() => undefined));
+      if (record.remote.polling) pending.push(record.remote.polling);
+    }
+    for (const terminal of this.terminals.values()) {
+      if (!terminal.remoteRef) continue;
+      await this.cleanTerminalSession(terminal);
+      this.endTerminal(terminal, 'closed', 'runner stopped');
+    }
+    await Promise.all(pending);
+  }
+
+  async awaitRemoteOperation(workspaceId: string, operationId: string): Promise<void> {
+    const record = this.records(workspaceId).find((item) => item.id === operationId);
+    await record?.remote?.pending;
+  }
+
+  private async cancelRemote(record: Managed): Promise<void> {
+    const remote = record.remote!;
+    if (remote.cancelling) return remote.cancelling;
+    clearTimeout(remote.timer);
+    remote.cancelling = (async () => {
+      await remote.pending.catch(() => undefined);
+      await this.remoteExecution!.backend.cancelJob(remote.ref, record.id);
+      remote.cancelled = true;
+      await this.remoteExecution!.backend.activity(remote.ref, record.id, false).catch(() => undefined);
+    })();
+    try { await remote.cancelling; }
+    finally {
+      remote.cancelling = undefined;
+      if (!remote.cancelled && record.status === 'running') {
+        remote.timer = setTimeout(() => { void this.pollRemote(record); }, 250);
+        remote.timer.unref();
+      }
+    }
+  }
+
+  /** Restore the complete dependency graph before reconciling any active remote task. */
+  async reconcileRemoteTasks(workspaceId: string, ownerId: string): Promise<void> {
+    if (!this.store || !this.remoteExecution?.resolve(workspaceId)) return;
+    const records = this.listTasks(workspaceId, ownerId);
+    for (const record of records) {
+      if (!this.tasks.has(record.id)) this.tasks.set(record.id, record);
+    }
+    for (const record of records) {
+      if (record.status === 'running' && !record.remote) this.startRemote(record, 'task', true);
+    }
+    this.reconcileQueued(workspaceId);
+    await Promise.all(records.filter((record) => record.remote).map((record) => this.pollRemote(record)));
+  }
+
   private startTask(record: Managed): void {
+    if (this.remoteExecution?.resolve(record.workspaceId)) {
+      record.status = 'running';
+      record.startedAt = Date.now();
+      this.persistRemote(record);
+      this.onTaskStart?.(record.workspaceId, record.timeoutMs ?? 60_000);
+      this.startRemote(record, 'task');
+      return;
+    }
     const timeoutSeconds = Math.max(1, Math.ceil(record.timeoutMs! / 1_000));
     const child = spawnDocker([
       'exec', '-i', '-w', `/workspace/${record.cwd === '.' ? '' : record.cwd}`, '-e', `CH_COMMAND=${record.command}`,
@@ -817,7 +1052,16 @@ export class OperationManager {
       return record;
     }
     if (record.status !== 'running') return record;
-    if (record.container) {
+    if (record.remote) {
+      await this.cancelRemote(record);
+      if (record.status !== 'running') return record;
+      const completed: Managed = { ...record, status: 'cancelled', finishedAt: Date.now() };
+      this.persistRemote(completed);
+      Object.assign(record, completed);
+      this.reconcileQueued(workspaceId);
+      this.settleTask(record);
+      return record;
+    } else if (record.container) {
       await terminateContainerProcessGroup(record.container, `/tmp/cloud-harness-tasks/${record.id}.pid`);
     }
     record.status = 'cancelled';
@@ -835,6 +1079,9 @@ export class OperationManager {
     return record;
   }
   async stopWorkspace(workspaceId: string, ownerId?: string): Promise<void> {
+    for (const terminal of this.terminals.values()) {
+      if (terminal.workspaceId === workspaceId && this.remoteExecution?.resolve(workspaceId)) await this.cleanTerminalSession(terminal);
+    }
     this.stopWorkspaceTerminals(workspaceId);
     const activeRecords = this.records(workspaceId).filter(
       (record) => record.status === 'running' || record.status === 'queued'
@@ -842,6 +1089,7 @@ export class OperationManager {
     const exitPromises: Promise<void>[] = [];
 
     for (const record of activeRecords) {
+      if (record.remote) await this.cancelRemote(record);
       if (record.child && (record.child.exitCode === null && record.child.signalCode === null)) {
         const child = record.child;
         const exitPromise = new Promise<void>((resolve, reject) => {
@@ -889,6 +1137,10 @@ export class OperationManager {
     for (const record of activeRecords) {
       record.status = 'cancelled';
       record.finishedAt = now;
+      if (record.remote) {
+        this.persistRemote(record);
+        continue;
+      }
       if (this.store && this.tasks.has(record.id)) {
         try {
           const current = this.store.getDurableTask(ownerId ?? record.ownerId ?? '', record.workspaceId, record.id);
@@ -910,6 +1162,7 @@ export class OperationManager {
     for (const op of this.genericOperations.values()) {
       if (op.workspaceId === workspaceId) {
         if (op.status === 'running' || op.status === 'queued') {
+          if (op.cancelRemote) await op.cancelRemote();
           op.status = 'cancelled';
           op.finishedAt = Date.now();
           op.error = { code: 'CANCELLED', message: 'Workspace stopped or closed', retryable: false };
@@ -1082,6 +1335,7 @@ export class OperationManager {
     const op = this.genericOperations.get(id);
     if (op) {
       if (op.status === 'running' || op.status === 'queued') {
+        if (op.cancelRemote) await op.cancelRemote();
         op.status = 'cancelled';
         op.finishedAt = Date.now();
         if (op.abortController) {
@@ -1207,6 +1461,7 @@ export class OperationManager {
     record.endedAt = Date.now();
     record.endReason = reason.slice(0, 200);
     if (exitCode !== undefined) record.exitCode = exitCode;
+    if (record.activityTimer) clearInterval(record.activityTimer);
     if (record.idleTimer) clearTimeout(record.idleTimer);
     if (record.lifetimeTimer) clearTimeout(record.lifetimeTimer);
     record.idleTimer = undefined;
@@ -1226,8 +1481,11 @@ export class OperationManager {
   /** End every process left in the terminal's session (job-control children in other process groups too). */
   private cleanTerminalSession(record: TerminalRecord): Promise<void> {
     if (record.sessionCleaned) return Promise.resolve();
-    record.cleaning ??= this.ptyTransport().killSession(record.container, record.id)
-      .then(() => { record.sessionCleaned = true; })
+    record.cleaning ??= record.transport.killSession(record.container, record.id)
+      .then(async () => {
+        record.sessionCleaned = true;
+        if (record.remoteRef) await this.remoteExecution!.backend.activity(record.remoteRef, record.id, false).catch(() => undefined);
+      })
       .finally(() => { record.cleaning = undefined; });
     return record.cleaning;
   }
@@ -1261,7 +1519,7 @@ export class OperationManager {
     let exitCode: number | null = null;
     try {
       for (let attempt = 0; attempt < 40; attempt += 1) {
-        const state = await this.ptyTransport().inspect(record.connection!.execId);
+        const state = await record.transport.inspect(record.connection!.execId);
         if (!state.running) {
           exitCode = state.exitCode;
           break;
@@ -1295,6 +1553,8 @@ export class OperationManager {
     }
     const now = Date.now();
     const record: TerminalRecord = {
+      remoteRef: this.remoteExecution?.resolve(input.workspaceId),
+      transport: this.remoteExecution?.resolve(input.workspaceId) ? this.remoteExecution.backend.pty(this.remoteExecution.resolve(input.workspaceId)!) : this.ptyTransport(),
       id: id('term'),
       workspaceId: input.workspaceId,
       ownerId: input.ownerId,
@@ -1317,7 +1577,7 @@ export class OperationManager {
     this.terminals.set(record.id, record);
     let connection: PtyConnection;
     try {
-      connection = await this.ptyTransport().open({
+      connection = await record.transport.open({
         container: input.container,
         terminalId: record.id,
         workingDir: `/workspace/${input.cwd === '.' ? '' : input.cwd}`,
@@ -1327,7 +1587,7 @@ export class OperationManager {
     } catch (error) {
       this.terminals.delete(record.id);
       // The exec may already exist (a start handshake that timed out); end whatever it started, best effort.
-      void this.ptyTransport().killSession(input.container, record.id).catch(() => undefined);
+      void record.transport.killSession(input.container, record.id).catch(() => undefined);
       throw error;
     }
     if (!this.terminals.has(record.id)) {
@@ -1337,6 +1597,12 @@ export class OperationManager {
     }
     record.connection = connection;
     record.opening = false;
+    if (record.remoteRef) {
+      const renew = () => { if (record.status === 'running') void this.remoteExecution!.backend.activity(record.remoteRef!, record.id, true).catch(() => undefined); };
+      renew();
+      record.activityTimer = setInterval(renew, 30_000);
+      record.activityTimer.unref();
+    }
     connection.onData((chunk) => this.appendTerminalOutput(record, chunk));
     connection.onEnd((end) => { void this.settleTerminalStream(record, end); });
     this.armIdleTimer(record);
@@ -1401,7 +1667,7 @@ export class OperationManager {
     const record = this.requireTerminal(ownerId, workspaceId, terminalId);
     if (record.status !== 'running' || !record.connection) throw new HarnessError('CONFLICT', 'terminal is not running', 409, false);
     this.noteWorkspaceActivity(record);
-    await this.ptyTransport().resize(record.connection.execId, cols, rows);
+    await record.transport.resize(record.connection.execId, cols, rows);
     record.cols = cols;
     record.rows = rows;
     this.touchTerminal(record);

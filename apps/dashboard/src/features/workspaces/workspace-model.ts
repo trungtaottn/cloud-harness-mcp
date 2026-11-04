@@ -9,6 +9,9 @@ export type Workspace = {
   ref?: string;
   status?: string;
   networkProfile?: string;
+  executorKind?: 'docker' | 'kata' | 'instabox';
+  installedSoftwareRetained?: boolean;
+  retention?: 'explicit-close-only';
   createdAt?: string;
   lastActivityAt?: string;
   expiresAt?: string;
@@ -32,7 +35,7 @@ export function workspaceStatusLabel(status: unknown): string {
 }
 
 export function networkLabel(profile: unknown): string {
-  return profile === 'dependency-access' ? 'Dependency access' : profile === 'local-host' ? 'Local host' : 'No network';
+  return profile === 'dependency-access' ? 'Dependency access' : profile === 'local-host' ? 'Local host' : profile === 'provider-managed' ? 'Provider-managed network' : 'No network';
 }
 
 /** `owner/repo` from a credential-free HTTPS repository URL. */

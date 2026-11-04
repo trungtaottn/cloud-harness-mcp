@@ -714,14 +714,16 @@ recorded in
 [ADR 0003](adr/0003-terminal-bash-and-managed-toolbox.md); this section records
 the boundary it keeps.
 
-- **Same executor, no new authority.** The runner opens the PTY through the
-  Docker Engine API exec call on the socket it already holds, inside the
-  workspace's existing hardened executor, as uid 10001. Nothing runs in the
-  API, the runner, or on the host, and the executor gains no capability, mount,
-  or credential. Because the exec needs the Engine API directly, terminals
-  require a unix `DOCKER_HOST`; any other value makes them unavailable rather
-  than falling back to another transport. Owner:
-  [`apps/runner/src/docker-pty.ts`](../apps/runner/src/docker-pty.ts).
+- **Same executor, no new authority.** Local Docker/Kata workspaces open the
+  PTY through the Docker Engine API exec call on the socket the runner already
+  holds, inside the existing hardened executor, as uid 10001. InstaBox
+  workspaces use the provider terminal WebSocket through the runner's
+  allocation-bound adapter; nothing runs in the API or on the host, and the
+  remote guest gains no control-plane credential. Local terminals require a
+  unix `DOCKER_HOST`; any other value makes them unavailable rather than
+  falling back to another transport. Owners:
+  [`apps/runner/src/docker-pty.ts`](../apps/runner/src/docker-pty.ts) and
+  [`apps/runner/src/executors/instabox-pty.ts`](../apps/runner/src/executors/instabox-pty.ts).
 - **Dashboard-only, re-authorized per call.** Terminal operations are internal
   runner operations, not MCP tools; agents keep `shell_*` and `sessions_*`. The
   browser reaches them only through the dashboard BFF, under the same session
@@ -749,8 +751,11 @@ the boundary it keeps.
   keystrokes and output are never audited, and the PTY transport never logs
   payloads.
 - **No resumption.** PTYs live in runner memory. A runner restart forgets
-  them, the dashboard reports them as lost, and nothing is resumed. Close ends
-  the whole PTY session, including job-control children.
+  them, the dashboard reports them as lost, and nothing is resumed. A browser
+  reconnect can reuse a live InstaBox provider connection; after that provider
+  WebSocket ends, transparent reconnect is refused so bytes or input are not
+  replayed—open a fresh terminal. Close ends the whole PTY session, including
+  job-control children.
 - **Browser posture.** The emulator is the vendored `@xterm/xterm` and
   `@xterm/addon-fit`, served same-origin from an explicit allow-list in
   [`apps/api/src/dashboard-assets.ts`](../apps/api/src/dashboard-assets.ts)
@@ -1456,3 +1461,40 @@ limit. This does not establish hostile multi-tenant isolation or hard block
 quotas. The guest has an OCI userspace, not unrestricted control of host devices
 or a guarantee of nested Docker/systemd compatibility. See the
 [custom fork guide](custom-fork.md#persistent-vm-executor).
+
+## Custom InstaBox remote executor boundary
+
+The custom fork's InstaBox backend is disabled by default and is intended for
+the same private, single-owner trust domain. Enabling it requires a runner-only
+API-key file, an exact operator machine allowlist, one canonical provider
+principal, and explicit public-network consent. The API key is read by the
+runner and never enters the API process, guest environment, checkout, logs, or
+MCP results; the production runner's existing read-only secret mount is
+`/run/cloud-harness-secrets`.
+
+Remote-first admission is deliberately narrow: it applies only when
+`workspace_open` omits `networkProfile` and no persisted instance default is
+present. Explicit `network-none` and `dependency-access` requests stay on the
+local backend, and local Kata is only a capacity fallback. Remote capabilities
+report `provider-managed` networking. That is provider-managed public egress,
+not the host-firewall-attested `dependency-access` boundary, and it must not be
+described as such or used to satisfy a network restriction request.
+
+The allowlisted machines are borrowed provider resources, not disposable
+containers owned by Cloud Harness. Stop and resume retain the same allocation,
+machine, checkout, and installed software. Explicit `workspace_close` is the
+release-and-delete path for the scoped workspace data; it does not delete the
+provider machine. Remote workspaces support direct guest installation but not
+managed package mounts or approved project dependency caches. The provider's
+Free policy carries no billing, a 30-minute idle pause, an eight-hour maximum
+run, and start cooldowns. A single archive upload is capped at 5 GiB, distinct
+from the runner's separate soft workspace-size ceiling.
+
+The remote Dashboard terminal keeps browser reconnects on a live provider
+connection. After the provider WebSocket itself is lost, transparent reconnect
+is refused to avoid replaying bytes or input; open a fresh terminal and do not
+replay input. See [`RemoteWorkspace`](../apps/runner/src/remote-workspace.ts),
+the InstaBox backend, and the lifecycle contract in
+[`workspace-service.ts`](../apps/runner/src/workspace-service.ts) for executable
+ownership. Source changes do not prove production activation or deployment of a
+latest image.

@@ -473,6 +473,9 @@ export class PackageService {
     }
     const plan = this.store.getPlan(ownerId, request.planId);
     if (!plan) throw harness('NOT_FOUND', 'package plan not found', 404);
+    if (plan.workspaceId && this.options.database.prepare("SELECT id FROM workspaces WHERE id=? AND owner_id=? AND executor_kind='instabox'").get(plan.workspaceId, ownerId)) {
+      throw harness('NOT_SUPPORTED', 'Install tools directly in remote guests; managed package mounts are unavailable', 400);
+    }
     const now = this.clock();
     // Checks the store cannot make run only for a plan the store would otherwise accept, so a replay
     // still returns its apply and every other refusal keeps the store's code.
@@ -1104,9 +1107,10 @@ function bindingViewWithoutRelease(binding: PackageBindingRecord): PackageBindin
 export function databaseWorkspaceDirectory(database: DatabaseSync, store: PackageStore): PackageWorkspaceDirectory {
   return {
     isActive: (ownerId, workspaceId) => {
-      const row = database.prepare('SELECT status FROM workspaces WHERE id = ? AND owner_id = ?').get(workspaceId, ownerId) as { status: string } | undefined;
+      const row = database.prepare("SELECT status FROM workspaces WHERE id = ? AND owner_id = ? AND executor_kind != 'instabox'").get(workspaceId, ownerId) as { status: string } | undefined;
       return row?.status === 'ACTIVE';
     },
-    retained: (ownerId) => store.retainedWorkspaceIds(ownerId)
+    retained: (ownerId) => store.retainedWorkspaceIds(ownerId).filter(workspaceId =>
+      database.prepare("SELECT id FROM workspaces WHERE id = ? AND owner_id = ? AND executor_kind != 'instabox'").get(workspaceId, ownerId) !== undefined)
   };
 }

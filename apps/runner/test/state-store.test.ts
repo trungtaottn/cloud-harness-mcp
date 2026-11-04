@@ -618,3 +618,36 @@ describe('StateStore', () => {
     store.close();
   });
 });
+
+it('migrates the old executor constraint without changing local rows and retains remote tasks on restart', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'executor-migration-'));
+  temporaryDirectories.push(directory);
+  const path = join(directory, 'state.db');
+  let store = new StateStore(path);
+  const ownerId = store.resolvePrincipal({ kind: 'external', issuer: 'https://issuer.example', subject: 'test-owner' });
+  const local = { ...record(), ownerId };
+  const kata = { ...record(), ownerId, id: 'ws_kata', idempotencyKey: 'kata-request', executorKind: 'kata' as const };
+  store.create(local); store.create(kata);
+  store.database.exec(`ALTER TABLE workspaces ADD COLUMN executor_kind_old TEXT NOT NULL DEFAULT 'docker' CHECK(executor_kind_old IN ('docker','kata'));
+    UPDATE workspaces SET executor_kind_old = executor_kind;
+    ALTER TABLE workspaces DROP COLUMN executor_kind;
+    ALTER TABLE workspaces RENAME COLUMN executor_kind_old TO executor_kind;`);
+  store.close();
+  store = new StateStore(path);
+  expect(store.byId(local.id)?.executorKind).toBeUndefined();
+  expect(store.byId(kata.id)?.executorKind).toBe('kata');
+  const remote = { ...record(), ownerId, id: 'ws_remote', idempotencyKey: 'remote-request', executorKind: 'instabox' as const };
+  store.create({ ...remote, executorKind: undefined });
+  expect(store.updateFenced(remote.id, 99, ['CREATING'], { executorKind: 'instabox' })).toBeUndefined();
+  expect(store.updateFenced(remote.id, remote.generation, ['CREATING'], { executorKind: 'instabox' })?.executorKind).toBe('instabox');
+  expect(store.byId(remote.id)).toMatchObject({ executorKind: 'instabox', containerName: null });
+  for (const ws of [local, remote]) store.createDurableTask({
+    id: `task_${ws.id}`, workspaceId: ws.id, ownerId: ws.ownerId, name: null, command: 'sleep 10', cwd: '.',
+    status: 'RUNNING', idempotencyKey: null, requestFingerprint: null, bootId: 'old-boot', exitCode: null,
+    errorCode: null, errorMessage: null, timeoutMs: 60000, maxBytes: 1024, logPath: '/tmp/task.log',
+    outputBytes: 0, outputArtifactId: null, createdAt: 1, startedAt: 1, finishedAt: null
+  });
+  expect(store.reconcileRunningTasks('new-boot', Date.now())).toBe(1);
+  expect(store.database.prepare('SELECT status FROM durable_tasks WHERE workspace_id = ?').get(remote.id)).toMatchObject({ status: 'RUNNING' });
+  store.close();
+});
