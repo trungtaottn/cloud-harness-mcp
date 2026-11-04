@@ -93,6 +93,20 @@ describe('MultiLocalWorkspaceBackend', () => {
     expect(model.message).toContain('model_profile_list is unsupported in local mode');
   });
 
+  it('refuses dependency operations before selecting or checking a local root', async () => {
+    const rootAvailable = vi.spyOn(pool, 'rootAvailable');
+    const reopen = vi.spyOn(pool, 'reopen');
+    for (const operation of ['dependencies_plan', 'dependencies_apply', 'dependencies_status'] as const) {
+      for (const workspaceId of [undefined, id('netforge'), 'ws_unknownunknownunknownxx']) {
+        const result = await router.call(operation, { workspaceId, ecosystem: 'go' });
+        expect(result.error?.code).toBe('NOT_SUPPORTED');
+        expect(result.message).toContain('remote runner');
+      }
+    }
+    expect(rootAvailable).not.toHaveBeenCalled();
+    expect(reopen).not.toHaveBeenCalled();
+  });
+
   it('fails closed on a missing ID with multiple workspaces and on an unknown ID', async () => {
     const missing = await router.call('files_list', { path: '.' });
     expect(missing.error?.code).toBe('CONFLICT');

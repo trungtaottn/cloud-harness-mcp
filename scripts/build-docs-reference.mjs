@@ -18,6 +18,11 @@ await mkdir(publicDir, { recursive: true });
 
 const CATEGORIES = [
   {
+    title: 'Approved Project Dependencies',
+    description: 'Workspace manifest snapshots, mandatory operator approval and bounded registry-only cache downloads for offline execution.',
+    names: ['dependencies_plan', 'dependencies_apply', 'dependencies_status']
+  },
+  {
     title: 'Workspace Lifecycle',
     description: 'Tools for opening, inspecting, listing, secrets discovery, and closing isolated TTL-bound workspaces.',
     names: ['workspace_open', 'workspace_list', 'workspace_status', 'workspace_capabilities', 'workspace_context', 'workspace_set_active', 'workspace_lease_renew', 'workspace_recover', 'workspace_close', 'secrets_list']

@@ -22,6 +22,8 @@ import {
   repositoryGuidanceSummary,
   sanitizeAndAttributeProvenance,
   toolkitSelectionIdentity,
+  type DependenciesPlanInput,
+  type DependenciesApplyInput,
   type GuidanceProfile,
   type RepositoryGuidanceSnapshot,
   type AgentProxyOperation,
@@ -40,6 +42,9 @@ import {
 } from '@cloud-harness/contracts';
 import { inspectContainer, removeContainer, runDocker, terminateContainerProcessGroup } from './docker-engine.js';
 import { EXECUTOR_HARDENING_ARGS, EXECUTOR_RESOURCE_CEILINGS, TOOLBOX_STALE_AFTER_MS, managedPathEnvArgs, reapStaleToolboxContainers, runToolboxCommand, toolboxContainerName, withManagedBins, type ToolboxRunResult } from './toolbox-runner.js';
+import { DependencyBuilder } from './dependency-builder.js';
+import { DependencyStore } from './dependency-store.js';
+import { DependencyService, dependencyProfileDigest, reconcileDependencyStaging, type DependencyWorkspace } from './dependency-service.js';
 import { PackageBuilder } from './package-builder.js';
 import { PACKAGE_OPERATIONS, PackageService, databaseWorkspaceDirectory, type PackageOperation } from './package-service.js';
 import { PackageStore } from './package-store.js';
@@ -325,6 +330,9 @@ export class WorkspaceService {
   readonly toolkitCacheManager: ToolkitCacheManager;
   readonly toolkitService: ToolkitService;
   private packageService?: PackageService | undefined;
+  private dependencyService?: DependencyService;
+  private dependencyBuilder?: DependencyBuilder;
+  private readonly dependencyWorkspaces = new Set<string>();
 
   public readonly networkProfileManager: NetworkProfileManager;
   private readonly agentManager?: AgentManager | undefined;
@@ -612,6 +620,19 @@ export class WorkspaceService {
     }
     await this.toolkitCacheManager.reconcileStartup().catch(() => undefined);
     await this.reconcileContainers();
+    if (this.config.dependenciesEnabled || this.store.database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='dependency_plans'").get()) {
+      void this.dependencies;
+      await this.dependencyBuilder!.cleanupStale();
+      const retained = this.store.database.prepare("SELECT id FROM workspaces WHERE status IN ('ACTIVE', 'EXPIRED_RECOVERABLE', 'NETWORK_QUARANTINED')").all() as Array<{ id: string }>;
+      for (const { id } of retained) {
+        const record = this.store.byId(id)!;
+        if (!existsSync(record.workspacePath)) continue;
+        const inspection = record.containerName ? await inspectContainer(record.containerName) : undefined;
+        const running = (inspection?.State as { Running?: boolean } | undefined)?.Running;
+        if (running) await this.withPausedExecutor(record, () => reconcileDependencyStaging(record.workspacePath));
+        else await reconcileDependencyStaging(record.workspacePath);
+      }
+    }
     // After leftover containers are gone, so no builder can still be writing below the packages root.
     if (this.config.packagesEnabled === true) await this.packages.reconcileStartup();
     await this.reconcileJobDirectories();
@@ -625,9 +646,54 @@ export class WorkspaceService {
   }
 
   /**
-   * Managed toolbox packages: plans, durable applies, releases, and the per-workspace mount profiles.
-   * Built on first use so a runner with managed packages off never validates their paths.
+   * Approved project caches have a separate policy from managed CLI packages.
+   * Lazy construction also permits Dashboard status while downloads are disabled.
    */
+  get dependencies(): DependencyService {
+    if (!this.dependencyService) {
+      const builder = new DependencyBuilder({ executorImage: this.config.executorImage, instanceId: this.instanceId,
+        network: this.config.provisioningNetwork || 'cloud-harness-mcp_provisioning', proxy: this.config.toolkitEgressProxy ?? 'http://provisioning-proxy:3128' });
+      this.dependencyBuilder = builder;
+      this.dependencyService = new DependencyService({
+        store: new DependencyStore(this.store.database), builder,
+        enabled: this.config.dependenciesEnabled, approvalAvailable: hasOperatorDashboard(this.config.authMode),
+        timeoutMs: this.config.dependenciesTimeoutMs, maxBytes: this.config.dependenciesMaxBytes,
+        withWorkspace: (ownerId, workspaceId, action, planning) => this.withDependencyWorkspace(ownerId, workspaceId, action, planning),
+        audit: (ownerId, action, plan) => {
+          try { this.metadata?.recordAudit(ownerId, action, 'dependency_plan', plan.planId, 1, { workspaceId: plan.workspaceId, ecosystem: plan.ecosystem, state: plan.state }); } catch { /* Audit contains no manifest content. */ }
+        }
+      });
+    }
+    return this.dependencyService;
+  }
+
+  private async withDependencyWorkspace<T>(ownerId: string, workspaceId: string, action: (workspace: DependencyWorkspace) => Promise<T>, planning = false): Promise<T> {
+    const record = this.requireWorkspace(ownerId, workspaceId);
+    if (this.dependencyWorkspaces.has(record.id) || this.recreatingWorkspaces.has(record.id)
+      || (!planning && ((this.workspaceRequests.get(record.id) ?? 0) > 1 || (record.mutationLockedUntil ?? 0) > Date.now()
+      || this.operations.hasActiveWorkspaceWork(record.id) || this.agentManager?.hasActiveAgents(ownerId, record.id)))) {
+      throw new HarnessError('CONFLICT', 'workspace is busy; finish active commands, agents, tasks and terminals before preparing dependency cache', 409, true);
+    }
+    this.dependencyWorkspaces.add(record.id);
+    try {
+      return await this.withMutationLease(record, async () => {
+        const paths = await this.provisionMountDirectories(record);
+        const profile = this.config.packagesEnabled ? this.packages.profileFor(ownerId, record.id) : { mounts: [], binDirs: [], releaseIds: [] };
+        return action({ repositoryRoot: await realpath(join(record.workspacePath, 'repo')), workspacePath: record.workspacePath,
+          ...paths, maxWorkspaceBytes: this.config.maxWorkspaceBytes, minFreeBytes: this.config.minFreeBytes,
+          toolMounts: profile.mounts, binDirs: profile.binDirs, profileDigest: dependencyProfileDigest(profile.releaseIds),
+          paused: (callback) => this.withPausedExecutor(record, callback),
+          assertCurrent: () => {
+            const current = this.store.byOwnerAndId(ownerId, record.id);
+            if (!current || current.status !== 'ACTIVE' || current.generation !== record.generation || current.hardExpiresAt <= Date.now()) {
+              throw new HarnessError('EXPIRED', 'workspace lifecycle changed during dependency download', 410);
+            }
+          }
+        });
+      }, this.config.dependenciesTimeoutMs);
+    } finally { this.dependencyWorkspaces.delete(record.id); }
+  }
+
   get packages(): PackageService {
     if (!this.packageService) {
       const builder = new PackageBuilder({
@@ -659,6 +725,7 @@ export class WorkspaceService {
     clearInterval(this.reaper);
     await this.agentManager?.stop();
     await this.packageService?.shutdown();
+    await this.dependencyService?.shutdown();
   }
   private async reconcileContainers(): Promise<void> {
     const managed = await runDocker([
@@ -816,7 +883,7 @@ export class WorkspaceService {
           '--network', 'none', '--user', '0:0', '--read-only',
           '--pids-limit', '32', '--memory', '128m', '--memory-swap', '128m', '--cpus', '0.25',
           '--volume', `${record.workspacePath}:/target:ro`, '--entrypoint', '/usr/bin/du', this.config.executorImage,
-          '-sb', '--apparent-size', '/target'
+          '-sb', '--apparent-size', '/target/repo', '/target/tools', '/target/cache'
         ], { timeoutMs: 30_000, maxBytes: 8_192 });
       } finally {
         await removeContainer(helperName);
@@ -2813,10 +2880,10 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   }
 
   async execute(principal: PrincipalSelector | string, operation: RunnerOperation, input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
-    return this.trackWorkspaceRequest(principal, input, () => this.executeRequest(principal, operation, input, signal));
+    return this.trackWorkspaceRequest(principal, input, () => this.executeRequest(principal, operation, input, signal), operation === 'dependencies_status');
   }
 
-  private async trackWorkspaceRequest<T>(principal: PrincipalSelector | string, input: Record<string, unknown>, action: () => Promise<T>): Promise<T> {
+  private async trackWorkspaceRequest<T>(principal: PrincipalSelector | string, input: Record<string, unknown>, action: () => Promise<T>, allowDependencyStatus = false): Promise<T> {
     const ownerId = this.store.resolvePrincipal(typeof principal === 'string' ? { kind: 'owner', ownerId: principal } : principal);
     let record: WorkspaceRecord;
     try {
@@ -2824,6 +2891,9 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     } catch {
       // Workspace-independent calls and normal validation keep their existing paths.
       return action();
+    }
+    if (this.dependencyWorkspaces.has(record.id) && !allowDependencyStatus) {
+      throw new HarnessError('CONFLICT', 'workspace dependency cache download is in progress; poll dependencies_status', 409, true);
     }
     if (this.recreatingWorkspaces.has(record.id)) {
       throw new HarnessError('CONFLICT', 'workspace executor recreation is in progress; retry after it finishes', 409, true);
@@ -2887,6 +2957,18 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     const ownerId = this.store.resolvePrincipal(typeof principal === 'string' ? { kind: 'owner', ownerId: principal } : principal);
     RunnerOperationSchema.parse(operation);
     const validated = TOOL_SCHEMA_BY_NAME[operation].parse(input) as Record<string, unknown>;
+    if (operation === 'dependencies_plan') {
+      const plan = await this.dependencies.plan(ownerId, validated as unknown as DependenciesPlanInput);
+      return { ok: true, message: 'Dependency plan awaits Dashboard approval', data: { plan }, truncated: false };
+    }
+    if (operation === 'dependencies_apply') {
+      const plan = await this.dependencies.apply(ownerId, validated as unknown as DependenciesApplyInput);
+      return { ok: true, message: 'Dependency download state', data: { plan }, truncated: false };
+    }
+    if (operation === 'dependencies_status') {
+      this.requireWorkspace(ownerId, validated.workspaceId as string, false, true);
+      return { ok: true, message: 'Dependency plans listed', data: this.dependencies.status(ownerId, validated.workspaceId as string, validated.planId as string | undefined), truncated: false };
+    }
     if (operation === 'workspace_open') return await this.open(ownerId, validated);
     if (operation === 'workspace_list') return this.list(ownerId, validated);
     // Repository creation is not bound to a workspace: the repository does not exist yet.
@@ -4894,6 +4976,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   }
 
   async close(ownerId: string, workspaceId: string): Promise<RunnerResponse> {
+    if (this.dependencyWorkspaces.has(workspaceId)) throw new HarnessError('CONFLICT', 'workspace dependency cache download is in progress', 409, true);
     if (this.recreatingWorkspaces.has(workspaceId)) throw new HarnessError('CONFLICT', 'workspace executor recreation is in progress', 409, true);
     const record = this.requireWorkspace(ownerId, workspaceId, false, true);
     await this.closeRecord(record, 'closed by client');
@@ -5281,9 +5364,11 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
           }
           this.markExpiredRecoverable(claimed, now);
         }
-      } else if (record.status === 'ACTIVE') {
+      } else if (record.status === 'ACTIVE' && !this.dependencyWorkspaces.has(record.id)) {
+        // A paused dependency import makes the size probe fall back to host paths,
+        // including temporary staging. The dependency service checks its own limits.
         const violation = await this.resourceViolation(record).catch(() => undefined);
-        if (violation) await this.closeRecord(record, violation).catch(() => undefined);
+        if (violation && !this.dependencyWorkspaces.has(record.id)) await this.closeRecord(record, violation).catch(() => undefined);
       }
     }
     for (const due of this.store.listAutoCloseDue(now)) {

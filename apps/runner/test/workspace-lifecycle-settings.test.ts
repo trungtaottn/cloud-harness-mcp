@@ -334,3 +334,70 @@ describe('workspace lifecycle settings', () => {
     expect(context.store.listAutoCloseDue(now, 3)).toHaveLength(3);
   });
 });
+
+
+describe('dependency download resource reaping', () => {
+  function activeFixture() {
+    const context = fixture();
+    const record = seedRecoverable(context, 'd', { status: 'ACTIVE', expiresAt: Date.now() + 600_000,
+      hardExpiresAt: Date.now() + 900_000, expiredAt: null, recoverableUntil: null });
+    const internals = context.service as unknown as {
+      dependencyWorkspaces: Set<string>;
+      resourceViolation: (record: WorkspaceRecord) => Promise<string | undefined>;
+      closeRecord: (record: WorkspaceRecord, reason: string) => Promise<void>;
+    };
+    return { ...context, record, internals };
+  }
+
+  it('measures only retained mounts when a paused executor forces a host size probe', async () => {
+    const { service, record } = activeFixture();
+    record.containerName = 'paused-executor';
+    docker.runDocker.mockImplementationOnce(async () => ({
+      stdout: '', stderr: 'container is paused', exitCode: 1, truncated: false
+    }));
+    const probe = service as unknown as { workspaceBytes: (record: WorkspaceRecord) => Promise<number | undefined> };
+    expect(await probe.workspaceBytes(record)).toBe(0);
+    const executorArgs = docker.runDocker.mock.calls[0]![0];
+    expect(executorArgs.slice(-3)).toEqual(['/workspace', '/opt/user-tools', '/var/cache/harness']);
+    const helperArgs = docker.runDocker.mock.calls.find(([args]) => args[0] === 'run' && args.includes('/usr/bin/du'))![0];
+    expect(helperArgs.slice(helperArgs.indexOf('--apparent-size') + 1)).toEqual(['/target/repo', '/target/tools', '/target/cache']);
+    expect(helperArgs).toContain(`${record.workspacePath}:/target:ro`);
+  });
+
+  it('skips resource measurement while dependency staging is active', async () => {
+    const { service, record, internals, store } = activeFixture();
+    internals.dependencyWorkspaces.add(record.id);
+    const probe = vi.spyOn(internals, 'resourceViolation').mockResolvedValue('workspace soft size ceiling exceeded');
+    const close = vi.spyOn(internals, 'closeRecord').mockResolvedValue();
+    await reap(service);
+    expect(probe).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+    expect(store.byId(record.id)?.status).toBe('ACTIVE');
+  });
+
+  it('does not close when dependency work begins during an awaited resource probe', async () => {
+    const { service, record, internals, store } = activeFixture();
+    const started = Promise.withResolvers<void>();
+    const result = Promise.withResolvers<string | undefined>();
+    vi.spyOn(internals, 'resourceViolation').mockImplementation(() => {
+      started.resolve();
+      return result.promise;
+    });
+    const close = vi.spyOn(internals, 'closeRecord').mockResolvedValue();
+    const sweeping = reap(service);
+    await started.promise;
+    internals.dependencyWorkspaces.add(record.id);
+    result.resolve('workspace soft size ceiling exceeded');
+    await sweeping;
+    expect(close).not.toHaveBeenCalled();
+    expect(store.byId(record.id)?.status).toBe('ACTIVE');
+  });
+
+  it('still closes an oversized workspace without dependency work', async () => {
+    const { service, record, internals } = activeFixture();
+    vi.spyOn(internals, 'resourceViolation').mockResolvedValue('workspace soft size ceiling exceeded');
+    const close = vi.spyOn(internals, 'closeRecord').mockResolvedValue();
+    await reap(service);
+    expect(close).toHaveBeenCalledWith(expect.objectContaining({ id: record.id }), 'workspace soft size ceiling exceeded');
+  });
+});

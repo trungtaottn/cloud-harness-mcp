@@ -603,6 +603,21 @@ through `PACKAGES_PROXY_HOSTS` in the proxy-only
 [operations](operations.md#package-registry-egress). The proxy is shared with
 toolkit helpers, so its Compose-set `ALLOWED_HOSTS` reach builders as well.
 
+## Approved project dependency downloads (custom fork)
+
+`DEPENDENCIES_ENABLED=true` enables owner-approved Go/pnpm cache downloads;
+Dashboard approval is mandatory regardless of `PACKAGES_APPROVAL_MODE`. The
+runner defaults and ranges are owned by
+[`RunnerConfigSchema`](../packages/contracts/src/config.ts); see
+[custom fork guidance](custom-fork.md#approved-project-dependency-downloads)
+for supported manifests and the isolated downloader boundary.
+
+The provisioning proxy must allow `proxy.golang.org`, `sum.golang.org`,
+`storage.googleapis.com` and `registry.npmjs.org` through `PACKAGES_PROXY_HOSTS`.
+Preserve its existing hosts. Every job additionally restricts egress to its
+own ecosystem's hosts, with `DEPENDENCIES_MAX_BYTES` and
+`DEPENDENCIES_TIMEOUT_MS` limits. No workspace network change is needed.
+
 ## MCP gateway
 
 The `/mcp-gateway` composition root adds nine settings. Their exact defaults,

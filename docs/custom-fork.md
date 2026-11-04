@@ -13,6 +13,42 @@
 
 ## Added behavior
 
+### Approved project dependency downloads
+
+The custom branch also supports `dependencies_plan`, `dependencies_apply` and
+`dependencies_status`. Enable with `DEPENDENCIES_ENABLED=true` only after
+deploying the matching contracts, API, Dashboard and runner. This is independent
+of managed CLI approval policy: each project download always requires a
+Dashboard decision. The owning contracts are
+[`dependency-schemas.ts`](../packages/contracts/src/dependency-schemas.ts), and
+the agent workflow is in the
+[managed-package reference](../.agents/skills/cloudharness/references/managed-packages.md#approved-project-dependency-caches).
+
+Operators must permit the Go proxy/checksum/storage hosts and npm registry on
+the provisioning proxy. Each download has an additional exact-host proxy and
+internal Docker network, so the existing broader provisioning allowlist does
+not grant broader helper access. The helper receives approved manifests only,
+no workspace secrets; lifecycle scripts and hooks remain disabled. The
+`DEPENDENCIES_MAX_BYTES` and `DEPENDENCIES_TIMEOUT_MS` settings bound the job.
+Transfer limits are strict; the disk monitor has a polling interval and may
+briefly overshoot before stopping. Cache is checked again before installation.
+
+Use public Go module manifests or standalone pnpm 10.30.1 version-9 lockfiles;
+matching public semver overrides are allowed. Private/git/local dependency
+sources, workspace catalogs and patches require separate reviewed support and
+are refused rather than downloading outside the approved registry route.
+Toolchain/browser/system-package downloads are not silently enabled.
+
+Applying replaces that ecosystem's workspace cache after successful download,
+with the executor paused and current manifests rechecked. It preserves source
+and network policy and does not require recreation. After a runner restart, stale helpers are removed and interrupted publication
+restores a displaced old cache or keeps a fully published new cache. Interrupted
+plans are marked failed and require a new approval to retry.
+Do not use an old deployment manifest to activate images for this feature;
+rebuild and verify the current branch first.
+
+### Executor recreation
+
 `workspace_recover({workspaceId, mode: "recreate"})` replaces an idle remote
 executor so newly applied managed package bindings become read-only mounts and
 their executables enter PATH. It retains workspace ID, checkout, user-tools and
@@ -47,9 +83,9 @@ the upstream skill lists every supported mode.
    Through `exec_run`, check `command -v pnpm` and `pnpm --version`; for the
    current Relaw request the expected version is **10.30.1**. Confirm checkout
    and Git state remain intact before resuming tests.
-5. A `network-none` workspace stays network-none. Dependency downloads need a
-   prepopulated cache or a separately authorized network-enabled workflow.
-   Report this separately from package mounting.
+5. A `network-none` workspace stays network-none. Use `dependencies_plan` for project dependencies, obtain Dashboard approval,
+   then call `dependencies_apply` and poll `dependencies_status`. This separate
+   downloader does not require opening internet access for the workspace.
 
 ## Operator customizations
 
@@ -77,7 +113,7 @@ The executor/package activation helpers invoke the stock upstream deployment:
 running them later can replace the custom API/runner overlay. Reapply a verified
 overlay afterward. Future upstream upgrades require rebasing and revalidation.
 
-## Validation recorded for this patch
+## Validation recorded for the earlier recreate patch
 
 Plugin synchronization, lint and typechecks passed. Backend: 3519 passed,
 2 skipped. Dashboard: 709 passed under Node 24.22.2; Node 26.13.0 failed browser

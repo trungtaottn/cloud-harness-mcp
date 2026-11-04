@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Activate the tested local API/runner patch and a 10 GiB workspace ceiling."""
+"""Activate the tested API/runner overlay and approved dependency cache workflow."""
 import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -15,6 +16,8 @@ import time
 
 STATE = Path('/var/lib/cloud-harness')
 CONFIG = Path('/etc/cloud-harness-mcp/runtime.env')
+PROXY_CONFIG = CONFIG.with_name('provisioning-proxy.env')
+DEPENDENCY_HOSTS = {'registry.npmjs.org', 'proxy.golang.org', 'sum.golang.org', 'storage.googleapis.com'}
 MARKER = STATE / 'workspace-recreate-in-progress'
 UNIT = 'cloud-harness-mcp.service'
 DEPLOY_UNIT = 'cloud-harness-workspace-recreate.service'
@@ -23,7 +26,52 @@ RELEASE_METADATA = {
     'release-api-image': STATE / 'release-api-image',
     'release-runner-image': STATE / 'release-runner-image',
     'release-config-runtime.env': STATE / 'release-config-current/runtime.env',
+    'release-config-provisioning-proxy.env': STATE / 'release-config-current/provisioning-proxy.env',
 }
+
+
+def setting_value(text, key):
+    values = []
+    for line in text.splitlines():
+        match = re.match(r'^\s*(?:export\s+)?' + re.escape(key) + r'\s*=(.*)$', line)
+        if match:
+            try:
+                parts = shlex.split(match.group(1), comments=True)
+            except ValueError as error:
+                raise RuntimeError(f'Invalid configuration syntax for {key}') from error
+            if len(parts) > 1:
+                raise RuntimeError(f'Ambiguous configuration for {key}')
+            values.append(parts[0] if parts else '')
+    if len(set(values)) > 1:
+        raise RuntimeError(f'Conflicting duplicate settings for {key}')
+    return values[-1] if values else ''
+
+
+def update_settings(text, settings):
+    pattern = re.compile(r'^\s*(?:export\s+)?(' + '|'.join(map(re.escape, settings)) + r')\s*=')
+    kept = ''.join(line for line in text.splitlines(keepends=True) if not pattern.match(line))
+    return kept.rstrip('\n') + '\n' + ''.join(f'{key}={value}\n' for key, value in settings.items())
+
+
+def dependency_configuration(runtime_text, proxy_text):
+    if setting_value(runtime_text, 'AUTH_MODE') != 'cloudflare-access':
+        raise RuntimeError('Dependency activation requires Dashboard approval-capable cloudflare-access authentication')
+    settings = {'MAX_WORKSPACE_BYTES': '10737418240', 'DEPENDENCIES_ENABLED': 'true'}
+    for key, default, minimum, maximum in (
+        ('DEPENDENCIES_TIMEOUT_MS', 900000, 10000, 1800000),
+        ('DEPENDENCIES_MAX_BYTES', 2147483648, 1048576, 10737418240),
+    ):
+        raw = setting_value(runtime_text, key) or str(default)
+        if not re.fullmatch(r'[0-9]+', raw) or not minimum <= int(raw) <= maximum:
+            raise RuntimeError(f'Invalid configuration range for {key}')
+        settings[key] = str(int(raw))
+    hosts = {host.strip().lower() for host in setting_value(proxy_text, 'PACKAGES_PROXY_HOSTS').split(',') if host.strip()}
+    label = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
+    if any(len(host) > 253 or not re.fullmatch(label + r'(?:\.' + label + r')+', host)
+           or host.split('.')[-1].isdigit() for host in hosts):
+        raise RuntimeError('Existing package proxy hosts contain an invalid hostname')
+    return (update_settings(runtime_text, settings),
+            update_settings(proxy_text, {'PACKAGES_PROXY_HOSTS': ','.join(sorted(hosts | DEPENDENCY_HOSTS))}))
 
 
 def run(*args, capture=False, **kwargs):
@@ -72,13 +120,21 @@ def rollback(*, acquire_lock=True):
     backup = Path(saved['backup'])
     run('systemctl', 'stop', UNIT)
     replace_file(CONFIG, (backup / 'runtime.env').read_text())
+    # Old recovery markers predate proxy changes and must leave that configuration alone.
+    if 'proxy_existed' in saved:
+        if saved['proxy_existed']:
+            replace_file(PROXY_CONFIG, (backup / 'provisioning-proxy.env').read_text())
+        else:
+            PROXY_CONFIG.unlink(missing_ok=True)
     for service, image in saved['images'].items():
         run('docker', 'tag', image, f'cloud-harness-{service}:local')
     run('systemctl', 'start', UNIT)
     ready()
     if 'metadata' in saved:
         backed_up_metadata = set(saved['metadata'])
-        for name, path in RELEASE_METADATA.items():
+        managed_metadata = saved.get('managed_metadata', [name for name in RELEASE_METADATA if name != 'release-config-provisioning-proxy.env'])
+        for name in managed_metadata:
+            path = RELEASE_METADATA[name]
             if name in backed_up_metadata:
                 replace_file(path, (backup / name).read_text())
             else:
@@ -98,6 +154,11 @@ def apply():
             raise RuntimeError('Resolve the existing deployment marker before starting')
         if (STATE / 'release-current').read_text().strip() != RELEASE:
             raise RuntimeError('Production release changed; rebase and verify the patch first')
+        for path in (CONFIG, PROXY_CONFIG, *RELEASE_METADATA.values()):
+            if path.is_symlink():
+                raise RuntimeError('Refusing symlinked deployment configuration or metadata')
+        proxy_existed = PROXY_CONFIG.exists()
+        runtime_text, proxy_text = dependency_configuration(CONFIG.read_text(), PROXY_CONFIG.read_text() if proxy_existed else '')
         for image in images.values():
             run('docker', 'image', 'inspect', image, capture=True)
         # Do not interrupt an executor with active commands or interactive sessions.
@@ -114,9 +175,17 @@ def apply():
             ).stdout.splitlines()
             if active_sidecars:
                 raise RuntimeError('An agent or helper operation is running; wait for it to finish before deployment')
+        dependency_helpers = run(
+            'docker', 'ps', '-a', '--filter', 'label=cloud-harness.role=dependency-download',
+            '--format', '{{.Names}}', capture=True
+        ).stdout.splitlines()
+        if dependency_helpers:
+            raise RuntimeError('A dependency helper exists; finish or reconcile its download before deployment')
         ready()
         backup = Path(tempfile.mkdtemp(prefix='workspace-recreate-', dir=STATE / 'backups'))
         shutil.copy2(CONFIG, backup / 'runtime.env')
+        if proxy_existed:
+            shutil.copy2(PROXY_CONFIG, backup / 'provisioning-proxy.env')
         database = STATE / 'state/cloud-harness.db'
         if database.exists():
             with sqlite3.connect(f'file:{database}?mode=ro', uri=True) as source, sqlite3.connect(backup / 'cloud-harness.db') as target:
@@ -127,12 +196,12 @@ def apply():
                 shutil.copy2(path, backup / name)
                 metadata.append(name)
         previous = {service: run('docker', 'inspect', f'cloud-harness-mcp-{service}-1', '--format', '{{.Image}}', capture=True).stdout.strip() for service in images}
-        MARKER.write_text(json.dumps({'backup': str(backup), 'images': previous, 'metadata': metadata}))
+        MARKER.write_text(json.dumps({'backup': str(backup), 'images': previous, 'metadata': metadata,
+                                      'managed_metadata': list(RELEASE_METADATA), 'proxy_existed': proxy_existed}))
         print(f'Backup: {backup}', flush=True)
         try:
-            text = ''.join(line for line in CONFIG.read_text().splitlines(keepends=True)
-                           if not re.match(r'^\s*(?:export\s+)?MAX_WORKSPACE_BYTES\s*=', line))
-            replace_file(CONFIG, text.rstrip('\n') + '\nMAX_WORKSPACE_BYTES=10737418240\n')
+            replace_file(CONFIG, runtime_text)
+            replace_file(PROXY_CONFIG, proxy_text)
             for service, image in images.items():
                 run('docker', 'tag', image, f'cloud-harness-{service}:local')
             run('systemctl', 'restart', UNIT)
@@ -142,19 +211,35 @@ def apply():
                 if actual != image:
                     raise RuntimeError(f'{service} did not start the verified image')
             run('docker', 'exec', 'cloud-harness-mcp-api-1', 'node', '--input-type=module', '-e',
-                "import {TOOL_SCHEMA_BY_NAME as t} from '@cloud-harness/contracts'; t.workspace_recover.parse({mode:'recreate'}); console.log('recreate schema: ready')")
-            run('docker', 'exec', 'cloud-harness-mcp-runner-1', 'node', '-e',
-                "if(process.env.MAX_WORKSPACE_BYTES!=='10737418240')process.exit(1); console.log('workspace quota: 10 GiB')")
+                "import {TOOL_SCHEMA_BY_NAME as t} from '@cloud-harness/contracts';"
+                "const workspaceId='ws_'+ 'a'.repeat(32),planId='dep_'+ 'a'.repeat(32),planDigest='a'.repeat(64);"
+                "t.workspace_recover.parse({mode:'recreate'});"
+                "for(const ecosystem of ['go','pnpm'])t.dependencies_plan.parse({workspaceId,ecosystem});"
+                "t.dependencies_apply.parse({workspaceId,planId,planDigest});"
+                "t.dependencies_status.parse({workspaceId});console.log('recreate and dependency schemas: ready')")
+            run('docker', 'exec', 'cloud-harness-mcp-runner-1', 'node', '--input-type=module', '-e',
+                "import {RunnerConfigSchema as s} from '@cloud-harness/contracts';"
+                "const e=process.env;"
+                "if(e.MAX_WORKSPACE_BYTES!=='10737418240'||e.DEPENDENCIES_ENABLED!=='true'||e.AUTH_MODE!=='cloudflare-access')process.exit(1);"
+                "s.shape.dependenciesEnabled.parse(e.DEPENDENCIES_ENABLED);"
+                "s.shape.dependenciesMaxBytes.parse(e.DEPENDENCIES_MAX_BYTES);"
+                "s.shape.dependenciesTimeoutMs.parse(e.DEPENDENCIES_TIMEOUT_MS);"
+                "console.log('dependency configuration and 10 GiB workspace quota: ready')")
+            run('docker', 'exec', 'cloud-harness-mcp-provisioning-proxy-1', 'node', '-e',
+                "const hosts=new Set((process.env.PACKAGES_PROXY_HOSTS||'').split(','));"
+                "if(!['registry.npmjs.org','proxy.golang.org','sum.golang.org','storage.googleapis.com'].every(h=>hosts.has(h)))process.exit(1);"
+                "console.log('dependency registry proxy hosts: ready')")
             # Pass canary credentials by environment, without displaying their values.
             run('bash', '-c', 'set -eu; set -a; source /etc/cloud-harness-mcp/canary-credentials; set +a; exec /usr/local/sbin/cloud-harness-service-compose run --rm --no-deps -e MCP_CANARY_URL -e MCP_CANARY_ACCESS_CLIENT_ID -e MCP_CANARY_ACCESS_CLIENT_SECRET ingress node /app/scripts/deploy-canary.mjs',
                 cwd='/opt/cloud-harness-mcp/repo')
             replace_file(RELEASE_METADATA['release-api-image'], images['api'] + '\n')
             replace_file(RELEASE_METADATA['release-runner-image'], images['runner'] + '\n')
             replace_file(RELEASE_METADATA['release-config-runtime.env'], CONFIG.read_text())
+            replace_file(RELEASE_METADATA['release-config-provisioning-proxy.env'], PROXY_CONFIG.read_text())
             # The upstream source revision stays unchanged; record this local overlay separately.
             (STATE / 'workspace-recreate-hotfix.json').write_text(json.dumps({'upstream': RELEASE, 'images': images, 'backup': str(backup)}))
             MARKER.unlink()
-            print('Local recreate patch active; workspace storage ceiling is 10 GiB.', flush=True)
+            print('Local recreate and approved dependency workflow active; workspace storage ceiling is 10 GiB.', flush=True)
         except BaseException:
             rollback(acquire_lock=False)
             raise

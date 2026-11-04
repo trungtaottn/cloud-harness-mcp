@@ -1271,3 +1271,15 @@ and
 [`test/integration/git-transfer-helper.docker.test.ts`](../test/integration/git-transfer-helper.docker.test.ts).
 Live private-repository verification still requires owner-supplied credentials
 and sanitized evidence.
+
+## Approved project dependency downloads (custom)
+
+`dependencies_plan` captures workspace Go/pnpm manifests without network access;
+`dependencies_apply` consumes the exact owner-approved digest and starts an
+isolated bounded download; `dependencies_status` reads durable plan/job state.
+Approval and rejection are Dashboard-only operations. Source/profile/image
+changes invalidate the plan. Existing executor networking stays unchanged, and
+cache publication does not close or recreate the workspace. A terminal failed
+plan never starts a second download on replay. Local mode returns NOT_SUPPORTED.
+See [custom fork guidance](custom-fork.md#approved-project-dependency-downloads)
+and the [schemas](../packages/contracts/src/dependency-schemas.ts).

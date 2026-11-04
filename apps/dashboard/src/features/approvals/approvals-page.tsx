@@ -1,3 +1,5 @@
+import { DependencyPlansSection } from './dependency-plans-section';
+import { dependencyApprovalsApi, type DependencyPlanView } from './approvals-model';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { PackageIcon, ShieldCheckIcon } from 'lucide-react';
 import { type ReactNode, useState } from 'react';
@@ -24,6 +26,7 @@ const PLAN_TONES: Record<string, BadgeTone> = { Pending: 'warning', 'Approved, a
 const NOT_REPORTED = 'Not reported';
 
 type Decision =
+  | { kind: 'dependency'; decision: 'approve' | 'reject'; plan: DependencyPlanView }
   | { kind: 'grant'; decision: 'approve' | 'reject'; grant: PrivilegeGrant }
   | { kind: 'plan'; decision: 'approve' | 'reject'; plan: PackagePlan };
 
@@ -151,6 +154,10 @@ function PackagePlansSection({ plans, onDecide }: { plans: PackagePlans | undefi
 }
 
 function confirmCopy(decision: Decision) {
+  if (decision.kind === 'dependency') {
+    const approve = decision.decision === 'approve';
+    return { title: approve ? 'Approve these dependency downloads?' : 'Reject this dependency plan?', description: approve ? 'An agent may download this exact workspace plan. Changed manifests require a new plan. Lifecycle scripts remain disabled. The decision is audited.' : 'This plan can no longer be applied. The decision is audited.', confirmLabel: approve ? 'Approve plan' : 'Reject plan', pendingLabel: approve ? 'Approving…' : 'Rejecting…', destructive: !approve, target: `Plan digest ${decision.plan.planDigest}`, success: approve ? 'Dependency plan approved.' : 'Dependency plan rejected.', failure: 'The dependency decision could not be saved' };
+  }
   if (decision.kind === 'grant') {
     return decision.decision === 'approve'
       ? { title: 'Approve this privilege request?', description: 'The command may then run in that workspace under your identity. The decision is audited.', confirmLabel: 'Approve', pendingLabel: 'Approving…', destructive: false, target: decision.grant.command, success: 'Privilege request approved.', failure: 'The privilege request could not be approved' }
@@ -187,6 +194,7 @@ export function ApprovalsPage() {
         )}
       </AsyncStatus>
       <PackagePlansSection plans={plans.data} onDecide={setPending} />
+      <DependencyPlansSection onDecide={(plan, decision) => setPending({ kind: 'dependency', plan, decision })} />
       <ConfirmDialog
         open={pending !== undefined}
         onOpenChange={(open) => { if (!open) setPending(undefined); }}
@@ -198,7 +206,8 @@ export function ApprovalsPage() {
         destructive={copy?.destructive ?? true}
         onConfirm={async () => {
           if (!pending || !copy) return;
-          if (pending.kind === 'grant') await approvalsApi.decideGrant(pending.grant, pending.decision);
+          if (pending.kind === 'dependency') await dependencyApprovalsApi[pending.decision](pending.plan);
+          else if (pending.kind === 'grant') await approvalsApi.decideGrant(pending.grant, pending.decision);
           else if (pending.decision === 'approve') await approvalsApi.approvePlan(pending.plan);
           else await approvalsApi.rejectPlan(pending.plan);
           toast({ title: copy.success, variant: 'success' });

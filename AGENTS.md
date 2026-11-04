@@ -20,6 +20,12 @@ does not prove production activation; verify the deployed image and contract.
   Managed npm/uv packages, the separate Go/Rust executor and dependency egress
   are separate concerns. The custom storage setting is a soft workspace disk
   ceiling, not a RAM limit or a hard filesystem reservation.
+- For missing project dependencies, use the custom `dependencies_plan` →
+  Dashboard approval → `dependencies_apply`/`dependencies_status` workflow.
+  Keep the workspace network profile unchanged; ordinary dependency updates
+  require a new approved plan, not an operator image rebuild. CLI packages and
+  project dependency caches use separate approvals. Read the custom fork guide
+  for supported public Go/pnpm manifests and current limits.
 - Diagnose empty lists and denied pushes against the authenticated principal,
   workspace owner and current GitHub installation binding. Do not merge
   identities or replace credentials just to make an operation succeed.

@@ -2,8 +2,9 @@
 
 Use these for a CLI tool you want in every new workspace and in the `bash`
 toolbox target, kept across workspace recreation and redeploys. For a
-project dependency, run `npm install` or `uv` in the workspace instead. All
-six tools return `FORBIDDEN` unless the operator set `PACKAGES_ENABLED=true`.
+project dependency, use the approved Go/pnpm cache workflow below when the
+workspace is offline, or the permitted workspace package manager otherwise. All
+six managed-toolbox tools return `FORBIDDEN` unless the operator set `PACKAGES_ENABLED=true`.
 
 Flow: `packages_plan` (→ `packages_status` with its `resolutionId` while it
 is `RESOLVING`) → (operator approves in the Dashboard when `approval` is
@@ -115,4 +116,55 @@ uninstalls.
 
 <!-- cloudharness-example:packages_remove
 {"bindingId":"pkb_0123456789abcdefghijklmn","expectedGeneration":3}
+-->
+
+## Approved project dependency caches
+
+These tools are separate from managed CLI packages. The operator enables
+`DEPENDENCIES_ENABLED=true`; Dashboard approval is mandatory even when managed
+package approvals are disabled. Only public-registry Go modules and standalone
+pnpm 10.30.1 lockfiles are supported. Custom URLs, Git/local sources, hooks and
+lifecycle scripts are refused. This does not grant an executor internet access.
+
+<!-- cloudharness-tool:dependencies_plan -->
+### `dependencies_plan`
+
+Required: `workspaceId`, `ecosystem` (`go` or `pnpm`). Optional `directory`
+(default `.`) is relative to the checkout. Planning captures go.mod/go.sum or
+package.json/pnpm-lock.yaml and makes no network request. Inspect returned
+`plan`: hashes, hosts, dependency changes, byte/time budgets and expiry. Ask the
+operator to approve that exact plan in Dashboard Approvals. Changed manifests,
+executor image or managed tool profile require a new plan.
+
+<!-- cloudharness-example:dependencies_plan
+{"workspaceId":"ws_aaaaaaaaaaaaaaaaaaaa","ecosystem":"pnpm","directory":"ui/web"}
+-->
+
+<!-- cloudharness-tool:dependencies_apply -->
+### `dependencies_apply`
+
+Required: `workspaceId`, `planId`, `planDigest` from the approved plan. Finish
+active commands/tasks/agents and close terminals first. The call starts a bounded
+isolated downloader and returns `plan`; poll status until SUCCEEDED or FAILED.
+The executor keeps its network profile and is briefly paused while cache is installed. Do
+not close or recreate the workspace. Same-plan replay returns the existing
+outcome; failure needs a new plan and approval, never a blind retry with new IDs.
+Only approved manifests are sent to the network-enabled helper, without the source checkout or workspace secrets. Package script declarations may be in the manifest but are never executed.
+
+<!-- cloudharness-example:dependencies_apply
+{"workspaceId":"ws_aaaaaaaaaaaaaaaaaaaa","planId":"dep_aaaaaaaaaaaaaaaaaaaa","planDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+-->
+
+<!-- cloudharness-tool:dependencies_status -->
+### `dependencies_status`
+
+Required: `workspaceId`; optional `planId`. Returns `plans`. Download progress
+survives disconnection; a runner restart marks unfinished downloads FAILED.
+SUCCEEDED means cache is ready, not tests passed. Install UI packages offline
+with the frozen lockfile before build/test; Go can use GOPROXY=off to verify
+cache completeness. These commands do not approve additional sources or scripts.
+Browser binaries, system libraries and network-dependent tests remain separate.
+
+<!-- cloudharness-example:dependencies_status
+{"workspaceId":"ws_aaaaaaaaaaaaaaaaaaaa","planId":"dep_aaaaaaaaaaaaaaaaaaaa"}
 -->

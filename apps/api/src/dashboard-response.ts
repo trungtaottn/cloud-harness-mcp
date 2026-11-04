@@ -227,6 +227,7 @@ export const DASHBOARD_RESPONSE_OPERATIONS = [
   'artifact_list', 'artifact_snapshot', 'artifact_read', 'artifact_restore', 'artifact_delete',
   'github_status', 'github_setup_begin', 'github_setup_complete', 'github_reconcile', 'github_disconnect',
   'privilege_grant_list', 'privilege_grant_approve', 'privilege_grant_reject',
+  'dependency_plan_list', 'dependency_plan_approve', 'dependency_plan_reject',
   'package_overview', 'package_plan_list', 'package_plan_approve', 'package_plan_reject', 'package_rollback', 'package_remove',
   'model_credential_list', 'model_credential_create', 'model_credential_rotate', 'model_credential_delete',
   'model_profile_list', 'model_profile_create', 'model_profile_update', 'model_profile_activate', 'model_profile_disable', 'model_profile_delete',
@@ -336,6 +337,17 @@ const knowledgeLinkKeys = ['id', 'sourceId', 'targetId', 'relation', 'origin', '
  * Managed packages. Every level is re-picked, so an owner identity, a host path, or an executor image
  * reference the runner might attach never reaches the browser.
  */
+const dependencyPlanKeys = ['planId', 'planDigest', 'workspaceId', 'ecosystem', 'directory', 'state', 'hosts', 'dependencyCount', 'timeoutMs', 'maxBytes', 'scripts', 'createdAt', 'expiresAt', 'completedAt', 'sizeBytes'] as const;
+function dependencyPlan(value: unknown): Record<string, unknown> {
+  const plan = value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
+  return {
+    ...pick(plan, dependencyPlanKeys),
+    manifests: listOf(plan.manifests, ['path', 'sha256']),
+    changes: objectOrNull(plan.changes, ['added', 'removed']),
+    error: plan.error ? 'Dependency download failed. Inspect the workspace dependency status.' : null
+  };
+}
+
 const packageRuntimeKeys = ['node', 'npm', 'uv', 'python'] as const;
 const packageReleaseKeys = ['releaseId', 'ecosystem', 'name', 'version', 'treeDigest', 'sizeBytes', 'fileCount', 'binaries', 'createdAt', 'status', 'stale', 'dependencyCount', 'lifecycleScripts', 'integrity'] as const;
 const packageHistoryKeys = ['generation', 'releaseId', 'version', 'reason', 'actor', 'createdAt', 'available'] as const;
@@ -529,6 +541,8 @@ export function mapDashboardData(operation: DashboardResponseOperation, value: u
   if (operation === 'privilege_grant_list') return list(data, 'grants', privilegeGrantKeys);
   if (operation === 'privilege_grant_approve' || operation === 'privilege_grant_reject') return { grant: pick(data.grant, privilegeGrantKeys) };
   if (operation === 'package_overview') return packageOverview(data);
+  if (operation === 'dependency_plan_list') return { plans: Array.isArray(data.plans) ? data.plans.map(dependencyPlan) : [] };
+  if (operation === 'dependency_plan_approve' || operation === 'dependency_plan_reject') return { plan: dependencyPlan(data.plan) };
   if (operation === 'package_plan_list') {
     return { ...pick(data, ['enabled', 'approvalMode']), plans: Array.isArray(data.plans) ? data.plans.map(packagePlan) : [] };
   }
@@ -703,6 +717,8 @@ const operationMessages: Partial<Record<DashboardResponseOperation, Record<strin
     NOT_FOUND: 'GitHub installation not found.'
   },
   github_disconnect: { NOT_FOUND: 'GitHub installation not found.' },
+  dependency_plan_approve: { UNAVAILABLE: 'Dependency downloads are unavailable. Check the operator dependency configuration.', NOT_FOUND: 'Dependency plan not found.', STALE_GENERATION: 'Dependency plan changed. Review a new plan.', EXPIRED: 'Dependency plan expired. Create a new plan.' },
+  dependency_plan_reject: { NOT_FOUND: 'Dependency plan not found.' },
   package_plan_approve: { FORBIDDEN: packagesDisabled, NOT_FOUND: 'Package plan not found.' },
   package_plan_reject: { FORBIDDEN: packagesDisabled, NOT_FOUND: 'Package plan not found.' },
   package_rollback: { FORBIDDEN: packagesDisabled },

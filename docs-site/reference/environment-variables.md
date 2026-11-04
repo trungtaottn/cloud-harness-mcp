@@ -93,7 +93,10 @@ Copy `.env.example` to `.env` and replace all `change-me` placeholder secrets be
 | `TERMINAL_RETAINED_BYTES` | `1048576` | Optional | Raw output bytes retained per terminal for reconnecting readers; older bytes are reported as missed. |
 | `TERMINAL_IDLE_TIMEOUT_MS` | `900000` | Optional | A terminal with no input, resize, or read for this long ends as timed_out. |
 | `TERMINAL_MAX_LIFETIME_MS` | `28800000` | Optional | Absolute terminal lifetime regardless of activity. |
-| `PACKAGES_ENABLED` | `false` | Optional | Managed toolbox (runner): enables the `bash` tool's `toolbox` target, which runs each command in a disposable no-network executor-image container. Off by default; the `workspace` target is unaffected. |
+| `DEPENDENCIES_ENABLED` | `false` | Optional | Managed toolbox (runner): enables the `bash` tool's `toolbox` target, which runs each command in a disposable no-network executor-image container. Off by default; the `workspace` target is unaffected. Project dependency downloads: mandatory Dashboard approval; executor networking is unchanged. |
+| `DEPENDENCIES_MAX_BYTES` | `2147483648` | Optional | Optional configuration. |
+| `DEPENDENCIES_TIMEOUT_MS` | `900000` | Optional | Optional configuration. |
+| `PACKAGES_ENABLED` | `false` | Optional | Add proxy.golang.org,sum.golang.org,storage.googleapis.com,registry.npmjs.org to the dedicated provisioning proxy host configuration when enabling downloads. |
 | `TOOLBOX_MAX_CONCURRENT` | `2` | Optional | Maximum toolbox containers running at once on this runner; a call beyond it gets LIMIT_EXCEEDED (429, retryable). |
 | `PACKAGES_ROOT` | `/var/lib/cloud-harness/packages` | Optional | Managed toolbox packages (runner, used only while PACKAGES_ENABLED=true). Immutable releases live here; Compose mounts HOST_PACKAGES_ROOT at this path and the two must be equal. |
 | `PACKAGES_ECOSYSTEMS` | `npm,uv` | Optional | Ecosystems that may be planned: a comma-separated subset of npm,uv. apt always answers NOT_SUPPORTED. |

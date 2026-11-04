@@ -32,7 +32,7 @@ export async function stubReads(page: Page, handlers: Record<string, ReadHandler
     const path = new URL(route.request().url()).pathname.slice(API.length);
     if (SERVED_BY_API.has(path) || path.startsWith('/dewee/')) return route.fallback();
     seen.push(path);
-    return (handlers[path] ?? answer(200))(route);
+    return (handlers[path] ?? (path === '/dependency-plans' ? answer(200, { data: { plans: [] } }) : answer(200)))(route);
   });
   return seen;
 }

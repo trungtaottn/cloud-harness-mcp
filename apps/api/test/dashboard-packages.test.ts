@@ -239,3 +239,30 @@ describe('Dashboard managed package routes', () => {
     expect(busy.json.message).toBe('an apply for this package and scope is in progress');
   });
 });
+
+describe('Dashboard dependency plan routes', () => {
+  const dependencyId = `dep_${'g'.repeat(24)}`;
+  const dependency = { planId: dependencyId, planDigest, workspaceId: `ws_${'h'.repeat(24)}`, ecosystem: 'go', directory: '.', state: 'PENDING_APPROVAL', manifests: [{ path: 'go.sum', sha256: planDigest, text: 'private source' }], hosts: ['proxy.golang.org'], changes: { added: 2, removed: 1, private: true }, dependencyCount: 3, scripts: 'deny', expiresAt: 1000, ownerId: 'secret-owner', imageId: 'secret-image', error: '/host/private/source' };
+  it('projects dependency plans without private snapshots and raw errors', async () => {
+    answers.dependency_plan_list = success({ plans: [dependency] });
+    const reply = await request('/api/v1/dependency-plans');
+    expect(reply.status).toBe(200);
+    expect(reply.json.data).toMatchObject({ plans: [{ planId: dependencyId, manifests: [{ path: 'go.sum', sha256: planDigest }], changes: { added: 2, removed: 1 } }] });
+    for (const leaked of ['secret-owner', 'secret-image', 'private source', '/host/private/source', '"private"']) expect(reply.text).not.toContain(leaked);
+  });
+  it('requires CSRF and displayed digest, then uses the session principal', async () => {
+    const path = `/api/v1/dependency-plans/${dependencyId}/approve`;
+    const headers = await csrfHeaders();
+    expect((await request(path, { method: 'POST', body: { planDigest }, headers: { cookie: headers.cookie, origin: headers.origin } })).status).toBe(403);
+    expect((await request(path, { method: 'POST', body: {}, headers })).status).toBe(400);
+    answers.dependency_plan_approve = success({ plan: { ...dependency, state: 'APPROVED' } });
+    expect((await request(path, { method: 'POST', body: { planDigest }, headers })).status).toBe(200);
+    expect(calls).toContainEqual({ operation: 'dependency_plan_approve', input: { planId: dependencyId, planDigest }, principal });
+  });
+  it('rejects through the authenticated decision boundary', async () => {
+    answers.dependency_plan_reject = success({ plan: { ...dependency, state: 'REJECTED' } });
+    const reply = await request(`/api/v1/dependency-plans/${dependencyId}/reject`, { method: 'POST', body: {}, headers: await csrfHeaders() });
+    expect(reply.status).toBe(200);
+    expect(calls).toContainEqual({ operation: 'dependency_plan_reject', input: { planId: dependencyId }, principal });
+  });
+});

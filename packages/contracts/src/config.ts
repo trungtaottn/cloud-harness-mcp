@@ -402,6 +402,9 @@ export const RunnerConfigSchema = z.object({
   terminalMaxLifetimeMs: z.coerce.number().int().min(60_000).max(86_400_000).default(28_800_000),
   // Managed toolbox gate. Off by default: the `bash` toolbox target runs a disposable executor-image
   // container per call, so the operator opts in before any caller can start one.
+  dependenciesEnabled: enabled.default(false),
+  dependenciesMaxBytes: z.coerce.number().int().min(1_048_576).max(10_737_418_240).default(2_147_483_648),
+  dependenciesTimeoutMs: z.coerce.number().int().min(10_000).max(1_800_000).default(900_000),
   packagesEnabled: enabled.default(false),
   /** Instance-wide TypeSafe egress switch: `off` stops skill suggestions and the Decision Plane even with a key. */
   typesafeEgress: z.enum(['on', 'off']).default('on'),

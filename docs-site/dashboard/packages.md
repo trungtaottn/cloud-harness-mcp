@@ -90,6 +90,17 @@ Reload the page and decide again. Every rollback is audited with the Dashboard a
 actor. Rollback needs no approval, because the target release was already approved and
 verified.
 
+## Project dependency downloads
+
+Project dependencies are distinct from installed CLI tools. In the custom
+deployment, **Approvals → Dependency downloads** shows requests from
+`dependencies_plan`: workspace, manifest hashes, source hosts, dependency
+changes, expiry and limits. Approve the exact plan, or reject/withdraw it.
+Approval permits one bounded download, not general internet access. The agent
+then calls `dependencies_apply` and polls `dependencies_status`; **Downloading**
+and **Downloaded** are different states. Changed manifests require a new plan.
+The workspace keeps its network profile; no executor recreation is needed for this cache.
+
 ## Uninstalling
 
 **Uninstall *name*** appears on every installed package. It removes the package from that

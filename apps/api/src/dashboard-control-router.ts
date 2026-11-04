@@ -1,3 +1,4 @@
+import { DependencyPlanApproveInputSchema, DependencyPlanRejectInputSchema } from '@cloud-harness/contracts';
 import { createHash } from 'node:crypto';
 import express, { type NextFunction, type Response, type Router } from 'express';
 import { API_KEY_MAX_EXPIRY_DAYS, ApiKeyManagementResponseSchema, McpEventSubscriptionIdSchema, McpEventsRunnerDataSchemas, MCP_GATEWAY_AUTHENTICATED_SSE_MESSAGE, PackagePlanApproveInputSchema, PackagePlanRejectInputSchema, PackageRemoveInputSchema, PackageRollbackInputSchema, type ApiConfig, type ApiKeyManagementOperation, type McpEventsRunnerRequest, type MetadataRunnerOperation, type RunnerPrincipalSelector } from '@cloud-harness/contracts';
@@ -206,6 +207,11 @@ export function registerDashboardControlRoutes(
   router.post('/api/v1/privilege-grants/:grantId/reject', endpoint('privilege_grant_reject', (request) => ({ grantId: request.params.grantId })));
   // Managed packages. Approval posts the digest the operator was shown, so a plan that changed is refused.
   router.get('/api/v1/packages', endpoint('package_overview', () => ({})));
+  router.get('/api/v1/dependency-plans', endpoint('dependency_plan_list', () => ({})));
+  router.post('/api/v1/dependency-plans/:planId/approve', endpoint('dependency_plan_approve', (request) => DependencyPlanApproveInputSchema.parse({
+    planId: request.params.planId, ...z.object({ planDigest: z.string() }).strict().parse(request.body)
+  })));
+  router.post('/api/v1/dependency-plans/:planId/reject', endpoint('dependency_plan_reject', (request) => DependencyPlanRejectInputSchema.parse({ planId: request.params.planId })));
   router.get('/api/v1/package-plans', endpoint('package_plan_list', () => ({})));
   router.post('/api/v1/package-plans/:planId/approve', endpoint('package_plan_approve', (request) => PackagePlanApproveInputSchema.parse({
     planId: request.params.planId, ...z.object({ planDigest: z.string() }).strict().parse(request.body)

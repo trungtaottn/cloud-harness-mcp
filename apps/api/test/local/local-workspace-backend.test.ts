@@ -197,6 +197,15 @@ describe('LocalWorkspaceBackend', () => {
     expect(toolbox.message).toContain('toolbox target is unsupported in local mode');
   });
 
+  it('refuses project dependency tools without opening or executing a local workspace', async () => {
+    for (const operation of ['dependencies_plan', 'dependencies_apply', 'dependencies_status'] as const) {
+      const result = await backend.call(operation, { workspaceId: backend.workspaceId, ecosystem: 'go' });
+      expect(result.ok).toBe(false);
+      expect(result.error?.code).toBe('NOT_SUPPORTED');
+      expect(result.message).toContain('remote runner');
+    }
+  });
+
   it('refuses every managed package tool in local mode', async () => {
     const calls: Array<[string, Record<string, unknown>]> = [
       ['packages_plan', { ecosystem: 'npm', name: 'prettier' }],

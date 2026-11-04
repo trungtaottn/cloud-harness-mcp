@@ -1,3 +1,5 @@
+import type { DependencyPlanView } from '@cloud-harness/contracts';
+export type { DependencyPlanView } from '@cloud-harness/contracts';
 import { apiClient } from '@/lib/api-client';
 
 export type GrantStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'CONSUMED' | 'EXPIRED';
@@ -127,4 +129,20 @@ export const approvalsApi = {
     apiClient.request(`/package-plans/${encodeURIComponent(plan.planId)}/reject`, { method: 'POST', body: {} })
 };
 
-export const APPROVAL_READS = ['/privilege-grants', '/package-plans'] as const;
+export const APPROVAL_READS = ['/privilege-grants', '/package-plans', '/dependency-plans'] as const;
+
+export function dependencyPlanIsActionable(plan: DependencyPlanView, now = Date.now()): boolean {
+  return plan.state === 'PENDING_APPROVAL' && plan.expiresAt > now;
+}
+export function dependencyPlanCanWithdraw(plan: DependencyPlanView, now = Date.now()): boolean {
+  return plan.state === 'APPROVED' && plan.expiresAt > now;
+}
+export function dependencyPlanStatusLabel(plan: DependencyPlanView, now = Date.now()): string {
+  if (['PENDING_APPROVAL', 'APPROVED'].includes(plan.state) && plan.expiresAt <= now) return 'Expired';
+  const labels = { PENDING_APPROVAL: 'Pending', APPROVED: 'Approved, awaiting download', REJECTED: 'Rejected', EXPIRED: 'Expired', RUNNING: 'Downloading', SUCCEEDED: 'Downloaded', FAILED: 'Failed' };
+  return labels[plan.state];
+}
+export const dependencyApprovalsApi = {
+  approve: (plan: DependencyPlanView) => apiClient.request(`/dependency-plans/${encodeURIComponent(plan.planId)}/approve`, { method: 'POST', body: { planDigest: plan.planDigest } }),
+  reject: (plan: DependencyPlanView) => apiClient.request(`/dependency-plans/${encodeURIComponent(plan.planId)}/reject`, { method: 'POST', body: {} })
+};

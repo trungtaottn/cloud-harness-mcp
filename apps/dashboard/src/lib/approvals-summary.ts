@@ -37,9 +37,9 @@ export function pendingPlanCount(body: unknown, now = Date.now()): number {
   return listOf<PackagePlan>(body, 'plans').filter((plan) => planIsActionable(plan, now)).length;
 }
 
-/** The two reads behind every approvals count: the same keys the Approvals page reads, so its decisions refresh them. */
+/** The reads behind every approvals count: the same keys the Approvals page reads, so its decisions refresh them. */
 export function approvalsQueries() {
-  return { grants: pageReadQuery('approvals', {}), plans: bffQuery<unknown>('/package-plans') } as const;
+  return { grants: pageReadQuery('approvals', {}), plans: bffQuery<unknown>('/package-plans'), dependencies: bffQuery<unknown>('/dependency-plans') } as const;
 }
 
 /**
@@ -48,10 +48,11 @@ export function approvalsQueries() {
  * registry read, all of which share these keys.
  */
 export function invalidateApprovals(queryClient: QueryClient): Promise<void> {
-  const { grants, plans } = approvalsQueries();
+  const { grants, plans, dependencies } = approvalsQueries();
   return Promise.all([
     queryClient.invalidateQueries({ queryKey: grants.queryKey }),
-    queryClient.invalidateQueries({ queryKey: plans.queryKey })
+    queryClient.invalidateQueries({ queryKey: plans.queryKey }),
+    queryClient.invalidateQueries({ queryKey: dependencies.queryKey })
   ]).then(() => undefined);
 }
 
@@ -60,9 +61,10 @@ export type ApprovalsSummary = {
   fetching: boolean;
   grantCount: number | undefined;
   planCount: number | undefined;
+  dependencyCount: number | undefined;
   /** Pending grants plus plans that could be read; a lower bound when `partial`. */
   total: number;
-  /** At least one of the two reads failed, so "nothing is waiting" cannot be claimed. */
+  /** At least one read failed, so "nothing is waiting" cannot be claimed. */
   partial: boolean;
   /** Either read has answered (data or an error); false while nothing has been asked yet. */
   settled: boolean;
@@ -74,18 +76,26 @@ export type ApprovalsSummary = {
  * the last count on pages that the legacy badge did not refresh on.
  */
 export function useApprovalsSummary({ enabled = true }: { enabled?: boolean } = {}): ApprovalsSummary {
-  const { grants: grantsQuery, plans: plansQuery } = approvalsQueries();
+  const { grants: grantsQuery, plans: plansQuery, dependencies: dependenciesQuery } = approvalsQueries();
   const grants = useQuery({ ...grantsQuery, enabled: enabled && grantsQuery.enabled !== false, refetchOnWindowFocus: true });
   const plans = useQuery({ ...plansQuery, enabled, refetchOnWindowFocus: true });
+  const dependencies = useQuery({ ...dependenciesQuery, enabled, refetchOnWindowFocus: true });
+  const dependencyCount = dependencies.data === undefined ? undefined : pendingDependencyCount(dependencies.data);
   const grantCount = grants.data === undefined ? undefined : pendingGrantCount(grants.data);
   const planCount = plans.data === undefined ? undefined : pendingPlanCount(plans.data);
   return {
-    loading: enabled && (grants.isPending || plans.isPending),
-    fetching: grants.isFetching || plans.isFetching,
+    loading: enabled && (grants.isPending || plans.isPending || dependencies.isPending),
+    fetching: grants.isFetching || plans.isFetching || dependencies.isFetching,
     grantCount,
     planCount,
-    total: (grantCount ?? 0) + (planCount ?? 0),
-    partial: grants.isError || plans.isError || grantCount === undefined || planCount === undefined,
-    settled: grants.data !== undefined || plans.data !== undefined || grants.isError || plans.isError
+    dependencyCount,
+    total: (grantCount ?? 0) + (planCount ?? 0) + (dependencyCount ?? 0),
+    partial: grants.isError || plans.isError || dependencies.isError || grantCount === undefined || planCount === undefined || dependencyCount === undefined,
+    settled: grants.data !== undefined || plans.data !== undefined || dependencies.data !== undefined || grants.isError || plans.isError || dependencies.isError
   };
+}
+
+export function pendingDependencyCount(body: unknown, now = Date.now()): number {
+  return listOf<{ state?: string; expiresAt?: number }>(body, 'plans')
+    .filter((plan) => plan.state === 'PENDING_APPROVAL' && typeof plan.expiresAt === 'number' && plan.expiresAt > now).length;
 }

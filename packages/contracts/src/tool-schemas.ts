@@ -13,6 +13,7 @@ import {
   ModelSpendSummaryToolInputSchema
 } from './model-tool-schemas.js';
 import { ModelCatalogSearchInputSchema } from './model-catalog-schemas.js';
+import { DependenciesPlanInputSchema, DependenciesApplyInputSchema, DependenciesStatusInputSchema } from './dependency-schemas.js';
 import { PackagesApplyInputSchema, PackagesListInputSchema, PackagesPlanInputSchema, PackagesRemoveInputSchema, PackagesRollbackInputSchema, PackagesStatusInputSchema } from './package-schemas.js';
 import {
   JournalTypeSchema,
@@ -829,6 +830,9 @@ const schemas = {
     if (input.workspaceId !== undefined) context.addIssue({ code: 'custom', path: ['workspaceId'], message: 'workspaceId is not allowed for the toolbox target' });
     if (input.cwd !== '.') context.addIssue({ code: 'custom', path: ['cwd'], message: 'cwd is only valid for the workspace target' });
   }),
+  dependencies_plan: DependenciesPlanInputSchema,
+  dependencies_apply: DependenciesApplyInputSchema,
+  dependencies_status: DependenciesStatusInputSchema,
   packages_plan: PackagesPlanInputSchema,
   packages_apply: PackagesApplyInputSchema,
   packages_list: PackagesListInputSchema,
@@ -1191,6 +1195,7 @@ const titles: Record<RunnerOperation, string> = {
   files_list: 'List files', files_read: 'Read file', files_write: 'Write file', files_write_batch: 'Write batch files', files_apply_patch: 'Apply text patch', files_delete: 'Delete file or directory', files_move: 'Move file or directory', files_mkdir: 'Create directory', grep_search: 'Search workspace',
   symbols_search: 'Find symbol definitions', symbols_references: 'Find lexical symbol references',
   exec_run: 'Run command', bash: 'Run bash command',
+  dependencies_plan: 'Request project dependency download', dependencies_apply: 'Download approved dependencies', dependencies_status: 'Project dependency download status',
   packages_plan: 'Plan managed package change', packages_apply: 'Apply managed package plan', packages_list: 'List managed packages', packages_status: 'Managed package status', packages_rollback: 'Roll back managed package', packages_remove: 'Uninstall managed package',
   model_provider_list: 'List model providers', model_catalog_search: 'Search model catalog', model_connection_verify: 'Check model connection',
   model_profile_list: 'List agent model profiles', model_profile_validate: 'Dry-run agent model profile change', model_profile_create: 'Create agent model profile',
@@ -1243,6 +1248,9 @@ const descriptions: Record<RunnerOperation, string> = {
   symbols_search: 'Find bounded indexed symbol definitions by case-insensitive substring.',
   symbols_references: 'Find bounded lexical whole-word occurrences of a symbol in workspace text.',
   exec_run: 'Run one bounded shell command in the workspace and return captured output.',
+  dependencies_plan: 'Snapshot Go or pnpm project manifests in an owned workspace and request mandatory Dashboard approval. directory is workspace-relative. No network or package scripts run during planning. The immutable plan names hashes, registry hosts, dependency changes and time/byte limits. Changed manifests require a new plan. Workspace networking stays unchanged.',
+  dependencies_apply: 'Start a Dashboard-approved dependency plan using its exact planId and planDigest. The workspace must be idle. Downloads use a separate bounded registry-only helper without workspace secrets or lifecycle scripts; installs verified cache into the existing workspace without recreation. Returns immediately; poll dependencies_status until SUCCEEDED. Same-plan replay returns its state, never another download.',
+  dependencies_status: 'Read dependency plan and download states for an owned workspace, optionally by planId. SUCCEEDED means cache installed, not project tests passed. Apply scripts/build/install offline separately. Plans and outcomes survive restart; interrupted downloads fail and require a new approved plan.',
   packages_plan: 'Resolve one managed toolbox package change into an immutable plan without installing anything and without running package code (uv accepts wheels only; npm lifecycle scripts stay off unless allowed). ecosystem "npm" or "uv" (uv tools get their own managed Python); "apt" is not supported and returns NOT_SUPPORTED because system packages need a reviewed executor image variant. scope "owner" (default) makes the tool available to all your new workspaces and the bash toolbox target; scope "workspace" needs workspaceId and overrides the owner binding there. "instance" scope does not exist. If resolution is still running after about 20 seconds, the result is { resolutionId, state: "RESOLVING" } instead: poll packages_status with that resolutionId (and waitMs) until it is READY with the plan or FAILED. The plan lists the exact version, source, integrity, dependency count, size, binaries, conflicts, affected workspaces, and planDigest. approval "required" means an operator approves the plan in the Dashboard first; "unavailable" means this instance cannot approve plans. Use for durable CLI tools; use npm install or uv in a workspace for project dependencies. Off unless the operator sets PACKAGES_ENABLED=true.',
   packages_apply: 'Build an approved plan (planId with the exact planDigest from packages_plan) into an immutable release in an isolated builder, verify its file tree, and launch-check every binary without network. Returns an applyId immediately; poll packages_status with applyId. Replaying the same plan returns the same apply. A release is installed only when the apply reaches SUCCEEDED. Existing workspaces keep their mounted releases until they are recreated; new workspaces and the bash toolbox target use the new release.',
   packages_list: 'List managed package bindings (what each scope uses now) and verified releases, with versions, digests, sizes, binaries, and whether a release was built for an older executor image (stale). Set includeHistory to see earlier releases you can roll back to.',
@@ -1340,7 +1348,7 @@ const readOnly = new Set<RunnerOperation>([
   'worktrees_list', 'skills_list', 'skills_read', 'hooks_list', 'memories_list', 'memories_read', 'memories_search',
   'knowledge_read', 'knowledge_list', 'knowledge_search', 'knowledge_graph', 'deployments_list',
   'artifacts_list', 'artifacts_read', 'secrets_list', 'github_read',
-  'packages_list', 'packages_status',
+  'packages_list', 'packages_status', 'dependencies_status',
   'agent_status', 'agent_logs', 'agent_list',
   'model_provider_list', 'model_catalog_search', 'model_profile_list', 'model_profile_validate', 'model_spend_summary'
 ]);
@@ -1353,7 +1361,7 @@ const destructive = new Set<RunnerOperation>([
   'worktrees_remove', 'skills_run', 'hooks_run', 'hooks_activate', 'hooks_deactivate', 'memories_write', 'memories_delete',
   'knowledge_create', 'knowledge_update', 'knowledge_delete', 'knowledge_link', 'knowledge_unlink',
   'deployments_run', 'artifacts_restore', 'artifacts_delete', 'github_action', 'github_repository_create',
-  'packages_rollback', 'packages_remove',
+  'packages_rollback', 'packages_remove', 'dependencies_apply',
   'agent_spawn', 'agent_message', 'agent_cancel',
   'model_profile_update'
 ]);
@@ -1368,7 +1376,7 @@ const idempotent = new Set<RunnerOperation>([
   'knowledge_create', 'knowledge_read', 'knowledge_update', 'knowledge_delete', 'knowledge_list', 'knowledge_search', 'knowledge_link', 'knowledge_unlink', 'knowledge_graph',
   'deployments_list',
   'artifacts_list', 'artifacts_read', 'secrets_list', 'github_read',
-  'packages_apply', 'packages_list', 'packages_status', 'packages_rollback',
+  'packages_apply', 'packages_list', 'packages_status', 'packages_rollback', 'dependencies_apply', 'dependencies_status',
   'agent_spawn', 'agent_status', 'agent_logs', 'agent_message', 'agent_cancel', 'agent_list',
   'model_provider_list', 'model_catalog_search', 'model_profile_list', 'model_profile_validate', 'model_profile_create', 'model_profile_update',
   'model_spend_summary'
@@ -1376,7 +1384,7 @@ const idempotent = new Set<RunnerOperation>([
 const openWorld = new Set<RunnerOperation>([
   'workspace_open', 'workspace_finalize', 'exec_run', 'bash', 'shell_io', 'sessions_io', 'tasks_run',
   'git_fetch', 'git_pull', 'git_push', 'skills_run', 'skill_suggest', 'hooks_run', 'deployments_run', 'github_action', 'github_read', 'github_repository_create',
-  'packages_plan', 'packages_apply',
+  'packages_plan', 'packages_apply', 'dependencies_apply',
   'agent_spawn', 'agent_message',
   'model_catalog_search', 'model_connection_verify'
 ]);

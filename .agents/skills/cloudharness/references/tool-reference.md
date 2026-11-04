@@ -36,6 +36,12 @@ See [managed packages](managed-packages.md).
 `packages_plan` `packages_apply` `packages_status` `packages_list`
 `packages_rollback` `packages_remove`
 
+## Approved project dependencies
+
+See [managed packages](managed-packages.md#approved-project-dependency-caches).
+
+`dependencies_plan` `dependencies_apply` `dependencies_status`
+
 ## Git and worktrees
 
 See [Git and worktrees](git-and-worktrees.md).

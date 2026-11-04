@@ -20,7 +20,7 @@ network isolation.
 | Open, recover, inspect, or close a workspace; interpret results/errors | [Workspace lifecycle and results](references/workspace-lifecycle-and-results.md) |
 | List, read, write, patch, move, delete, grep, or search symbols | [Files and search](references/files-and-search.md) |
 | Run a command, interactive shell, coding session, or dependency task | [Execution and tasks](references/execution-and-tasks.md) |
-| Install, update, roll back, or uninstall a durable CLI tool for every workspace | [Managed packages](references/managed-packages.md) |
+| Request approved Go/pnpm project dependency caches, or install/update/remove durable CLI tools | [Managed packages](references/managed-packages.md) |
 | Inspect or change Git state, transfer origin refs, or use worktrees | [Git and worktrees](references/git-and-worktrees.md) |
 | Run an automated merge train: branch locks, commit statuses, check runs, review state, workflow dispatch and re-runs | [GitHub merge train](references/github-merge-train.md) |
 | Create a new organization repository and bootstrap it (only when the user explicitly asks) | [GitHub repository bootstrap](references/github-repository-bootstrap.md) |
@@ -186,6 +186,10 @@ poll `tasks_status`, `operation_wait`, or `agent_status` instead.
      grant in the dashboard, then pass `approvalGrantToken`.
    - Injected secrets are available to container processes automatically; never
      attempt to print, echo, or exfiltrate secret values.
+   - For missing Go/pnpm project dependencies in an offline workspace, use
+     `dependencies_plan`, wait for Dashboard approval, then `dependencies_apply`
+     and poll `dependencies_status`. Read the managed-packages reference first.
+     Do not change the workspace network profile or widen package scope.
 7. **Git workflow and finalization.**
    - Inspect status and diff using `git_status` and `git_diff`.
    - Use `workspace_finalize` for streamlined transactional staging, preflight

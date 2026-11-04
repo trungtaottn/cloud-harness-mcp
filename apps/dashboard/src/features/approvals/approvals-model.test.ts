@@ -173,6 +173,6 @@ describe('approvalsApi', () => {
   });
 
   it('names the read paths it invalidates', () => {
-    expect(APPROVAL_READS).toEqual(['/privilege-grants', '/package-plans']);
+    expect(APPROVAL_READS).toEqual(['/privilege-grants', '/package-plans', '/dependency-plans']);
   });
 });

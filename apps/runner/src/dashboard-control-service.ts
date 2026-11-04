@@ -456,6 +456,9 @@ export class DashboardControlService {
           }
           return ok('Privilege grant rejected', { grant: rejectedGrant });
         }
+        case 'dependency_plan_list': return ok('Dependency plans listed', { plans: this.workspaces.dependencies.list(principalId) });
+        case 'dependency_plan_approve': return ok('Dependency plan approved', { plan: this.workspaces.dependencies.approve(principalId, parsed.input) });
+        case 'dependency_plan_reject': return ok('Dependency plan rejected', { plan: this.workspaces.dependencies.reject(principalId, parsed.input) });
         case 'package_overview': return ok('Managed packages listed', this.packageOverview(principalId, await this.currentPackageImageId()));
         case 'package_plan_list': return ok('Package plans listed', this.packagePlanList(principalId));
         case 'package_plan_approve': {
