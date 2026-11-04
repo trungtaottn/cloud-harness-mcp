@@ -541,6 +541,16 @@ describe('PackageService publish atomicity and recovery', () => {
 });
 
 describe('PackageService ownership, precedence, conflicts, and rollback', () => {
+  it('excludes remote workspaces from owner package activation and rejects a stored remote plan', async () => {
+    const f = fixture();
+    const local = f.workspace(f.owner), remote = f.workspace(f.owner);
+    const remotePlan = await plan(f, { scope: 'workspace', workspaceId: remote });
+    f.state.updateFenced(remote, f.state.byId(remote)!.generation, ['ACTIVE'], { executorKind: 'instabox' });
+    const ownerPlan = await plan(f);
+    expect(ownerPlan.affectedWorkspaces).toEqual([local]);
+    await expectCode(f.packages.execute(f.owner, 'packages_apply', { planId: remotePlan.planId, planDigest: remotePlan.planDigest }), 'NOT_SUPPORTED');
+  });
+
   it('hides another owner\'s plans, applies, bindings, and releases', async () => {
     const f = fixture();
     const { planned, applied } = await install(f);

@@ -142,3 +142,94 @@ with tempfile.TemporaryDirectory() as directory:
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 });
+
+it('blocks InstaBox downgrades from config and read-only retained state, tolerating legacy schemas', () => {
+  python(String.raw`
+import runpy, sqlite3, tempfile
+from pathlib import Path
+from types import SimpleNamespace
+vm = runpy.run_path('custom/guard-vm-runner.py')
+with tempfile.TemporaryDirectory() as directory:
+    database = Path(directory) / 'state.db'
+    assert not vm['retained_instabox'](database)
+    assert not database.exists()
+    with sqlite3.connect(database) as db:
+        db.execute('CREATE TABLE workspaces (id TEXT)')
+    assert not vm['retained_instabox'](database)
+    with sqlite3.connect(database) as db:
+        db.execute('ALTER TABLE workspaces ADD COLUMN executor_kind TEXT')
+        db.execute("INSERT INTO workspaces VALUES ('fixture', 'instabox')")
+    assert vm['retained_instabox'](database)
+    with sqlite3.connect(database) as db:
+        db.execute('DELETE FROM workspaces')
+        db.execute('CREATE TABLE executor_allocations (released INTEGER)')
+        db.execute('INSERT INTO executor_allocations VALUES (1)')
+    assert not vm['retained_instabox'](database)
+    with sqlite3.connect(database) as db:
+        db.execute('INSERT INTO executor_allocations VALUES (0)')
+    assert vm['retained_instabox'](database)
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(stdout='')
+    vm['guard'].__globals__['subprocess'] = SimpleNamespace(run=run)
+    for settings, path in [({}, database), ({'INSTABOX_ENABLED':'true'}, Path(directory)/'absent')]:
+        try:
+            vm['guard'](settings, check_only=True, database=path)
+        except RuntimeError as error:
+            assert 'InstaBox' in str(error)
+        else:
+            raise AssertionError('unaware runner accepted')
+    assert any('io.cloud-harness.instabox-workspaces' in str(call) for call in calls)
+    vm['guard'].__globals__['subprocess'] = SimpleNamespace(run=lambda *a, **k: SimpleNamespace(stdout='1' if a[0][1] == 'image' else ''))
+    vm['guard']({'INSTABOX_ENABLED':'true'}, database=Path(directory)/'absent')
+    assert vm['parse_settings']('INSTABOX_ENABLED=true\nINSTABOX_API_KEY=sentinel\n') == {'INSTABOX_ENABLED': 'true'}
+`);
+});
+
+it('checks exact target images and preserves explicitly configured remote settings', () => {
+  python(String.raw`
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+with tempfile.TemporaryDirectory() as directory:
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(stdout='0')
+    scope['require_instabox_runner'].__globals__.update(STATE=Path(directory), run=run)
+    configured = 'AUTH_MODE=cloudflare-access\nINSTABOX_ENABLED=true\nINSTABOX_MACHINE_IDS=fixture-a\nINSTABOX_PRINCIPAL_ID=fixture-owner\nINSTABOX_API_KEY_FILE=/operator/selected/file\n'
+    try:
+        scope['require_instabox_runner']('old-image', configured)
+    except RuntimeError as error:
+        assert 'InstaBox' in str(error)
+    else:
+        raise AssertionError('unsafe image accepted')
+    assert calls[0][:4] == ('docker', 'image', 'inspect', 'old-image')
+    updated, _ = scope['dependency_configuration'](configured, '')
+    for line in configured.splitlines():
+        assert line in updated.splitlines()
+    scope['require_instabox_runner'].__globals__['run'] = lambda *a, **k: SimpleNamespace(stdout='1')
+    assert scope['require_instabox_runner']('aware-image', configured)
+`);
+});
+
+it('fails closed on corrupt allocation schema without modifying the database', () => {
+  python(String.raw`
+import runpy, sqlite3, tempfile
+from pathlib import Path
+vm = runpy.run_path('custom/guard-vm-runner.py')
+with tempfile.TemporaryDirectory() as directory:
+    database = Path(directory) / 'state.db'
+    with sqlite3.connect(database) as db:
+        db.execute('CREATE TABLE executor_allocations (unknown_column TEXT)')
+    before = database.read_bytes()
+    try:
+        vm['retained_instabox'](database)
+    except RuntimeError as error:
+        assert 'Cannot verify' in str(error)
+    else:
+        raise AssertionError('unknown allocation schema accepted')
+    assert database.read_bytes() == before
+`);
+});

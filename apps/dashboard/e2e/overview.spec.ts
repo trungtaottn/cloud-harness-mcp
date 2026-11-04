@@ -80,10 +80,10 @@ test('leads with decision tiles that link to the filtered lists, reading each en
   await expect(page.locator('main [style]')).toHaveCount(0);
 
   // The classic reads, each once: /overview, /metrics?window=24h, /reliability, /server, the shared
-  // /profile, and the approvals badge's two reads (`refreshApprovalsBadge` ran on every Overview load).
+  // /profile, and all three approval sources, including dependency plans.
   await expect(page.getByRole('table', { name: 'MCP reliability by server' })).toBeVisible();
-  await expect.poll(() => reads.length).toBe(7);
-  expect([...reads].sort()).toEqual(['/metrics?window=24h', '/overview', '/package-plans', '/privilege-grants', '/profile', '/reliability', '/server']);
+  await expect.poll(() => reads.length).toBe(8);
+  expect([...reads].sort()).toEqual(['/dependency-plans', '/metrics?window=24h', '/overview', '/package-plans', '/privilege-grants', '/profile', '/reliability', '/server']);
   await expectNoSeriousA11yViolations(page);
   expect(problems).toEqual([]);
 });

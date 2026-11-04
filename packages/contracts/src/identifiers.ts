@@ -44,5 +44,5 @@ export type IntegrationCredentialId = z.infer<typeof IntegrationCredentialIdSche
 export const ExecutorNetworkProfileSchema = z.enum(['network-none', 'dependency-access']);
 export type ExecutorNetworkProfile = z.infer<typeof ExecutorNetworkProfileSchema>;
 
-export const WorkspaceNetworkExposureSchema = z.enum(['network-none', 'dependency-access', 'local-host']);
+export const WorkspaceNetworkExposureSchema = z.enum(['network-none', 'dependency-access', 'local-host', 'provider-managed']);
 export type WorkspaceNetworkExposure = z.infer<typeof WorkspaceNetworkExposureSchema>;

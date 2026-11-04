@@ -24,6 +24,13 @@ services:
       ACCESS_LEGACY_ISSUER: ""
       ACCESS_LEGACY_SUBJECT: ""
       ACCESS_PRINCIPAL_RELINKS: ""
+      # Remote executor credentials and pool routing belong only to the runner.
+      INSTABOX_ENABLED: "false"
+      INSTABOX_API_KEY: ""
+      INSTABOX_API_KEY_FILE: ""
+      INSTABOX_MACHINE_IDS: ""
+      INSTABOX_PRINCIPAL_ID: ""
+      INSTABOX_ALLOW_PUBLIC_NETWORK: "false"
     depends_on:
       runner:
         condition: service_healthy

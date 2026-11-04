@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import shlex
 import signal
@@ -77,6 +78,25 @@ def dependency_configuration(runtime_text, proxy_text, vm=False):
             update_settings(proxy_text, {'PACKAGES_PROXY_HOSTS': ','.join(sorted(hosts | DEPENDENCY_HOSTS))}))
 
 
+def instabox_guard_module():
+    source = Path(__file__).with_name('guard-vm-runner.py')
+    if not source.exists():
+        source = Path(__file__).parent.parent / 'guard-vm-runner.py'
+    return runpy.run_path(str(source))
+
+
+def require_instabox_runner(image, runtime_text):
+    guard = instabox_guard_module()
+    configured = guard['parse_settings'](runtime_text).get('INSTABOX_ENABLED') == 'true'
+    retained = guard['retained_instabox'](STATE / 'state/cloud-harness.db')
+    if configured or retained:
+        aware = run('docker', 'image', 'inspect', image, '--format',
+                    '{{index .Config.Labels "io.cloud-harness.instabox-workspaces"}}', capture=True).stdout.strip()
+        if aware != '1':
+            raise RuntimeError('Refusing a runner without InstaBox support; recover forward without releasing retained allocations')
+    return configured or retained
+
+
 def run(*args, capture=False, **kwargs):
     return subprocess.run(args, check=True, text=True, stdout=subprocess.PIPE if capture else None, **kwargs)
 
@@ -126,6 +146,8 @@ def rollback(*, acquire_lock=True):
                        '--filter', 'label=cloud-harness.managed=true', '--format', '{{.Names}}', capture=True).stdout.strip()
         if retained:
             raise RuntimeError('Rollback to a pre-VM runner is blocked while retained VMs exist. Keep the new runner and recover forward; do not remove VM disks.')
+    require_instabox_runner(saved['images']['runner'], CONFIG.read_text())
+    require_instabox_runner(saved['images']['runner'], (backup / 'runtime.env').read_text())
     run('systemctl', 'stop', UNIT)
     replace_file(CONFIG, (backup / 'runtime.env').read_text())
     # Old recovery markers predate proxy changes and must leave that configuration alone.
@@ -169,6 +191,7 @@ def apply():
         runtime_text, proxy_text = dependency_configuration(CONFIG.read_text(), PROXY_CONFIG.read_text() if proxy_existed else '', vm='--vm' in sys.argv)
         if '--vm' in sys.argv:
             run('bash', str(Path(__file__).with_name('smoke-kata-runtime.sh')), setting_value(runtime_text, 'EXECUTOR_IMAGE') or 'cloud-harness-executor:local')
+        instabox_required = require_instabox_runner(images['runner'], runtime_text)
         for image in images.values():
             run('docker', 'image', 'inspect', image, capture=True)
         # Do not interrupt an executor with active commands or interactive sessions.
@@ -214,7 +237,7 @@ def apply():
                                       'managed_metadata': list(RELEASE_METADATA), 'proxy_existed': proxy_existed, 'vm_activation': '--vm' in sys.argv}))
         print(f'Backup: {backup}', flush=True)
         try:
-            if '--vm' in sys.argv:
+            if '--vm' in sys.argv or instabox_required:
                 guard_dir = Path('/usr/local/lib/cloud-harness')
                 guard_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
                 for source, target in (('guard-vm-runner.py', 'guard-vm-runner.py'), ('setup-vm-firewall.sh', 'setup-vm-firewall.sh')):
@@ -291,8 +314,8 @@ def launch():
         smoke_source = Path(__file__).parent.parent / 'smoke-kata-runtime.sh'
         if '--vm' in sys.argv:
             shutil.copy2(smoke_source, installed / 'smoke-kata-runtime.sh')
-            shutil.copy2(Path(__file__).parent.parent / 'guard-vm-runner.py', installed / 'guard-vm-runner.py')
-            shutil.copy2(Path(__file__).parent.parent.parent / 'deploy/scripts/setup-dependency-firewall.sh', installed / 'setup-vm-firewall.sh')
+        shutil.copy2(Path(__file__).parent.parent / 'guard-vm-runner.py', installed / 'guard-vm-runner.py')
+        shutil.copy2(Path(__file__).parent.parent.parent / 'deploy/scripts/setup-dependency-firewall.sh', installed / 'setup-vm-firewall.sh')
         run('systemd-run', '--wait', '--collect', '--unit=cloud-harness-workspace-recreate',
             '--property=KillMode=mixed', '--property=TimeoutStopSec=300',
             f'--property=ExecStopPost=/usr/bin/python3 {installed}/deploy.py --recover',

@@ -27,6 +27,9 @@ function cleanWorkspace(value: unknown): Record<string, unknown> {
   const item = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   const allowed = ['workspaceId', 'repositoryUrl', 'ref', 'status', 'networkProfile', 'createdAt', 'lastActivityAt', 'expiresAt'];
   const clean = Object.fromEntries(allowed.filter((key) => item[key] !== undefined).map((key) => [key, item[key]]));
+  if (['docker', 'kata', 'instabox'].includes(String(item.executorKind))) clean.executorKind = item.executorKind;
+  if (typeof item.installedSoftwareRetained === 'boolean') clean.installedSoftwareRetained = item.installedSoftwareRetained;
+  if (item.retention === 'explicit-close-only') clean.retention = item.retention;
   if (typeof item.generation === 'number') clean.version = item.generation;
   if (typeof item.canRenewLease === 'boolean') clean.canRenewLease = item.canRenewLease;
   if (typeof item.leaseCapped === 'boolean') clean.leaseCapped = item.leaseCapped;

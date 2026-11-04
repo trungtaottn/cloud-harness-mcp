@@ -7,19 +7,19 @@ import { workspacesList } from './fixtures/workspaces';
 import { answer, expectPage, sidebarLink, stubReads, type VisitedPage } from './support';
 
 // Moving between the migrated pages inside one document: every navigation reads no more than
-// the classic loader for that page read (docs/dashboard-parity-matrix.md §6), and a page's
+// the page contract allows, including dependency approvals, and a page's
 // pollers stop the moment it is left, so a client-side tour never stacks duplicate pollers.
 
 const API = '/dashboard/api/v1';
 const SHELL_READS = new Set(['/session', '/profile', '/preferences']);
 
 /**
- * The page reads of each classic loader (`apps/api/dashboard/dashboard.js`), without the
+ * Classic loader budgets plus the custom dependency approval source, without the
  * shell's session, profile and preferences reads, which the React shell makes once.
  */
-const LEGACY_READS: Record<'overview' | 'workspaces' | 'agents' | 'agent' | 'activity' | 'skills', readonly string[]> = {
+const PAGE_READS: Record<'overview' | 'workspaces' | 'agents' | 'agent' | 'activity' | 'skills', readonly string[]> = {
   // `loadOverview` plus `refreshApprovalsBadge`.
-  overview: ['/server', '/overview', '/metrics', '/reliability', '/privilege-grants', '/package-plans'],
+  overview: ['/server', '/overview', '/metrics', '/reliability', '/privilege-grants', '/package-plans', '/dependency-plans'],
   // `loadIndex`.
   workspaces: ['/workspaces'],
   // `loadAgents`.
@@ -27,7 +27,7 @@ const LEGACY_READS: Record<'overview' | 'workspaces' | 'agents' | 'agent' | 'act
   // `loadAgents(agentId)`: the detail and its log tail.
   agent: [`/agents/${PARENT_ID}`, `/agents/${PARENT_ID}/logs`],
   // `loadActivity` plus `refreshApprovalsBadge`.
-  activity: ['/activity', '/privilege-grants', '/package-plans'],
+  activity: ['/activity', '/privilege-grants', '/package-plans', '/dependency-plans'],
   // `loadSkills`: the library rows.
   skills: ['/skills']
 };
@@ -72,7 +72,7 @@ const READS = {
   [`/skill-imports/${IMPORT_JOB}`]: answer(200, importJob('running'))
 };
 
-test('a client-side tour reads no more than the classic loaders and leaves no poller behind', async ({ page }) => {
+test('a client-side tour stays within page read budgets and leaves no poller behind', async ({ page }) => {
   test.setTimeout(90_000);
   await page.clock.install();
   const reads = trackReads(page);
@@ -102,23 +102,23 @@ test('a client-side tour reads no more than the classic loaders and leaves no po
 
   // Overview, at rest: nothing polls.
   await page.goto('/dashboard');
-  await arrive('overview', 0, LEGACY_READS.overview);
+  await arrive('overview', 0, PAGE_READS.overview);
   expect(await rest()).toEqual([]);
 
   let mark = reads.length;
   await sidebarLink(page, 'workspaces').click();
-  await arrive('workspaces', mark, LEGACY_READS.workspaces);
+  await arrive('workspaces', mark, PAGE_READS.workspaces);
   expect(await rest()).toEqual([]);
 
   mark = reads.length;
   await sidebarLink(page, 'agents').click();
-  await arrive('agents', mark, LEGACY_READS.agents);
+  await arrive('agents', mark, PAGE_READS.agents);
   expect(await rest()).toEqual([]);
 
   // Agent detail with Follow on: it polls while open (one owner per read, no duplicates per tick).
   mark = reads.length;
   await page.locator(`main a[href^="/dashboard/agents/${PARENT_ID}"]`).first().click();
-  await arrive('agent', mark, LEGACY_READS.agent);
+  await arrive('agent', mark, PAGE_READS.agent);
   await page.getByRole('button', { name: 'Follow' }).click();
   const following = reads.length;
   await page.clock.runFor(10_000);
@@ -129,7 +129,7 @@ test('a client-side tour reads no more than the classic loaders and leaves no po
   // Leaving stops both of the detail's polls at once.
   mark = reads.length;
   await sidebarLink(page, 'activity').click();
-  await arrive('activity', mark, LEGACY_READS.activity);
+  await arrive('activity', mark, PAGE_READS.activity);
   expectNoLeftoverPolls(mark);
   expect(await rest()).toEqual([]);
   expectNoLeftoverPolls(mark);
@@ -137,7 +137,7 @@ test('a client-side tour reads no more than the classic loaders and leaves no po
   // Skills with an import running: the job polls while the page is open.
   mark = reads.length;
   await sidebarLink(page, 'skills').click();
-  await arrive('skills', mark, LEGACY_READS.skills);
+  await arrive('skills', mark, PAGE_READS.skills);
   await page.getByRole('tab', { name: 'Discover' }).click();
   await page.getByRole('textbox', { name: 'Source' }).fill('acme/review-skills');
   await page.getByRole('button', { name: 'Import' }).click();
@@ -148,7 +148,7 @@ test('a client-side tour reads no more than the classic loaders and leaves no po
   // Back to Overview: the import poll stops, and Overview reads no more than its loader did.
   mark = reads.length;
   await sidebarLink(page, 'overview').click();
-  await arrive('overview', mark, LEGACY_READS.overview);
+  await arrive('overview', mark, PAGE_READS.overview);
   expectNoLeftoverPolls(mark);
   expect(await rest()).toEqual([]);
   expectNoLeftoverPolls(mark);

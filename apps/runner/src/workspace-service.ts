@@ -42,6 +42,8 @@ import {
 } from '@cloud-harness/contracts';
 import { assertVmExecutor, stopVmExecutor, VM_RUNTIME, vmLaunchArgs, vmWritableBytes } from './vm-executor.js';
 import { inspectContainer, removeContainer, runDocker, terminateContainerProcessGroup } from './docker-engine.js';
+import { ExecutorStore } from './executor-store.js';
+import { RemoteWorkspace } from './remote-workspace.js';
 import { EXECUTOR_HARDENING_ARGS, EXECUTOR_RESOURCE_CEILINGS, TOOLBOX_STALE_AFTER_MS, managedPathEnvArgs, reapStaleToolboxContainers, runToolboxCommand, toolboxContainerName, withManagedBins, type ToolboxRunResult } from './toolbox-runner.js';
 import { DependencyBuilder } from './dependency-builder.js';
 import { DependencyStore } from './dependency-store.js';
@@ -218,18 +220,22 @@ function availableLifecycleActions(status: WorkspaceRecord['status'], canRenewLe
   }
 }
 
+function retainedExecutor(record: WorkspaceRecord): boolean {
+  return record.executorKind === 'kata' || record.executorKind === 'instabox';
+}
+
 function publicRecord(record: WorkspaceRecord, capabilities?: WorkspaceCapabilityResult) {
   const now = Date.now();
   const remainingLeaseMs = Math.max(0, record.expiresAt - now);
   const hardRemainingMs = Math.max(0, record.hardExpiresAt - now);
-  const canRenewLease = (record.status === 'ACTIVE' || record.status === 'EXPIRED_RECOVERABLE') && (record.executorKind === 'kata' || hardRemainingMs > 60_000);
+  const canRenewLease = (record.status === 'ACTIVE' || record.status === 'EXPIRED_RECOVERABLE') && (retainedExecutor(record) || hardRemainingMs > 60_000);
   let leaseState: 'ACTIVE' | 'WARNING' | 'EXPIRED_RECOVERABLE' | 'EXPIRED' = 'ACTIVE';
   const leaseWarnings: string[] = [];
 
   if (record.status === 'EXPIRED_RECOVERABLE') {
     leaseState = 'EXPIRED_RECOVERABLE';
-    leaseWarnings.push(record.executorKind === 'kata' ? 'VM compute lease ended. Installed software and files remain until explicit workspace_close; use resume to start.' : 'Workspace lease has expired. Work is retained in recoverable grace state.');
-  } else if (record.status === 'NETWORK_QUARANTINED') {
+    leaseWarnings.push(retainedExecutor(record) ? 'Compute lease ended. Installed software and files remain retained; use workspace_recover resume to continue on the same machine.' : 'Workspace lease has expired. Work is retained in recoverable grace state.');
+  } else if (record.executorKind !== 'instabox' && record.status === 'NETWORK_QUARANTINED') {
     leaseState = 'EXPIRED';
     leaseWarnings.push('Workspace is quarantined due to network security policy drift. Work is retained and recoverable after policy reconciliation.');
   } else if (record.status === 'CLOSED' || record.status === 'FAILED') {
@@ -248,7 +254,8 @@ function publicRecord(record: WorkspaceRecord, capabilities?: WorkspaceCapabilit
     repositoryUrl: record.repositoryUrl,
     ref: record.repositoryRef,
     status: record.status,
-    networkProfile: record.networkProfile,
+    networkProfile: record.executorKind === 'instabox' ? 'provider-managed' : record.networkProfile,
+    ...(record.executorKind === 'instabox' ? { executorKind: 'instabox', installedSoftwareRetained: true, retention: 'explicit-close-only', providerPolicy: 'Free: never billed; pauses after 30 idle minutes or 8 running hours. Start throttles and cooldown apply.' } : {}),
     ...(record.executorKind === 'kata' ? { executorKind: 'kata', installedSoftwareRetained: true } : {}),
     createdAt: new Date(record.createdAt).toISOString(),
     lastActivityAt: new Date(record.lastActivityAt).toISOString(),
@@ -304,6 +311,7 @@ function internalWorkspaceDetail(record: WorkspaceRecord) {
 }
 
 export class WorkspaceService {
+  private readonly remoteWorkspace?: RemoteWorkspace;
   private readonly workspaceRequests = new Map<string, number>();
   private readonly recreatingWorkspaces = new Set<string>();
   private readonly operations: OperationManager;
@@ -317,6 +325,9 @@ export class WorkspaceService {
    * restart simply rescans on first use.
    */
   private readonly guidanceCache = new Map<string, { generation: number; fingerprint: string; snapshot: RepositoryGuidanceSnapshot }>();
+  private readonly remoteLifecycleWorkspaces = new Set<string>();
+  private remoteWorkersDetached = false;
+  private readonly remoteWorkerCompletions = new Set<Promise<void>>();
   private reaper?: NodeJS.Timeout | undefined;
   private reaperRunning = false;
   /** Toolbox containers this runner is running now; the semaphore count and the sweep's exclusion list. */
@@ -360,6 +371,7 @@ export class WorkspaceService {
     }
     this.metadata = metadata;
     this.instanceId = store.instanceId();
+    if (config.instabox) this.remoteWorkspace = new RemoteWorkspace(new ExecutorStore(store.database), config);
     const { manager, ...managerDependencies } = agentDeps ?? {};
     this.agentManager = manager ?? (config.agents
       ? new AgentManager(config.agents, store, {
@@ -382,10 +394,16 @@ export class WorkspaceService {
           }
         })
       : undefined);
-    this.instanceId = store.instanceId();
     this.store.reconcileRunningTasks(this.bootId, Date.now());
     this.store.reconcilePendingGitOperations(Date.now());
     this.operations = new OperationManager(this.store, this.bootId, {
+      ...(this.remoteWorkspace ? { remoteExecution: {
+        resolve: (workspaceId: string) => {
+          const record = this.store.byId(workspaceId);
+          return record?.executorKind === 'instabox' ? this.remoteWorkspace!.ref(record) : undefined;
+        },
+        backend: this.remoteWorkspace.backend
+      } } : {}),
       limits: {
         maxPerWorkspace: this.config.terminalMaxPerWorkspace,
         retainedBytes: this.config.terminalRetainedBytes,
@@ -557,6 +575,62 @@ export class WorkspaceService {
     }
   }
 
+  private requireRemote(): RemoteWorkspace {
+    if (!this.remoteWorkspace) throw new HarnessError('UNAVAILABLE', 'Remote executor configuration is unavailable; refusing local replacement', 503, false);
+    return this.remoteWorkspace;
+  }
+
+  private async reconcileRemoteWorkspace(record: WorkspaceRecord): Promise<void> {
+    const remote = this.requireRemote();
+    if (remote.allocations.isReleased(record.id, record.ownerId)) {
+      await this.closeRecord(record, 'finish host cleanup after confirmed remote release');
+      return;
+    }
+    remote.ref(record);
+    const allocation = remote.allocations.byWorkspace(record.id);
+    if (allocation?.cleanupRequested || record.error?.startsWith('Remote close pending')) return;
+    if (allocation?.state === 'QUARANTINED') {
+      this.store.updateFenced(record.id, record.generation, [record.status], { status: 'EXPIRED_RECOVERABLE', recoverableUntil: null, error: 'Remote lifecycle was interrupted; explicitly resume to verify retained identity or close to clean up' });
+      return;
+    }
+    if (record.status === 'REAPING') {
+      await this.suspendVmWorkspace(record, 'interrupted remote stop');
+      return;
+    }
+    if (record.status === 'CREATING') {
+      this.store.updateFenced(record.id, record.generation, ['CREATING'], {
+        status: 'EXPIRED_RECOVERABLE', recoverableUntil: null,
+        error: 'Remote provisioning interrupted; retained allocation requires recovery'
+      });
+      return;
+    }
+    const state = await remote.backend.inspect(remote.ref(record));
+    if (record.expiresAt <= Date.now() || record.hardExpiresAt <= Date.now() || !state.ready) {
+      await this.suspendVmWorkspace(record, 'remote compute stopped or lease expired');
+      return;
+    }
+    await this.operations.reconcileRemoteTasks(record.id, record.ownerId);
+  }
+
+  private async resumeRemoteExecutor(record: WorkspaceRecord, recreate: boolean): Promise<WorkspaceRecord> {
+    if (recreate) throw new HarnessError('NOT_SUPPORTED', 'Remote disks are retained; use resume instead of recreate', 400, false);
+    const remote = this.requireRemote();
+    const allocation = remote.allocations.byWorkspace(record.id);
+    if (record.error?.startsWith('Remote close pending') || allocation?.cleanupRequested || ['STARTING', 'STOPPING', 'RELEASING'].includes(allocation?.state ?? '')) throw new HarnessError('UNAVAILABLE', 'Remote cleanup is incomplete; retry explicit workspace close before reusing this allocation', 503, false);
+    await remote.resume(record);
+    try {
+      const updated = this.store.activateWithLimit(record.id, record.generation,
+        ['ACTIVE', 'EXPIRED_RECOVERABLE', 'NETWORK_QUARANTINED'], { status: 'ACTIVE', error: null }, this.configuredActiveWorkspaceLimit());
+      if (!updated) throw new HarnessError('CONFLICT', 'Remote workspace lifecycle changed during resume', 409, true);
+      await this.operations.reconcileRemoteTasks(updated.id, updated.ownerId);
+      return updated;
+    } catch (error) {
+      await remote.stop(record).catch(() => undefined);
+      if (error instanceof ActiveWorkspaceLimitReachedError) throw this.activeWorkspaceLimitError(error.active, error.limit);
+      throw error;
+    }
+  }
+
   private async reconcileVmWorkspace(record: WorkspaceRecord): Promise<void> {
     if (record.status === 'REAPING') {
       await this.suspendVmWorkspace(record, 'interrupted VM stop');
@@ -569,7 +643,7 @@ export class WorkspaceService {
       });
       return;
     }
-    if (record.status === 'NETWORK_QUARANTINED') {
+    if (record.executorKind !== 'instabox' && record.status === 'NETWORK_QUARANTINED') {
       await stopVmExecutor(record.containerName);
       return;
     }
@@ -615,12 +689,17 @@ export class WorkspaceService {
       });
     }
     await mkdir(this.config.jobsRoot, { recursive: true, mode: 0o700 });
+    this.remoteWorkspace?.allocations.quarantineInterrupted();
     for (const record of this.store.active()) {
+      if (record.executorKind === 'instabox') {
+        await this.reconcileRemoteWorkspace(record);
+        continue;
+      }
       if (record.executorKind === 'kata') {
         await this.reconcileVmWorkspace(record);
         continue;
       }
-      if (record.status === 'NETWORK_QUARANTINED') {
+      if (record.executorKind !== 'instabox' && record.status === 'NETWORK_QUARANTINED') {
         if (record.containerName) {
           try {
             await removeContainer(record.containerName);
@@ -712,6 +791,7 @@ export class WorkspaceService {
 
   private async withDependencyWorkspace<T>(ownerId: string, workspaceId: string, action: (workspace: DependencyWorkspace) => Promise<T>, planning = false): Promise<T> {
     const record = this.requireWorkspace(ownerId, workspaceId);
+    if (record.executorKind === 'instabox') throw new HarnessError('NOT_SUPPORTED', 'Install project dependencies directly inside the retained remote guest; managed dependency mounts are unavailable', 400, false);
     if (this.dependencyWorkspaces.has(record.id) || this.recreatingWorkspaces.has(record.id)
       || (!planning && ((this.workspaceRequests.get(record.id) ?? 0) > 1 || (record.mutationLockedUntil ?? 0) > Date.now()
       || this.operations.hasActiveWorkspaceWork(record.id) || this.agentManager?.hasActiveAgents(ownerId, record.id)))) {
@@ -765,7 +845,10 @@ export class WorkspaceService {
 
   async stop(): Promise<void> {
     this.beginShutdown();
+    this.remoteWorkersDetached = true;
     clearInterval(this.reaper);
+    await this.operations.detachRemoteOperations();
+    await Promise.all(this.remoteWorkerCompletions);
     await this.agentManager?.stop();
     await this.packageService?.shutdown();
     await this.dependencyService?.shutdown();
@@ -859,7 +942,7 @@ export class WorkspaceService {
       containerName: claimed.executorKind === 'kata' ? claimed.containerName : null,
       lastActivityAt: now,
       expiredAt: now,
-      recoverableUntil: claimed.executorKind === 'kata' ? null : now + this.recoverableGraceSecondsFor(claimed) * 1_000
+      recoverableUntil: retainedExecutor(claimed) ? null : now + this.recoverableGraceSecondsFor(claimed) * 1_000
     });
   }
 
@@ -890,8 +973,8 @@ export class WorkspaceService {
       if (record.status === 'ACTIVE' && (record.expiresAt <= now || record.hardExpiresAt <= now)) {
         const claimed = this.store.claimForExpiry(record.id, record.generation);
         if (claimed) {
-          this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
-          if (claimed.executorKind === 'kata') await this.suspendVmWorkspace(claimed, 'workspace compute lease expired');
+          if (claimed.executorKind !== 'instabox') this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
+          if (retainedExecutor(claimed)) await this.suspendVmWorkspace(claimed, 'workspace compute lease expired');
           else {
             if (claimed.containerName) await removeContainer(claimed.containerName).catch(() => undefined);
             this.markExpiredRecoverable(claimed, now);
@@ -910,6 +993,12 @@ export class WorkspaceService {
   }
 
   private async workspaceBytes(record: WorkspaceRecord): Promise<number | undefined> {
+    if (record.executorKind === 'instabox') {
+      const remote = this.requireRemote();
+      const result = await remote.invoke(record, `sudo -n -- du -sb --apparent-size -- ${shellQuote(remote.ref(record).root)}`, { timeoutMs: 30000, maxBytes: 8192 });
+      const bytes = Number(result.stdout.trim().split(/\s+/)[0]);
+      return result.exitCode === 0 && Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : undefined;
+    }
     let result;
     if (record.containerName) {
       result = await runDocker(
@@ -970,7 +1059,7 @@ export class WorkspaceService {
   private async enforceActiveLimits(record: WorkspaceRecord): Promise<void> {
     const violation = await this.resourceViolation(record);
     if (!violation) return;
-    if (record.executorKind === 'kata') {
+    if (retainedExecutor(record)) {
       await this.suspendVmWorkspace(record, violation);
       throw new HarnessError('LIMIT_EXCEEDED', `${violation}; workspace execution stopped`, 507, false);
     }
@@ -1188,6 +1277,7 @@ export class WorkspaceService {
   }
 
   private async ensureActiveExecutor(record: WorkspaceRecord, recreate = false): Promise<WorkspaceRecord> {
+    if (record.executorKind === 'instabox') return this.resumeRemoteExecutor(record, recreate);
     if (record.executorKind === 'kata') return this.resumeVmExecutor(record, recreate);
     // Dependency-access requires a fresh attestation before reuse; a quarantined
     // record must never resume its existing container. Force removal and rebuild
@@ -1292,6 +1382,16 @@ export class WorkspaceService {
   }
 
   private async suspendVmWorkspace(record: WorkspaceRecord, reason: string): Promise<void> {
+    if (record.executorKind !== 'instabox') return this.suspendRetainedWorkspace(record, reason);
+    if (this.remoteLifecycleWorkspaces.has(record.id)) throw new HarnessError('CONFLICT', 'Remote lifecycle change is already in progress', 409, true);
+    const current = this.store.byId(record.id);
+    if (current?.error?.startsWith('Remote close pending') || this.requireRemote().allocations.byWorkspace(record.id)?.cleanupRequested) return;
+    this.remoteLifecycleWorkspaces.add(record.id);
+    try { await this.suspendRetainedWorkspace(record, reason); }
+    finally { this.remoteLifecycleWorkspaces.delete(record.id); }
+  }
+
+  private async suspendRetainedWorkspace(record: WorkspaceRecord, reason: string): Promise<void> {
     let claimed: WorkspaceRecord | undefined;
     if (record.status === 'REAPING') {
       claimed = record;
@@ -1299,7 +1399,11 @@ export class WorkspaceService {
       claimed = this.store.byId(record.id);
     }
     if (!claimed) return;
-    this.operations.stopWorkspaceTerminals(claimed.id, reason);
+    if (claimed.executorKind === 'instabox') {
+      await this.operations.reconcileRemoteTasks(claimed.id, claimed.ownerId);
+      await this.operations.stopWorkspace(claimed.id, claimed.ownerId);
+      await this.requireRemote().stop(claimed);
+    } else this.operations.stopWorkspaceTerminals(claimed.id, reason);
     if (claimed.containerName) await stopVmExecutor(claimed.containerName);
     const stopped = this.markExpiredRecoverable(claimed, Date.now());
     if (stopped) this.store.updateFenced(stopped.id, stopped.generation, ['EXPIRED_RECOVERABLE'], { error: reason });
@@ -1420,6 +1524,19 @@ export class WorkspaceService {
 
       const cloneViolation = await this.resourceViolation(record);
       if (cloneViolation) throw new HarnessError('LIMIT_EXCEEDED', cloneViolation, 507, false);
+      if (this.remoteWorkspace && parsed.networkProfile === undefined && this.store.getWorkspaceDefaultNetworkProfile() === undefined
+        && await this.remoteWorkspace.reserve(record)) {
+        const selected = this.store.updateFenced(record.id, record.generation, ['CREATING'], { executorKind: 'instabox' });
+        if (!selected) throw new HarnessError('CONFLICT', 'Workspace lifecycle changed during remote admission', 409, true);
+        Object.assign(record, selected);
+        await this.remoteWorkspace.provision(record, validatedWorkspaceEnvironment(environment));
+        const active = this.store.updateFenced(workspaceId, record.generation, ['CREATING'], { status: 'ACTIVE', containerName: null, lastActivityAt: Date.now(), error: null });
+        if (!active) throw new HarnessError('CONFLICT', 'Remote creation lost its lifecycle lease; allocation retained', 409, true);
+        await this.runLifecycleHooks(active, 'on_workspace_open').catch(() => undefined);
+        const guidance = await this.repositoryGuidance(active).catch(() => undefined);
+        return { ok: true, message: 'Workspace opened', data: { ...this.publicWorkspaceRecord(active),
+          ...(guidance ? { repositoryContext: repositoryGuidanceSummary(guidance.snapshot) } : {}) }, truncated: false };
+      }
       const containerName = await this.createExecutor(record, repositoryPath, validatedWorkspaceEnvironment(environment ?? {}));
       const active = this.store.updateFenced(workspaceId, record.generation, ['CREATING'], { containerName, status: 'ACTIVE', lastActivityAt: Date.now(), error: null });
       if (!active) {
@@ -1441,6 +1558,10 @@ export class WorkspaceService {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'workspace creation failed';
+      if (record.executorKind === 'instabox' || this.remoteWorkspace?.allocations.byWorkspace(record.id)) {
+        this.store.updateFenced(workspaceId, record.generation, ['CREATING'], { executorKind: 'instabox', status: 'EXPIRED_RECOVERABLE', recoverableUntil: null, error: 'Remote creation outcome needs reconciliation; allocation and staging retained' });
+        throw error;
+      }
       this.store.updateFenced(workspaceId, record.generation, ['CREATING'], { status: 'FAILED', error: message.slice(0, 2_000) });
       this.store.deleteSecretSnapshot(workspaceId);
       this.redactorCache.delete(workspaceId);
@@ -1713,8 +1834,9 @@ export class WorkspaceService {
           tasks: true,
           sessions: true,
           deployments: true,
-          privileged,
-          networkProfile: record.networkProfile,
+          privileged: record.executorKind === 'instabox' ? false : privileged,
+          networkProfile: record.executorKind === 'instabox' ? 'provider-managed' : record.networkProfile,
+          ...(record.executorKind === 'instabox' ? { executorKind: 'instabox' as const, installedSoftwareRetained: true, retention: 'explicit-close-only' as const, recovery: { stop: true, resume: true, recreate: false }, installations: { direct: true, managedPackages: false, managedDependencies: false } } : {}),
           defaultNetworkProfile: this.store.getWorkspaceDefaultNetworkProfile() ?? this.config.networkProfile
         }
       },
@@ -1794,6 +1916,10 @@ export class WorkspaceService {
     const record = this.store.byOwnerAndId(ownerId, workspaceId);
     const now = Date.now();
     if (!record || record.status !== 'ACTIVE' || record.expiresAt <= now || record.hardExpiresAt <= now) throw unavailable();
+    if (record.executorKind === 'instabox') {
+      if (this.operations.hasActiveWorkspaceWork(record.id)) throw new HarnessError('CONFLICT', 'Finish active work before refreshing the remote skill projection', 409, true);
+      return this.withMutationLease(record, () => this.requireRemote().snapshotCheckout(record));
+    }
     try {
       return await realpath(join(record.workspacePath, 'repo'));
     } catch {
@@ -1842,9 +1968,13 @@ export class WorkspaceService {
       if (allowRecoverable) return record;
       throw new HarnessError('EXPIRED', 'workspace is expired and in recoverable grace state; use workspace_recover or workspace_lease_renew', 410);
     }
-    if (record.status === 'NETWORK_QUARANTINED') {
+    if (record.executorKind !== 'instabox' && record.status === 'NETWORK_QUARANTINED') {
       if (allowRecoverable) return record;
       throw new HarnessError('DEPENDENCY_EGRESS_UNAVAILABLE', `workspace is quarantined due to network security policy drift (${record.error ?? 'firewall attestation failed'}); use workspace_recover after policy reconciliation or workspace_close`, 503, false);
+    }
+    if (active && record.executorKind === 'instabox') {
+      const allocation = this.requireRemote().allocations.byWorkspace(record.id);
+      if (record.error?.startsWith('Remote close pending') || allocation?.cleanupRequested || ['STARTING', 'STOPPING', 'RELEASING', 'QUARANTINED'].includes(allocation?.state ?? '')) throw new HarnessError('UNAVAILABLE', 'Remote allocation requires cleanup reconciliation', 503, false);
     }
     if (active && record.status !== 'ACTIVE') {
       throw new HarnessError(record.status === 'CLOSED' ? 'EXPIRED' : 'CONFLICT', `workspace is ${record.status.toLowerCase()}`, 409);
@@ -1853,8 +1983,8 @@ export class WorkspaceService {
       const now = Date.now();
       const claimed = this.store.claimForExpiry(record.id, record.generation);
       if (claimed) {
-        this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
-        if (claimed.executorKind === 'kata') void this.suspendVmWorkspace(claimed, 'workspace compute lease expired').catch(() => undefined);
+        if (claimed.executorKind !== 'instabox') this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
+        if (retainedExecutor(claimed)) void this.suspendVmWorkspace(claimed, 'workspace compute lease expired').catch(() => undefined);
         else {
           if (claimed.containerName) void removeContainer(claimed.containerName).catch(() => undefined);
           this.markExpiredRecoverable(claimed, now);
@@ -2019,6 +2149,105 @@ export class WorkspaceService {
     return { snapshot, reused: false };
   }
 
+  private async runRemoteWorker(record: WorkspaceRecord, operation: RunnerOperation | 'skills_roster' | 'workspace_bootstrap_context', input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
+    const remote = this.requireRemote(), ref = remote.ref(record), backend = remote.backend;
+    const operationId = typeof input.operationId === 'string' && input.operationId ? input.operationId : opaqueId('op');
+    const timeoutMs = Math.min(typeof input.timeoutMs === 'number' ? input.timeoutMs + 5000 : 65000, 305000);
+    const maxBytes = Math.min(67108864, Math.max(this.config.maxOutputBytes, 262144) * 6 + 8192);
+    const controller = new AbortController();
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const deadline = Date.now() + timeoutMs;
+    const tracked = this.operations.registerGenericOperation({ id: operationId, workspaceId: record.id, kind: operation, deadlineMs: deadline, abortController: controller });
+    const payload = JSON.stringify({ operation, input });
+    // Linux bounds each argv string, independently of the provider's upload
+    // budget. File writes/patches can exceed that bound, so RPC content belongs
+    // in a private payload file rather than a shell -c argument or command log.
+    const payloadPath = `${ref.root}/runtime/request-${operationId}.json`;
+    const command = `node ${shellQuote(ref.root + '/runtime/harness-worker.mjs')} < ${shellQuote(payloadPath)}; code=$?; rm -f -- ${shellQuote(payloadPath)}; exit "$code"`;
+    let startRequested = false;
+    const dispatched = (async () => {
+      await backend.writeFile(ref, payloadPath, Buffer.from(payload));
+      startRequested = true;
+      await backend.startJob(ref, { id: operationId, kind: 'task', command, cwd: `${ref.root}/repo`, timeoutMs, maxBytes,
+        fingerprint: createHash('sha256').update(payload).digest('hex') });
+    })();
+    let cancellationConfirmed = false;
+    tracked.cancelRemote = async () => {
+      await dispatched.catch(() => undefined);
+      if (startRequested) await backend.cancelJob(ref, operationId);
+      cancellationConfirmed = true;
+      controller.abort();
+    };
+    const work = (async (): Promise<RunnerResponse> => {
+      // Dispatch acknowledgments can be lost; the durable operation identity is the only recovery route.
+      await dispatched.catch(error => {
+        if (!startRequested) {
+          this.operations.updateGenericOperation(operationId, { status: 'failed', error: { code: 'UNAVAILABLE', message: 'Remote worker input could not be transferred', retryable: true } });
+          throw error;
+        }
+      });
+      const chunks: Buffer[] = [];
+      let cursor = 0, activityAt = 0;
+      while (!this.remoteWorkersDetached) {
+        if (combined.aborted || Date.now() >= deadline) {
+          try {
+            if (!cancellationConfirmed) await backend.cancelJob(ref, operationId);
+            cancellationConfirmed = true;
+          }
+          catch { await new Promise(resolveWait => setTimeout(resolveWait, 1000)); continue; }
+          const code = combined.aborted ? 'CANCELLED' : 'TIMEOUT';
+          this.operations.updateGenericOperation(operationId, { status: combined.aborted ? 'cancelled' : 'failed', error: { code, message: 'Remote worker stopped', retryable: false } });
+          await backend.activity(ref, operationId, false).catch(() => undefined);
+          throw new HarnessError(code, 'Remote worker stopped', code === 'CANCELLED' ? 499 : 504, false);
+        }
+        let observation;
+        try { observation = await backend.readJob(ref, operationId, cursor, Math.min(65536, maxBytes - cursor + 1)); }
+        catch { await new Promise(resolveWait => setTimeout(resolveWait, 1000)); continue; }
+        if (combined.aborted || this.remoteWorkersDetached) continue;
+        if (observation.status === 'unknown') { await new Promise(resolveWait => setTimeout(resolveWait, 1000)); continue; }
+        if (observation.nextOffset !== cursor + observation.output.length || observation.nextOffset > maxBytes || observation.truncated) {
+          controller.abort();
+          continue;
+        }
+        chunks.push(observation.output); cursor = observation.nextOffset;
+        if (observation.status === 'exited' && observation.output.length === 0 && observation.exitCode !== undefined) {
+          await backend.activity(ref, operationId, false).catch(() => undefined);
+          const redactor = this.getRedactor(record.id);
+          if (observation.exitCode !== 0) {
+            const message = redactor.sanitizeString(Buffer.concat(chunks).toString('utf8')).slice(0, 2000) || 'Remote worker failed';
+            this.operations.updateGenericOperation(operationId, { status: 'failed', error: { code: 'INTERNAL_ERROR', message, retryable: false } });
+            throw new HarnessError('INTERNAL_ERROR', message, 500, false);
+          }
+          let response: RunnerResponse;
+          try { response = redactor.sanitizeObject(RunnerResponseSchema.parse(JSON.parse(Buffer.concat(chunks).toString('utf8')))); }
+          catch {
+            this.operations.updateGenericOperation(operationId, { status: 'failed', error: { code: 'INTERNAL_ERROR', message: 'Remote worker returned an invalid bounded result', retryable: false } });
+            throw new HarnessError('INTERNAL_ERROR', 'Remote worker returned an invalid bounded result', 500, false);
+          }
+          if (tracked.status !== 'cancelled') this.operations.updateGenericOperation(operationId, { status: response.ok ? 'completed' : 'failed', result: response.data, error: response.error });
+          return { ...response, data: response.data && typeof response.data === 'object' ? { ...response.data, operationId } : response.data };
+        }
+        if ((observation.status === 'running' || observation.status === 'starting') && Date.now() - activityAt >= 30000) {
+          await backend.activity(ref, operationId, true).catch(() => undefined);
+          activityAt = Date.now();
+        }
+        if (observation.output.length === 0) await new Promise(resolveWait => setTimeout(resolveWait, 250));
+      }
+      throw new HarnessError('UNAVAILABLE', 'Runner observation stopped; remote operation outcome remains unknown', 503, true);
+    })();
+    const completion = work.then(() => undefined, () => undefined);
+    tracked.completion = completion;
+    this.remoteWorkerCompletions.add(completion);
+    void completion.then(() => this.remoteWorkerCompletions.delete(completion));
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([work, new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new HarnessError('UNAVAILABLE', `Remote operation ${operationId} is still reconciling; inspect operation_status before retrying`, 503, true)), timeoutMs + 5000);
+        timer.unref();
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+
   private async runWorker(
     record: WorkspaceRecord,
     /**
@@ -2029,6 +2258,7 @@ export class WorkspaceService {
     input: Record<string, unknown>,
     signal?: AbortSignal
   ): Promise<RunnerResponse> {
+    if (record.executorKind === 'instabox') return this.runRemoteWorker(record, operation, input, signal);
     if (operation === 'skills_run') {
       return await this.runSkillInHelperContainer(record, input, signal);
     }
@@ -2104,6 +2334,12 @@ export class WorkspaceService {
     signal?: AbortSignal,
     writable = false
   ): Promise<RunnerResponse> {
+    if (record.executorKind === 'instabox') {
+      const remote = this.requireRemote();
+      remote.ref(record);
+      if (record.status !== 'ACTIVE') throw new HarnessError('UNAVAILABLE', 'Remote compute is stopped; explicitly resume the workspace before reading or exporting retained files', 503, false);
+      return await this.runWorker(record, operation, input, signal);
+    }
     if (record.containerName) {
       return await this.runWorker(record, operation, input, signal);
     }
@@ -2138,6 +2374,48 @@ export class WorkspaceService {
     }
   }
 
+  private async sanitizeRemoteGitStage(path: string, sha256: boolean): Promise<void> {
+    // The exported repository is guest-controlled. Reject filesystem redirects before
+    // any credential-bearing Git process can interpret its configuration or objects.
+    const inspect = async (directory: string): Promise<void> => {
+      for (const name of await readdir(directory)) {
+        const child = join(directory, name), info = await lstat(child);
+        if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) throw new HarnessError('INVALID_INPUT', 'Remote Git staging contains unsupported filesystem entries', 400, false);
+        if (info.isDirectory()) await inspect(child);
+      }
+    };
+    await inspect(path);
+    for (const name of ['objects/info/alternates', 'objects/info/http-alternates', 'refs/replace']) {
+      if (existsSync(join(path, name))) throw new HarnessError('INVALID_INPUT', 'Remote Git staging contains object redirects or replacement refs', 400, false);
+    }
+    const packedRefs = await readFile(join(path, 'packed-refs'), 'utf8').catch(() => '');
+    if (/\srefs\/replace\//.test(packedRefs)) throw new HarnessError('INVALID_INPUT', 'Remote Git staging contains replacement refs', 400, false);
+    await rm(join(path, 'hooks'), { recursive: true, force: true });
+    await rm(join(path, 'config'), { force: true });
+    await rm(join(path, 'config.worktree'), { force: true });
+    await writeFile(join(path, 'config'), `[core]\nrepositoryformatversion = ${sha256 ? 1 : 0}\nbare = true\n${sha256 ? '[extensions]\nobjectFormat = sha256\n' : ''}`, { mode: 0o600 });
+  }
+
+  private async verifyRemoteGitStage(record: WorkspaceRecord, transferName: string, source: string, expected: string, signal?: AbortSignal): Promise<void> {
+    const helperName = `chm-verify-${randomBytes(6).toString('hex')}`;
+    try {
+      const normalized = await runDocker(['run', '--rm', '--pull', 'never', '--name', helperName,
+        '--label', 'cloud-harness.ephemeral=true', '--network', 'none', '--user', '0:0', '--read-only',
+        '--memory', '128m', '--pids-limit', '32', '--volume', `${join(record.workspacePath, transferName)}:/stage:rw`,
+        '--entrypoint', '/bin/sh', this.config.executorImage, '-c', 'chown -R 10001:10001 /stage && chmod 0700 /stage'],
+      { timeoutMs: 30000, maxBytes: 8192, ...(signal ? { signal } : {}) });
+      if (normalized.exitCode !== 0) throw new HarnessError('UNAVAILABLE', 'Remote Git staging ownership could not be normalized', 503, false);
+      const result = await runDocker(['run', '--rm', '--pull', 'never', '--name', helperName,
+        '--label', 'cloud-harness.ephemeral=true', '--network', 'none', '--user', '10001:10001', '--read-only',
+        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--memory', '128m', '--pids-limit', '32',
+        '--env', 'GIT_CONFIG_NOSYSTEM=1', '--env', 'GIT_CONFIG_GLOBAL=/dev/null', '--env', 'GIT_NO_REPLACE_OBJECTS=1',
+        '--volume', `${join(record.workspacePath, transferName)}:/stage:ro`, '--entrypoint', 'git', this.config.executorImage,
+        '--git-dir=/stage', '-c', 'core.hooksPath=/dev/null', 'rev-parse', '--verify', '--end-of-options', `${source}^{commit}`],
+      { timeoutMs: 30000, maxBytes: 8192, ...(signal ? { signal } : {}) });
+      if (result.exitCode !== 0 || result.stdout.trim() !== expected) throw new HarnessError('STALE_HEAD', 'Staged Git source does not match the expected remote checkout commit', 409, false);
+    } finally { await removeContainer(helperName); }
+  }
+
   private async runGitTransferHelper(
     record: WorkspaceRecord,
     mode: 'fetch' | 'import' | 'stage-push' | 'push',
@@ -2148,6 +2426,37 @@ export class WorkspaceService {
     signal?: AbortSignal,
     historySpec = ''
   ) {
+    if (record.executorKind === 'instabox' && (mode === 'import' || mode === 'stage-push')) {
+      if (token) throw new HarnessError('INTERNAL_ERROR', 'Repository credentials cannot enter the remote executor', 500, false);
+      if (this.operations.hasActiveWorkspaceWork(record.id)) throw new HarnessError('CONFLICT', 'Finish active tasks and close shells and terminals before Git transfer', 409, true);
+      const remote = this.requireRemote(), ref = remote.ref(record);
+      const guestTransfer = `${ref.root}/${transferName}`;
+      const before = await this.currentHead(record, signal).catch(() => '');
+      const refs = async (path: string): Promise<string> => {
+        const result = await remote.invoke(record, `git -c core.hooksPath=/dev/null -c core.fsmonitor=false --git-dir=${shellQuote(path)} for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags`, { timeoutMs: 30000, maxBytes: 1048576, ...(signal ? { signal } : {}) });
+        if (result.exitCode !== 0 || result.truncated) throw new HarnessError('CONFLICT', 'Remote Git refs could not be snapshotted within bounds', 409, false);
+        return result.stdout;
+      };
+      const beforeRefs = mode === 'stage-push' ? await refs(`${ref.root}/repo/.git`) : undefined;
+      try {
+        if (mode === 'import') await remote.importTree(record, join(record.workspacePath, transferName), guestTransfer);
+        const command = ['bash', `${ref.root}/runtime/git-transfer-helper.sh`, mode, record.repositoryUrl, `${ref.root}/repo`, guestTransfer, argument, expectedRemoteOid ?? '', historySpec].map(shellQuote).join(' ');
+        const result = await remote.invoke(record, command, { stdin: '\n', timeoutMs: 120000, maxBytes: this.config.maxOutputBytes, ...(signal ? { signal } : {}) });
+        if (result.exitCode !== 0) throw new HarnessError('CONFLICT', 'Remote Git staging or import failed', 409, false);
+        if (mode === 'stage-push') {
+          const after = await this.currentHead(record, signal).catch(() => '');
+          if (before !== after) throw new HarnessError('CONFLICT', 'Remote checkout changed while preparing Git snapshot', 409, true);
+          if (await refs(guestTransfer) !== beforeRefs) throw new HarnessError('CONFLICT', 'Staged remote refs differ from the requested snapshot', 409, true);
+          await remote.exportTree(record, guestTransfer, join(record.workspacePath, transferName));
+          if (await refs(`${ref.root}/repo/.git`) !== beforeRefs) throw new HarnessError('CONFLICT', 'Remote refs changed during snapshot export', 409, true);
+          if (before !== await this.currentHead(record, signal).catch(() => '')) throw new HarnessError('CONFLICT', 'Remote checkout changed during snapshot export', 409, true);
+          await this.sanitizeRemoteGitStage(join(record.workspacePath, transferName), before.length === 64);
+        }
+        return { ...result, truncated: result.truncated ?? false };
+      } finally {
+        await remote.invoke(record, `rm -rf -- ${shellQuote(guestTransfer)}`, { timeoutMs: 10000, maxBytes: 4096 }).catch(() => undefined);
+      }
+    }
     const helperName = `chm-git-${mode.replaceAll('-', '').slice(0, 5)}-${randomBytes(6).toString('hex')}`;
     const network = mode === 'fetch' || mode === 'push' ? 'bridge' : 'none';
     try {
@@ -2227,6 +2536,11 @@ export class WorkspaceService {
   }
 
   private async currentBranch(record: WorkspaceRecord, signal?: AbortSignal): Promise<string> {
+    if (record.executorKind === 'instabox') {
+      const result = await this.requireRemote().invoke(record, 'git -c core.hooksPath=/dev/null -c core.pager=cat branch --show-current', { timeoutMs: 30000, maxBytes: 8192, ...(signal ? { signal } : {}) });
+      if (result.exitCode !== 0) throw new HarnessError('CONFLICT', 'Current remote Git branch could not be determined', 409, false);
+      return result.stdout.trim();
+    }
     if (record.containerName) {
       const result = await runDocker([
         'exec', record.containerName, 'git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.pager=cat', 'branch', '--show-current'
@@ -2267,6 +2581,11 @@ export class WorkspaceService {
   private async currentHead(record: WorkspaceRecord, signal?: AbortSignal, revision = 'HEAD'): Promise<string> {
     const revParse = revision === 'HEAD' ? ['rev-parse', 'HEAD'] : ['rev-parse', '--verify', '--quiet', `${revision}^{commit}`];
     const unresolved = revision === 'HEAD' ? 'current Git HEAD could not be determined' : `Git revision ${revision} could not be resolved`;
+    if (record.executorKind === 'instabox') {
+      const result = await this.requireRemote().invoke(record, `git -c core.hooksPath=/dev/null -c core.pager=cat ${revParse.map(shellQuote).join(' ')}`, { timeoutMs: 30000, maxBytes: 8192, ...(signal ? { signal } : {}) });
+      if (result.exitCode !== 0) throw new HarnessError('CONFLICT', unresolved, 409, false);
+      return result.stdout.trim();
+    }
     if (record.containerName) {
       const result = await runDocker([
         'exec', record.containerName, 'git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.pager=cat', ...revParse
@@ -2495,6 +2814,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       } else {
         await this.runGitTransferHelper(record, 'stage-push', transferName, '', undefined, undefined, signal);
       }
+      if (record.executorKind === 'instabox') await this.verifyRemoteGitStage(record, transferName, pushedSource, currentLocalHead, signal);
       let pushed: { exitCode: number; stdout: string; stderr: string; truncated: boolean };
       try {
         pushed = await this.runGitTransferHelper(record, 'push', transferName, refspec, token, lease, signal);
@@ -2539,6 +2859,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     const approvalGrantToken = validated.approvalGrantToken as string | undefined;
 
     if (privileged) {
+      if (record.executorKind === 'instabox') throw new HarnessError('NOT_SUPPORTED', 'Use guest sudo directly in the retained remote executor; host privileged helpers are unavailable', 400, false);
       if (!hasOperatorDashboard(this.config.authMode)) {
         throw new HarnessError('FORBIDDEN', `Privileged execution requires Cloudflare Access operator dashboard approval and is disabled in ${this.config.authMode ?? 'owner-bearer'} mode`, 403, false);
       }
@@ -2985,6 +3306,9 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   }
 
   private async runPackageOperation(ownerId: string, operation: PackageOperation, validated: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
+    if (typeof validated.workspaceId === 'string' && this.store.byOwnerAndId(ownerId, validated.workspaceId)?.executorKind === 'instabox') {
+      throw new HarnessError('NOT_SUPPORTED', 'Install CLI tools directly inside the retained remote guest; managed package mounts are unavailable', 400, false);
+    }
     const data = await this.packages.execute(ownerId, operation, validated, signal);
     return { ok: true, message: packageMessage(operation, data), data, truncated: false };
   }
@@ -3032,7 +3356,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   }
 
   private async recreateExecutor(record: WorkspaceRecord): Promise<RunnerResponse> {
-    if (record.executorKind === 'kata') {
+    if (retainedExecutor(record)) {
       throw new HarnessError('NOT_SUPPORTED', 'Persistent VM installs need no recreation. Use resume to start the retained VM; recreation would discard installed software.', 400, false);
     }
     const now = Date.now();
@@ -3292,7 +3616,20 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     }
 
     const workspaceId = validated.workspaceId as string | undefined;
-    if (operation === 'workspace_status') return this.status(ownerId, workspaceId);
+    if (operation === 'workspace_status') {
+      const result = this.status(ownerId, workspaceId);
+      const record = this.requireWorkspace(ownerId, workspaceId, false, true);
+      if (record.executorKind !== 'instabox' || record.status === 'CLOSED') return result;
+      const allocation = this.remoteWorkspace?.allocations.byWorkspace(record.id);
+      let compute: Record<string, unknown> = { state: 'unavailable', ready: false };
+      try {
+        const remote = this.requireRemote();
+        compute = { ...await remote.backend.inspect(remote.ref(record)) };
+      } catch { /* Status remains readable during a provider outage; never wake or replace the machine. */ }
+      return { ...result, data: { ...(result.data as Record<string, unknown>), compute: {
+        ...compute, allocationState: allocation?.state ?? 'unavailable', cleanupRequested: allocation?.cleanupRequested ?? false
+      } } };
+    }
     if (operation === 'workspace_capabilities') {
       const githubRepositoryCreate = this.repositoryCreator.capability(ownerId);
       // Without a workspaceId and with no active workspace, only principal-level capabilities exist;
@@ -3326,7 +3663,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         throw new HarnessError('CONFLICT', `workspace is ${rec.status.toLowerCase()}`, 409, true);
       }
       const now = Date.now();
-      if (rec.executorKind !== 'kata' && rec.hardExpiresAt <= now) {
+      if (!retainedExecutor(rec) && rec.hardExpiresAt <= now) {
         throw new HarnessError('EXPIRED', 'Workspace hard lease limit reached and cannot be renewed', 410);
       }
       const isRecoverable = rec.status === 'EXPIRED_RECOVERABLE';
@@ -3346,7 +3683,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       try {
         const extSec = (validated.extensionSeconds as number) ?? this.idleTtlSecondsFor(rec);
         const requestedExpires = now + extSec * 1000;
-        const hardExpiresAt = rec.executorKind === 'kata' && (isRecoverable || rec.hardExpiresAt <= now) ? now + this.config.wallTtlSeconds * 1000 : rec.hardExpiresAt;
+        const hardExpiresAt = retainedExecutor(rec) && (isRecoverable || rec.hardExpiresAt <= now) ? now + this.config.wallTtlSeconds * 1000 : rec.hardExpiresAt;
         const newExpires = Math.min(hardExpiresAt, requestedExpires);
         let activeRecord = rec;
         if (isRecoverable) {
@@ -3387,7 +3724,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       }
       const mode = (validated.mode as 'resume' | 'recreate' | 'stop' | 'status' | 'patch' | 'export') ?? 'resume';
       if (mode === 'stop') {
-        if (rec.executorKind !== 'kata') throw new HarnessError('NOT_SUPPORTED', 'Retained stop is supported only for VM workspaces', 400, false);
+        if (!retainedExecutor(rec)) throw new HarnessError('NOT_SUPPORTED', 'Retained stop is supported only for VM workspaces', 400, false);
         if (rec.status === 'EXPIRED_RECOVERABLE') return { ok: true, message: 'VM is already stopped; files and installed software retained', data: publicRecord(rec), truncated: false };
         if ((this.workspaceRequests.get(rec.id) ?? 0) > 1 || (rec.mutationLockedUntil ?? 0) > Date.now()
           || this.operations.hasActiveWorkspaceWork(rec.id) || this.agentManager?.hasActiveAgents(rec.ownerId, rec.id)) {
@@ -3399,7 +3736,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       if (mode === 'recreate') return this.recreateExecutor(rec);
       if (mode === 'resume') {
         const now = Date.now();
-        if (rec.executorKind !== 'kata' && rec.hardExpiresAt <= now) {
+        if (!retainedExecutor(rec) && rec.hardExpiresAt <= now) {
           throw new HarnessError('EXPIRED', 'Workspace hard lease limit reached and cannot be recovered to active state; use mode: export to save work', 410);
         }
         const isRecoverable = rec.status === 'EXPIRED_RECOVERABLE';
@@ -3419,7 +3756,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         try {
           const activeRecord = await this.ensureActiveExecutor(rec);
           const extSec = this.idleTtlSecondsFor(activeRecord);
-          const hardExpiresAt = rec.executorKind === 'kata' && (rec.status !== 'ACTIVE' || rec.hardExpiresAt <= now) ? now + this.config.wallTtlSeconds * 1000 : activeRecord.hardExpiresAt;
+          const hardExpiresAt = retainedExecutor(rec) && (rec.status !== 'ACTIVE' || rec.hardExpiresAt <= now) ? now + this.config.wallTtlSeconds * 1000 : activeRecord.hardExpiresAt;
           const newExpires = Math.min(hardExpiresAt, now + extSec * 1000);
           let updated: WorkspaceRecord | undefined;
           try {
@@ -3519,6 +3856,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     if (AgentManager.isPublicOperation(operation)) {
       if (!this.agentManager) throw new HarnessError('UNAVAILABLE', 'agent execution is not configured', 503, false);
       const targetWorkspace = this.requireWorkspace(ownerId, workspaceId, false, true);
+      if (targetWorkspace.executorKind === 'instabox') throw new HarnessError('NOT_SUPPORTED', 'Managed agent runtimes require a local network-none workspace; external MCP clients can use remote workspaces', 400, false);
       return await this.agentManager.dispatch(ownerId, targetWorkspace, operation, validated);
     }
 
@@ -3571,7 +3909,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
           // manifest and an agent's injected guidance cannot disagree about which files apply.
           const attributedItems = applyGuidanceActivity((rawItems as Record<string, unknown>[]).map((rawItem) => sanitizeAndAttributeProvenance(rawItem, {
             partitionSource: 'repository',
-            repositoryRoot: record.workspacePath
+            repositoryRoot: record.executorKind === 'instabox' ? this.requireRemote().ref(record).root + '/repo' : record.workspacePath
           })), (validated as { clientProfile?: GuidanceProfile }).clientProfile ?? 'all');
           for (const item of attributedItems) {
             const itemBytes = Buffer.byteLength(JSON.stringify(item));
@@ -4515,11 +4853,13 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       return result;
     }
     if (operation === 'shell_open') {
-      const shell = this.operations.openShell(record.id, record.containerName!, validated.cwd as string, validated.idempotencyKey as string, this.config.maxOutputBytes);
+      const shell = this.operations.openShell(record.id, record.containerName ?? '', validated.cwd as string, validated.idempotencyKey as string, this.config.maxOutputBytes);
+      await this.operations.awaitRemoteOperation(record.id, shell.id);
       return { ok: true, message: 'Shell opened', data: this.operations.view(shell), truncated: false };
     }
     if (operation === 'shell_io') {
       const shell = this.operations.shellIo(record.id, validated.shellId as string, validated.input as string | undefined);
+      await this.operations.awaitRemoteOperation(record.id, shell.id);
       if ((validated.waitMs as number) > 0) await new Promise((resolvePromise) => setTimeout(resolvePromise, validated.waitMs as number));
       const page = this.operations.viewSince(shell, validated.cursor as string | undefined);
       return { ok: true, message: 'Shell output', ...page };
@@ -4531,16 +4871,18 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     if (operation === 'sessions_open') {
       const session = this.operations.openSession(
         record.id,
-        record.containerName!,
+        record.containerName ?? '',
         validated.name as string,
         validated.cwd as string,
         validated.idempotencyKey as string,
         this.config.maxOutputBytes
       );
+      await this.operations.awaitRemoteOperation(record.id, session.id);
       return { ok: true, message: 'Coding session opened', data: this.operations.view(session), truncated: false };
     }
     if (operation === 'sessions_io') {
       const session = this.operations.sessionIo(record.id, validated.sessionId as string, validated.input as string | undefined);
+      await this.operations.awaitRemoteOperation(record.id, session.id);
       if ((validated.waitMs as number) > 0) await new Promise((resolvePromise) => setTimeout(resolvePromise, validated.waitMs as number));
       const page = this.operations.viewSince(session, validated.cursor as string | undefined);
       return { ok: true, message: 'Coding session output', ...page };
@@ -4568,7 +4910,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       try {
         const task = this.operations.runTask(
           record.id,
-          record.containerName!,
+          record.containerName ?? '',
           validated.cwd as string,
           validated.command as string,
           validated.idempotencyKey as string,
@@ -4822,6 +5164,15 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   ): Promise<{ ownerId: string; content: Buffer }> {
     const ownerId = this.store.resolvePrincipal(principal);
     const record = this.requireWorkspace(ownerId, input.workspaceId);
+    if (record.executorKind === 'instabox') {
+      const remote = this.requireRemote(), ref = remote.ref(record);
+      const script = `const fs=require('node:fs'),p=require('node:path');const root=fs.realpathSync(process.argv[1]);const path=p.resolve(root,process.argv[2]);if(!path.startsWith(root+'/'))throw Error('path outside checkout');const fd=fs.openSync(path,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);try{const actual=fs.realpathSync('/proc/self/fd/'+fd),info=fs.fstatSync(fd),limit=Number(process.argv[3]);if(!actual.startsWith(root+'/')||!info.isFile()||info.size>limit)throw Error('invalid bounded artifact');const bytes=Buffer.alloc(info.size);let n=0;while(n<bytes.length){const count=fs.readSync(fd,bytes,n,bytes.length-n,n);if(!count)break;n+=count;}if(n!==info.size||fs.fstatSync(fd).size!==info.size)throw Error('artifact changed during read');process.stdout.write(bytes.toString('base64'));}finally{fs.closeSync(fd)}`;
+      const result = await remote.invoke(record, ['node', '-e', script, `${ref.root}/repo`, input.path, String(this.config.maxArtifactBytes)].map(shellQuote).join(' '), { timeoutMs: 30000, maxBytes: Math.ceil(this.config.maxArtifactBytes / 3) * 4 + 4 });
+      if (result.exitCode !== 0 || result.truncated) throw new HarnessError('INVALID_INPUT', 'Artifact source must be a bounded regular file inside the remote checkout', 400, false);
+      const content = Buffer.from(result.stdout, 'base64');
+      if (content.length > this.config.maxArtifactBytes) throw new HarnessError('LIMIT_EXCEEDED', 'Artifact exceeds size limit', 413, false);
+      return { ownerId, content };
+    }
     const repositoryRoot = await realpath(join(record.workspacePath, 'repo'));
     const content = await readVerifiedWorkspaceFile(repositoryRoot, input.path, this.config.maxArtifactBytes);
     return { ownerId, content };
@@ -5032,11 +5383,11 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       // Mirrors the shell_open path of execute(): an active, owned workspace with a live executor.
       const record = this.touch(this.requireWorkspace(ownerId, parsed.input.workspaceId, true, false));
       await this.enforceActiveLimits(record);
-      if (!record.containerName) throw new HarnessError('UNAVAILABLE', 'workspace executor is unavailable', 503, true);
+      if (!record.containerName && record.executorKind !== 'instabox') throw new HarnessError('UNAVAILABLE', 'workspace executor is unavailable', 503, true);
       const terminal = await this.operations.openTerminal({
         ownerId,
         workspaceId: record.id,
-        container: record.containerName,
+        container: record.containerName ?? '',
         cwd: parsed.input.cwd,
         cols: parsed.input.cols,
         rows: parsed.input.rows
@@ -5158,6 +5509,14 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   }
 
   private async closeRecord(record: WorkspaceRecord, reason: string): Promise<void> {
+    if (record.executorKind !== 'instabox') return this.finishCloseRecord(record, reason);
+    if (this.remoteLifecycleWorkspaces.has(record.id)) throw new HarnessError('CONFLICT', 'Remote lifecycle change is already in progress', 409, true);
+    this.remoteLifecycleWorkspaces.add(record.id);
+    try { await this.finishCloseRecord(record, reason); }
+    finally { this.remoteLifecycleWorkspaces.delete(record.id); }
+  }
+
+  private async finishCloseRecord(record: WorkspaceRecord, reason: string): Promise<void> {
     let claimed = this.store.byId(record.id) ?? record;
     if (claimed.status !== 'REAPING') {
       if (claimed.status === 'CLOSED') return;
@@ -5174,15 +5533,22 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         claimed = this.store.byId(claimed.id)!;
       }
     }
+    const remoteReleased = claimed.executorKind === 'instabox' && this.requireRemote().allocations.isReleased(claimed.id, claimed.ownerId);
+    if (claimed.executorKind === 'instabox') {
+      claimed = this.store.updateFenced(claimed.id, claimed.generation, ['REAPING'], { error: 'Remote close pending' }) ?? claimed;
+    }
     try {
       await this.agentManager?.stopWorkspace(claimed.ownerId, claimed.id, reason);
-      await this.operations.stopWorkspace(claimed.id, claimed.ownerId);
+      if (!remoteReleased) {
+        if (claimed.executorKind === 'instabox') await this.operations.reconcileRemoteTasks(claimed.id, claimed.ownerId);
+        await this.operations.stopWorkspace(claimed.id, claimed.ownerId);
+      }
     } catch (stopErr) {
       this.store.updateFenced(claimed.id, claimed.generation, ['REAPING'], {
-        status: 'EXPIRED_RECOVERABLE',
+        status: claimed.executorKind === 'instabox' ? 'REAPING' : 'EXPIRED_RECOVERABLE',
         lastActivityAt: Date.now(),
         ...this.failedCloseWindow(claimed, Date.now()),
-        error: `Workspace stop failed: ${stopErr instanceof Error ? stopErr.message : String(stopErr)}`
+        error: `${claimed.executorKind === 'instabox' ? 'Remote close pending: ' : ''}Workspace stop failed: ${stopErr instanceof Error ? stopErr.message : String(stopErr)}`
       });
       throw stopErr;
     }
@@ -5212,10 +5578,10 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
               });
             } catch (spoolErr) {
               this.store.updateFenced(claimed.id, claimed.generation, ['REAPING'], {
-                status: 'EXPIRED_RECOVERABLE',
+                status: claimed.executorKind === 'instabox' ? 'REAPING' : 'EXPIRED_RECOVERABLE',
                 lastActivityAt: Date.now(),
                 ...this.failedCloseWindow(claimed, Date.now()),
-                error: `Artifact spool failed: ${spoolErr instanceof Error ? spoolErr.message : String(spoolErr)}`
+                error: `${claimed.executorKind === 'instabox' ? 'Remote close pending: ' : ''}Artifact spool failed: ${spoolErr instanceof Error ? spoolErr.message : String(spoolErr)}`
               });
               throw new HarnessError('UNAVAILABLE', `Failed to archive task output for task ${t.id} during close: ${spoolErr instanceof Error ? spoolErr.message : String(spoolErr)}`, 503, true);
             }
@@ -5223,6 +5589,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         }
       }
     }
+    if (claimed.executorKind === 'instabox' && !remoteReleased) await this.requireRemote().release(claimed);
     if (claimed.containerName) await removeContainer(claimed.containerName);
     await this.safeRemovePath(claimed.workspacePath);
     this.store.deleteSecretSnapshot(claimed.id);
@@ -5272,7 +5639,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
    */
   private async autoCloseRecoverable(id: string, generation: number): Promise<void> {
     const record = this.store.byId(id);
-    if (!record || record.executorKind === 'kata' || record.generation !== generation || record.status !== 'EXPIRED_RECOVERABLE') return;
+    if (!record || retainedExecutor(record) || record.generation !== generation || record.status !== 'EXPIRED_RECOVERABLE') return;
     try {
       this.store.acquireRecoverableMutationLease(id, generation, Date.now() + 120_000);
     } catch {
@@ -5422,12 +5789,12 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   private async reapExpired(): Promise<void> {
     const now = Date.now();
     await this.sweepDocker(now);
-    const hasDependencyWorkspaces = this.store.active().some((r) => r.status === 'ACTIVE' && r.networkProfile === 'dependency-access');
+    const hasDependencyWorkspaces = this.store.active().some((r) => r.executorKind !== 'instabox' && r.status === 'ACTIVE' && r.networkProfile === 'dependency-access');
     if (hasDependencyWorkspaces) {
       const attestation = await this.networkProfileManager.checkAttestation().catch(() => ({ ok: false, reason: 'attestation probe failed' }));
       if (!attestation.ok) {
         for (const record of this.store.active()) {
-          if (record.status === 'ACTIVE' && record.networkProfile === 'dependency-access') {
+          if (record.executorKind !== 'instabox' && record.status === 'ACTIVE' && record.networkProfile === 'dependency-access') {
             // 1. Atomically fence the workspace record to NETWORK_QUARANTINED first so no new execution can start
             const fenced = this.store.updateFenced(record.id, record.generation, ['ACTIVE'], {
               status: 'NETWORK_QUARANTINED',
@@ -5476,7 +5843,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     // Retry forced removal for quarantined workspaces whose container removal
     // previously failed, so an unfiltered executor cannot linger.
     for (const record of this.store.active()) {
-      if (record.status === 'NETWORK_QUARANTINED') {
+      if (record.executorKind !== 'instabox' && record.status === 'NETWORK_QUARANTINED') {
         const labeled = await runDocker([
           'ps', '-a', '--filter', `label=cloud-harness.workspace=${record.id}`, '--format', '{{.Names}}'
         ], { timeoutMs: 30_000, maxBytes: 1_048_576 }).catch(() => ({ exitCode: 1, stdout: '', stderr: '', truncated: false }));
@@ -5497,15 +5864,15 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       }
     }
     for (const record of this.store.active()) {
-      if (record.executorKind === 'kata' && record.status === 'REAPING') {
+      if (retainedExecutor(record) && record.status === 'REAPING') {
         await this.suspendVmWorkspace(record, 'retry VM stop').catch(() => undefined);
         continue;
       }
       if (record.status === 'ACTIVE' && (record.expiresAt <= now || record.hardExpiresAt <= now)) {
         const claimed = this.store.claimForExpiry(record.id, record.generation);
         if (claimed) {
-          this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
-          if (claimed.executorKind === 'kata') await this.suspendVmWorkspace(claimed, 'workspace compute lease expired');
+          if (claimed.executorKind !== 'instabox') this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
+          if (retainedExecutor(claimed)) await this.suspendVmWorkspace(claimed, 'workspace compute lease expired');
           else {
             if (claimed.containerName) await removeContainer(claimed.containerName).catch(() => undefined);
             this.markExpiredRecoverable(claimed, now);
@@ -5516,7 +5883,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         // including temporary staging. The dependency service checks its own limits.
         const violation = await this.resourceViolation(record).catch(() => undefined);
         if (violation && !this.dependencyWorkspaces.has(record.id)) {
-          if (record.executorKind === 'kata') await this.suspendVmWorkspace(record, violation).catch(() => undefined);
+          if (retainedExecutor(record)) await this.suspendVmWorkspace(record, violation).catch(() => undefined);
           else await this.closeRecord(record, violation).catch(() => undefined);
         }
       }
@@ -5634,6 +6001,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   private requireWorkspaceForAgent(ownerId: string, workspaceId: string): WorkspaceRecord {
     const record = this.store.byId(workspaceId);
     if (!record || record.ownerId !== ownerId) throw new HarnessError('NOT_FOUND', 'workspace was not found', 404, false);
+    if (record.executorKind === 'instabox') throw new HarnessError('NOT_SUPPORTED', 'Managed agent runtimes require local network-none execution', 400, false);
     if (record.status !== 'ACTIVE' || record.expiresAt <= Date.now()) {
       throw new HarnessError('EXPIRED', 'workspace is not active', 410, false);
     }

@@ -85,8 +85,24 @@ export const WorkspaceCapabilitiesSchema = z.object({
   deployments: z.boolean(),
   privileged: z.boolean().default(false),
   networkProfile: WorkspaceNetworkExposureSchema,
-  defaultNetworkProfile: WorkspaceNetworkExposureSchema.describe('Profile applied when workspace_open omits networkProfile').optional()
-}).passthrough();
+  defaultNetworkProfile: WorkspaceNetworkExposureSchema.describe('Profile applied when workspace_open omits networkProfile').optional(),
+  executorKind: z.enum(['docker', 'kata', 'instabox']).optional(),
+  installedSoftwareRetained: z.boolean().optional(),
+  retention: z.literal('explicit-close-only').optional().describe('Stopped data remains reserved until explicit close; recoverable grace does not release it'),
+  recovery: z.object({ stop: z.boolean(), resume: z.boolean(), recreate: z.boolean() }).strict().optional(),
+  installations: z.object({ direct: z.boolean(), managedPackages: z.boolean(), managedDependencies: z.boolean() }).strict().optional()
+}).passthrough().superRefine((capabilities, context) => {
+  if (capabilities.executorKind !== 'instabox') return;
+  if (capabilities.networkProfile !== 'provider-managed') {
+    context.addIssue({ code: 'custom', path: ['networkProfile'], message: 'InstaBox uses provider-managed networking, without host dependency-egress attestation' });
+  }
+  if (capabilities.recovery?.recreate === true) {
+    context.addIssue({ code: 'custom', path: ['recovery', 'recreate'], message: 'Retained remote machines cannot be recreated' });
+  }
+  if (capabilities.installations?.managedPackages === true || capabilities.installations?.managedDependencies === true) {
+    context.addIssue({ code: 'custom', path: ['installations'], message: 'Remote workspaces install directly rather than mounting managed packages or dependency caches' });
+  }
+});
 
 export const RepositoryPermissionsSchema = z.object({
   contents: z.object({ read: z.boolean(), write: z.boolean() }).strict(),

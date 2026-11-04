@@ -28,6 +28,12 @@ The page shows the effective value and its source — **Set in this dashboard** 
 
 **Save** writes the selected value as the instance-wide default. **Reset to runner default** clears it, so `WORKSPACE_NETWORK_PROFILE` (or the built-in default) applies again. Neither action starts, stops, or changes a running workspace; the new default applies to workspaces opened afterwards.
 
+For an operator-enabled InstaBox backend, a saved `dependency-access` or
+`network-none` default deliberately keeps omitted-profile opens local. To allow
+remote-first selection again, use **Reset to runner default** here after the
+runner's remote-public-network consent is configured; this clears the persisted
+override and does not mutate existing workspaces. There is no automatic reset.
+
 ## Egress readiness check
 
 **Check egress readiness** runs an on-demand attestation of the managed bridge and host firewall and reports `Ready`, or `Not ready` with the probe's reason. Workspaces on `dependency-access` fail closed while readiness is not ready, because the runner also attests the profile before every executor start and quarantines a workspace whose network drifts.

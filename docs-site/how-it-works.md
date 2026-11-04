@@ -32,7 +32,7 @@ Cloud Harness MCP is architected as a split control plane and execution runtime.
                          │          ▼              │
                          │     Runner Service      │
                          │      ├── SQLite State   │
-                         │      ├── Docker Auth    │
+                         │      ├── Docker / remote executor auth │
                          │      └── GitHub Broker  │
                          └────────────┬────────────┘
                                       │
@@ -45,7 +45,7 @@ Cloud Harness MCP is architected as a split control plane and execution runtime.
         │  • 3-Zone Storage     │           │  • GitHub App Token   │
         │  • Network: dep-access│           │    passed via STDIN   │
         │  • No Docker socket   │           │  • Origin-only push   │
-        │  • TTL auto-cleanup   │           │  • Ephemeral cleanup  │
+        │  • TTL / retained stop│           │  • Ephemeral cleanup  │
         └───────────────────────┘           └───────────────────────┘
 ```
 
@@ -58,7 +58,7 @@ Cloud Harness MCP is architected as a split control plane and execution runtime.
 3. **Policy & Lifecycle Execution:**
    The API performs JSON schema validation against `TOOL_SCHEMA_BY_NAME` and issues an internal RPC to the **Runner**. The Runner validates principal permissions, checks concurrency bounds, and orchestrates the workspace container.
 4. **Isolated Execution:**
-   The **Workspace Executor** is spawned from `cloud-harness-executor:local`. The repository is cloned into a dedicated directory. Commands, file edits, and tasks execute inside this container under user `harness` (UID 10001) across partitioned user-space toolchain directories (`/opt/user-tools`) and temporary home (`/tmp/cloud-harness-home`).
+   The **Workspace Executor** is normally spawned from `cloud-harness-executor:local`. When the operator enables the custom InstaBox backend, an open that omits `networkProfile` (and has no persisted instance default) may instead use an allowlisted retained provider machine; explicit network profiles remain local. Commands, file edits, and tasks still use the same MCP contract.
 5. **Credential-Free Git Origin Transfer:**
    When `git_push` is invoked, the Runner starts an ephemeral helper container, streams a short-lived GitHub App installation token over `stdin`, pushes to GitHub origin, and immediately tears down the helper. The workspace executor never touches or observes the token.
 6. **Result Normalization:**
@@ -70,3 +70,4 @@ Cloud Harness MCP is architected as a split control plane and execution runtime.
 - **No Docker-in-Docker** — The Docker socket is never mounted into the workspace container.
 - **Idempotent Lifecycle** — `workspace_open` requires an `idempotencyKey`. If a client disconnects and retries with the same key, it attaches to the existing workspace rather than starting a duplicate clone.
 - **TTL Bounds** — Workspaces enforce both a wall-clock TTL (default 15 minutes) and an idle TTL (default 5 minutes). Expiry removes the container; the checkout stays recoverable for a grace period (default 60 minutes) and is then deleted, unless it still holds unsaved or unpushed work. The operator can change these in Dashboard → Settings.
+- **Remote retention** — An InstaBox workspace reports provider-managed networking, retains its borrowed machine and installed software across `workspace_recover` stop/resume, and is released only by explicit `workspace_close`; local Kata is the capacity fallback when configured. Remote public networking is provider-managed, not host-firewall-attested.

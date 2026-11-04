@@ -22,7 +22,8 @@ codex plugin add cloud-harness@bestagentkits
 
 ## Capabilities Taught to the Agent
 
-- **Safe Lifecycle:** Always keeping the `workspaceId`, closing stale shells before exit.
+- **Safe Lifecycle:** Always keeping the `workspaceId`, closing stale shells before exit, and stopping retained Kata/InstaBox workspaces so incomplete work can resume on the same workspace. Use `workspace_close` only when intentionally releasing data; an InstaBox close failure pins cleanup until the same close is retried after reconciliation or cooldown.
+- **Executor Choice:** On an operator-enabled InstaBox instance, omitting `networkProfile` with no persisted instance default permits remote-first admission; explicit network profiles stay local. Remote networking is provider-managed, not host-firewall-attested.
 - **Incremental Navigation:** Using `files_list` pagination and `grep_search` rather than recursive host dumping.
 - **Atomic File Edits:** Applying targeted patches with `files_apply_patch` instead of rewriting massive files.
 - **Clean Git Handoffs:** Verifying commit status before calling `git_push`.

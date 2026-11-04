@@ -19,6 +19,8 @@ To prevent unbounded memory growth and buffer overflow attacks, Cloud Harness MC
 | **Workspace Idle TTL** | 300s (5 min) | `WORKSPACE_IDLE_TTL_SECONDS` |
 | **Recoverable Grace** | 3600s (60 min) | `WORKSPACE_RECOVERABLE_GRACE_SECONDS` |
 | **Active Workspaces** | 3 per principal | `MAX_ACTIVE_WORKSPACES_PER_OWNER` |
+| **InstaBox archive upload** | 5 GiB per archive | Provider transfer bound; distinct from workspace storage |
+| **InstaBox provider policy** | Free/no billing; 30-minute idle pause; 8-hour maximum run | Provider lifecycle bound; not a harness TTL or quota |
 | **Max File List Entries** | 500 entries / page | `files_list.limit` |
 | **Max Active API Keys** | 10 per identity | Hard bound |
 | **Managed Package Release Size** | 512 MiB per release | `PACKAGES_MAX_RELEASE_BYTES` |
@@ -32,6 +34,13 @@ To prevent unbounded memory growth and buffer overflow attacks, Cloud Harness MC
 | **Skills over MCP Cache Hint** | `ttlMs: 30000`, `cacheScope: private` | Hard bound |
 
 The workspace TTLs, recoverable grace, and active-workspace quota can also be overridden instance-wide in Dashboard → [Settings](/dashboard/settings#workspace-limits-lifecycle), which takes precedence over the runner variable. TTL and grace changes apply only to workspaces opened afterwards.
+
+The runner's `MAX_WORKSPACE_BYTES` remains a soft, periodically measured
+workspace budget. For InstaBox, it measures the retained allocation root; it is
+separate from the provider's per-archive upload bound and does not describe the
+provider machine's full disk quota. Remote selection is opt-in and only applies
+when `workspace_open` omits `networkProfile` without a persisted instance
+default; explicit network profiles remain local.
 
 ## Agent model budgets
 

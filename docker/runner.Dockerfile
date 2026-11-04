@@ -11,6 +11,7 @@ RUN npm run build -w @cloud-harness/contracts && npm run build -w @cloud-harness
 
 FROM node:24.11.0-alpine3.22
 LABEL io.cloud-harness.vm-workspaces="1"
+LABEL io.cloud-harness.instabox-workspaces="1"
 RUN apk add --no-cache docker-cli tini
 ENV NODE_ENV=production
 WORKDIR /app
@@ -22,6 +23,8 @@ COPY --from=build --chmod=0444 /app/apps/runner/package.json ./apps/runner/packa
 COPY --from=build /app/apps/runner/dist ./apps/runner/dist
 COPY --from=build --chmod=0444 /app/packages/contracts/package.json ./packages/contracts/package.json
 COPY --from=build /app/packages/contracts/dist ./packages/contracts/dist
+COPY --chmod=0444 worker/remote-executor.mjs worker/harness-worker.mjs worker/workspace-transfer.mjs worker/git-transfer-helper.sh ./worker/
+RUN chmod 0755 /app/worker
 EXPOSE 3001
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "apps/runner/dist/index.js"]

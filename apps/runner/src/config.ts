@@ -46,6 +46,20 @@ function cloudflareAccessOAuth(): Record<string, unknown> | undefined {
   };
 }
 
+function instabox(): Record<string, unknown> | undefined {
+  const enabled = process.env.INSTABOX_ENABLED;
+  if (enabled === undefined || enabled === 'false') return undefined;
+  if (enabled !== 'true') throw new Error('INSTABOX_ENABLED must be true or false');
+  if (process.env.INSTABOX_API_KEY !== undefined) throw new Error('INSTABOX_API_KEY is forbidden; use INSTABOX_API_KEY_FILE');
+  const file = process.env.INSTABOX_API_KEY_FILE;
+  if (!file) throw new Error('INSTABOX_API_KEY_FILE is required');
+  let apiKey: string;
+  try { apiKey = readFileSync(file, 'utf8').trim(); }
+  catch { throw new Error('INSTABOX_API_KEY_FILE could not be read'); }
+  return { apiKey, machineIds: csv(process.env.INSTABOX_MACHINE_IDS, ''),
+    principalId: process.env.INSTABOX_PRINCIPAL_ID, allowPublicNetwork: process.env.INSTABOX_ALLOW_PUBLIC_NETWORK === 'true' };
+}
+
 const csv = (value: string | undefined, fallback: string) => (value ?? fallback).split(',').map((entry) => entry.trim()).filter(Boolean);
 
 type PrincipalRelinks = NonNullable<RunnerConfig['principalRelinks']>;
@@ -159,6 +173,7 @@ export function loadRunnerConfigWithReadiness(): RunnerConfigLoadResult {
     stateDb: process.env.STATE_DB ?? '/var/lib/cloud-harness/state/cloud-harness.db',
     executorImage: process.env.EXECUTOR_IMAGE ?? 'cloud-harness-executor:local',
     executorKind: process.env.EXECUTOR_KIND ?? 'docker',
+    instabox: instabox(),
     vmMemoryMiB: Number(process.env.VM_MEMORY_MIB ?? 4096),
     vmCpus: Number(process.env.VM_CPUS ?? 2),
     networkGuardImage: process.env.NETWORK_GUARD_IMAGE ?? 'cloud-harness-network-guard:local',

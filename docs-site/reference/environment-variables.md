@@ -133,6 +133,11 @@ Copy `.env.example` to `.env` and replace all `change-me` placeholder secrets be
 | `EXECUTOR_KIND` | `docker` | Optional | Custom persistent VM backend; requires Kata on the Docker host. Existing workspaces keep their backend. |
 | `VM_MEMORY_MIB` | `4096` | Optional | Optional configuration. |
 | `VM_CPUS` | `2` | Optional | Optional configuration. |
+| `INSTABOX_ENABLED` | `false` | Optional | Opt-in borrowed InstaBox pool. Disabled by default; see docs/custom-fork.md before activation. |
+| `INSTABOX_API_KEY_FILE` | `/run/cloud-harness-secrets/instabox-api-key` | Optional | Required when enabled: runner-only API key file. Inline INSTABOX_API_KEY is rejected; never mount the key into API or guests. |
+| `INSTABOX_MACHINE_IDS` | `—` | Optional | Required when enabled: exact comma-separated machine allowlist. Exclude CI and other owners' machines. |
+| `INSTABOX_PRINCIPAL_ID` | `—` | Optional | Required when enabled: canonical Cloud Harness principal bound to the entire pool, not an InstaBox account ID. |
+| `INSTABOX_ALLOW_PUBLIC_NETWORK` | `false` | Optional | Must be true when enabled: consent to provider-managed public networking, not host-attested dependency-access. |
 
 ## Security Guidelines
 

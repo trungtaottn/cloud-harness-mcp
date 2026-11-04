@@ -10,9 +10,11 @@ an interactive `bash` shell inside that workspace's executor. It is a real termi
 full-screen programs, colours, job control, and window resizing behave as they would in
 a local terminal.
 
-The shell runs in the same sandbox as agent commands, with the same user, limits,
-network profile, and environment. It does not run on the host or in the harness's own
-services, and it gives you no more access than an agent working in that workspace has.
+The shell runs in the same executor as agent commands, with the same user, limits,
+network profile, and environment. For an InstaBox workspace, the terminal uses the
+runner's allocation-bound provider WebSocket and reports provider-managed networking;
+it does not run in the API or on the host. In either backend it gives you no more
+access than an agent working in that workspace has.
 
 ## Opening and re-attaching
 
@@ -48,8 +50,12 @@ workspace is closed or expires, the terminal shows **No longer available** and s
 polling.
 
 Terminals are not resumed. If the harness restarts, every open terminal ends and shows
-**No longer available**; start a new session to continue. Use a background task (for
-example `tasks_run` from an AI tool) for long-running work that must survive a restart.
+**No longer available**; start a new session to continue. A browser reconnect can reuse
+an existing InstaBox terminal while its provider connection is still live. If that
+provider WebSocket has ended, the harness refuses transparent reconnect so it cannot
+duplicate bytes or replay input; open a fresh session and re-enter only intentional
+input. Use a background task (for example `tasks_run` from an AI tool) for long-running
+work that must survive a restart.
 
 ## All terminals
 
