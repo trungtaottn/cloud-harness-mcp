@@ -45,7 +45,7 @@ test('start applies one shared three-per-minute budget and verifies readiness',a
  finally{sdk.getInfo.mockImplementation(async()=>({state:'running',machine:{runtime:{ready:true}}}));sdk.resume.mockReset();}
 });
 test('bootstrap marker conflict prevents every file overwrite',async()=>{
- const b=new InstaBoxBackend(options);vi.spyOn(b,'run').mockResolvedValueOnce({exitCode:0,stdout:'',stderr:''}).mockResolvedValue({exitCode:1,stdout:'',stderr:''});const write=vi.spyOn(b,'writeFile');
+ const b=new InstaBoxBackend(options);vi.spyOn(b,'run').mockResolvedValueOnce({exitCode:0,stdout:'',stderr:''}).mockResolvedValueOnce({exitCode:0,stdout:'',stderr:''}).mockResolvedValue({exitCode:1,stdout:'',stderr:''});const write=vi.spyOn(b,'writeFile');
  await expect(b.bootstrap(ref,[{path:'runtime/worker',content:'anything'}])).rejects.toThrow('allocation_marker_conflict');expect(write).not.toHaveBeenCalled();
 });
 test('streamed upload accepts a 10 GiB caller budget and verifies provider digest',async()=>{
@@ -67,4 +67,8 @@ test('a multibyte UTF-8 truncation boundary never expands the byte budget',async
 test('bootstrap refuses a guest without kernel subreaper support before allocating files',async()=>{
  const b=new InstaBoxBackend(options);vi.spyOn(b,'run').mockResolvedValue({exitCode:1,stdout:'',stderr:''});const write=vi.spyOn(b,'writeFile');
  await expect(b.bootstrap(ref,[])).rejects.toThrow('kernel_subreaper_unavailable');expect(write).not.toHaveBeenCalled();
+});
+test('bootstrap refuses a guest without noninteractive scoped cleanup privilege before allocating files',async()=>{
+ const b=new InstaBoxBackend(options);vi.spyOn(b,'run').mockResolvedValueOnce({exitCode:0,stdout:'',stderr:''}).mockResolvedValueOnce({exitCode:1,stdout:'',stderr:'private sudo error'});const write=vi.spyOn(b,'writeFile');
+ await expect(b.bootstrap(ref,[])).rejects.toThrow('privileged_cleanup_unavailable');expect(write).not.toHaveBeenCalled();
 });

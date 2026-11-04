@@ -9,6 +9,7 @@ import { pipeline } from 'node:stream/promises';
 import { StringDecoder } from 'node:string_decoder';
 import type { RemoteExecutionBackend, RemoteExecutorRef, ExecutionOptions, ExecutionResult, RemoteJobSpec, RemoteJobObservation, RemoteMachineState } from './execution-backend.js';
 import { InstaBoxPty } from './instabox-pty.js';
+import { REMOTE_CLEANUP_PREREQUISITE } from '../remote-cleanup.js';
 
 const API = 'https://api.instabox.sh';
 const FILE_LIMIT = 5 * 1024 ** 3;
@@ -159,6 +160,8 @@ export class InstaBoxBackend implements RemoteExecutionBackend {
     this.validate(ref);
     const containment = await this.run(ref, `python3 -c ${shellQuote("import ctypes,sys; lib=ctypes.CDLL(None,use_errno=True); set_result=lib.prctl(36,1,0,0,0); value=ctypes.c_int(); get_result=lib.prctl(37,ctypes.byref(value),0,0,0); sys.exit(0 if set_result==0 and get_result==0 and value.value==1 else 125)")}`, { cwd: '/data/home', timeoutMs: 10000, maxBytes: 4096 });
     if (containment.exitCode !== 0) throw new InstaBoxProviderError('kernel_subreaper_unavailable');
+    const cleanup = await this.run(ref, `sudo -n -- python3 -c ${shellQuote(REMOTE_CLEANUP_PREREQUISITE)}`, { cwd: '/data/home', timeoutMs: 10000, maxBytes: 4096 });
+    if (cleanup.exitCode !== 0) throw new InstaBoxProviderError('privileged_cleanup_unavailable');
     const script = `const f=require('fs'),p=require('path');const root=${JSON.stringify(ref.root)},receipt=${JSON.stringify(JSON.stringify(ref))};f.mkdirSync(p.dirname(root),{recursive:true});try{f.mkdirSync(root);f.writeFileSync(root+'/.ch-allocation.json',receipt,{flag:'wx',mode:384});}catch(e){if(e.code!=='EEXIST'||f.readFileSync(root+'/.ch-allocation.json','utf8')!==receipt)throw Error('allocation marker conflict');}f.mkdirSync(root+'/runtime',{recursive:true});`;
     const result = await this.run(ref, `node -e ${shellQuote(script)}`, { cwd: '/data/home', timeoutMs: 30_000, maxBytes: 4096 });
     if (result.exitCode !== 0) throw new InstaBoxProviderError('allocation_marker_conflict');

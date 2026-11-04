@@ -83,8 +83,10 @@ policy is no-billing, with the observed 30-minute idle pause, eight-hour
 maximum run, and start cooldowns; these limits are distinct from the harness's
 workspace quota and lifecycle settings. A single remote archive upload is
 limited to 5 GiB, separately from the runner's soft workspace-size ceiling.
-Guest bootstrap requires Node.js, Bash and Python 3 with Linux child-subreaper
-support; see [configuration](configuration.md#optional-instabox-remote-executor).
+Guest bootstrap requires Node.js, Bash, Python 3 with Linux child-subreaper
+support, and passwordless noninteractive `sudo` for scoped close cleanup and
+read-only allocation quota measurement. See
+[configuration](configuration.md#optional-instabox-remote-executor).
 Remote terminal browser reconnect works while the provider connection remains
 live; after that provider WebSocket is lost, open a fresh terminal and do not
 replay input.

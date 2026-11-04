@@ -139,6 +139,9 @@ expires. Retained Kata and InstaBox workspaces stop compute and remain reserved
 until an explicit close. Remote InstaBox networking is provider-managed and is
 not the local host-firewall-attested `dependency-access` profile.
 
-Operators enabling InstaBox must prepare guests with Node.js, Bash and Python 3
-with Linux child-subreaper support. Bootstrap checks this prerequisite so
-cancelled or completed jobs cannot leave detached child processes running.
+Operators enabling InstaBox must prepare guests with Node.js, Bash, Python 3,
+Linux child-subreaper support, and passwordless noninteractive `sudo` for the
+scoped close cleanup and read-only allocation quota measurement. Bootstrap
+checks these prerequisites before allocating a workspace, so jobs cannot leave
+detached children and close can remove retained direct-install caches without
+widening cleanup beyond that allocation.

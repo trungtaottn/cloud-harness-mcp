@@ -995,7 +995,7 @@ export class WorkspaceService {
   private async workspaceBytes(record: WorkspaceRecord): Promise<number | undefined> {
     if (record.executorKind === 'instabox') {
       const remote = this.requireRemote();
-      const result = await remote.invoke(record, `du -sb --apparent-size -- ${shellQuote(remote.ref(record).root)}`, { timeoutMs: 30000, maxBytes: 8192 });
+      const result = await remote.invoke(record, `sudo -n -- du -sb --apparent-size -- ${shellQuote(remote.ref(record).root)}`, { timeoutMs: 30000, maxBytes: 8192 });
       const bytes = Number(result.stdout.trim().split(/\s+/)[0]);
       return result.exitCode === 0 && Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : undefined;
     }

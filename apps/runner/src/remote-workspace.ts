@@ -11,6 +11,7 @@ import type { RemoteExecutorRef, ExecutionResult } from './executors/execution-b
 import type { WorkspaceRecord } from './state-store.js';
 import { REPOSITORY_SUB_RANK } from './skill-resolver.js';
 import { runDocker, removeContainer } from './docker-engine.js';
+import { remoteCleanupCommand } from './remote-cleanup.js';
 
 const executeFile = promisify(execFile);
 export const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
@@ -158,7 +159,7 @@ export class RemoteWorkspace {
       await this.backend.start(ref);
       this.checkClaim(ref, claim, 'RELEASING');
       // The caller stopped operations; this exclusive claim prevents overlapping start/stop/close.
-      const result = await this.backend.run(ref, `rm -rf -- ${shellQuote(ref.root)}; test ! -e ${shellQuote(ref.root)}`, { cwd: '/data/home', timeoutMs: 60000, maxBytes: 4096 });
+      const result = await this.backend.run(ref, remoteCleanupCommand(ref), { cwd: '/data/home', timeoutMs: 120000, maxBytes: 4096 });
       if (result.exitCode !== 0) throw new Error('remote workspace cleanup failed');
       this.checkClaim(ref, claim, 'RELEASING');
       await this.backend.stop(ref);

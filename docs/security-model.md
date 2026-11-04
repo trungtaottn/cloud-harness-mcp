@@ -1484,7 +1484,13 @@ The allowlisted machines are borrowed provider resources, not disposable
 containers owned by Cloud Harness. Stop and resume retain the same allocation,
 machine, checkout, and installed software. Explicit `workspace_close` is the
 release-and-delete path for the scoped workspace data; it does not delete the
-provider machine. Remote workspaces support direct guest installation but not
+provider machine. The runner uses passwordless guest `sudo` only for read-only
+quota measurement of the fixed allocation root and, after a stopped prior boot,
+for a runner-supplied cleanup program. That cleanup program opens the
+fixed allocation ancestors and every child descriptor-relative without following
+links, checks inode and Linux mount identity, and fails closed with cleanup intent
+pinned rather than crossing a mount or releasing an uncertain allocation. Remote
+workspaces support direct guest installation but not
 managed package mounts or approved project dependency caches. The provider's
 Free policy carries no billing, a 30-minute idle pause, an eight-hour maximum
 run, and start cooldowns. A single archive upload is capped at 5 GiB, distinct

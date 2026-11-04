@@ -27,6 +27,44 @@ const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 const repositoryUrl = 'https://github.com/bestagentkits/cloud-harness-mcp.git';
 const fixtureRef = 'test-fixture-v1';
 
+// Software and caches stay inside the disposable allocation, outside its Git checkout.
+const installDependencies = `set -eu
+tools="$HARNESS_WORKSPACE_ROOT/../canary-tools"
+mkdir -p "$tools/ui" "$tools/go-project"
+npm install --prefix "$tools" --cache "$tools/npm-cache" --no-audit --no-fund --ignore-scripts --package-lock=false --registry=https://registry.npmjs.org pnpm@10.30.1
+test "$("$tools/node_modules/.bin/pnpm" --version)" = 10.30.1
+printf '%s\\n' '{"private":true,"dependencies":{"is-number":"7.0.0"}}' > "$tools/ui/package.json"
+"$tools/node_modules/.bin/pnpm" --dir "$tools/ui" install --ignore-scripts --store-dir "$tools/pnpm-store" --registry=https://registry.npmjs.org
+node -e 'if(require(process.argv[1])("42") !== true) process.exit(1)' "$tools/ui/node_modules/is-number"
+cd "$tools/go-project"
+printf 'module canary.invalid/dependencies\\n\\ngo 1.22\\n\\nrequire github.com/google/uuid v1.6.0\\n' > go.mod
+cat > dependencies_test.go <<'GO_TEST'
+package dependencies
+import ("testing"; "github.com/google/uuid")
+func TestDependency(t *testing.T) {
+  if uuid.Nil.String() != "00000000-0000-0000-0000-000000000000" { t.Fatal("dependency could not be used") }
+}
+GO_TEST
+export GOPATH="$tools/go" GOCACHE="$tools/go-build" GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOTOOLCHAIN=local
+go mod tidy
+go test -count=1 -mod=readonly ./...
+sudo -n install -d -m 500 "$tools/root-owned-cache"
+printf 'retained root-owned cache\\n' | sudo -n tee "$tools/root-owned-cache/receipt" >/dev/null
+sudo -n chmod 400 "$tools/root-owned-cache/receipt"
+printf 'dependency-install-online-ok\\n'`;
+
+const verifyRetainedDependencies = `set -eu
+tools="$HARNESS_WORKSPACE_ROOT/../canary-tools"
+test "$("$tools/node_modules/.bin/pnpm" --version)" = 10.30.1
+test "$(sudo -n cat "$tools/root-owned-cache/receipt")" = 'retained root-owned cache'
+rm -rf -- "$tools/ui/node_modules"
+"$tools/node_modules/.bin/pnpm" --dir "$tools/ui" install --offline --frozen-lockfile --ignore-scripts --store-dir "$tools/pnpm-store"
+node -e 'if(require(process.argv[1])("42") !== true) process.exit(1)' "$tools/ui/node_modules/is-number"
+cd "$tools/go-project"
+export GOPATH="$tools/go" GOCACHE="$tools/go-offline-build" GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local
+go test -count=1 -mod=readonly ./...
+printf 'dependency-cache-offline-after-resume-ok\\n'`;
+
 function validateCanaryRequests(): void {
   const workspaceId = 'ws_' + 'a'.repeat(24), taskId = 'task_' + 'a'.repeat(24), shellId = 'sh_' + 'a'.repeat(24), sessionId = 'sess_' + 'a'.repeat(24), artifactId = 'art_' + 'a'.repeat(24);
   const requests: Array<[keyof typeof TOOL_SCHEMA_BY_NAME, Record<string, unknown>]> = [
@@ -121,8 +159,8 @@ describe.skipIf(!enabled)('real InstaBox MCP workflow and Kata overflow', () => 
     }
     throw new Error('Canary task did not settle within deadline');
   }
-  async function output(workspaceId: string, command: string): Promise<string> {
-    const result = await call('exec_run', { workspaceId, command, cwd: '.', timeoutMs: 30_000, maxOutputBytes: 65_536 });
+  async function output(workspaceId: string, command: string, timeoutMs = 30_000): Promise<string> {
+    const result = await call('exec_run', { workspaceId, command, cwd: '.', timeoutMs, maxOutputBytes: 65_536 });
     expect(result.data.exitCode).toBe(0);
     return String(result.data.output);
   }
@@ -359,10 +397,14 @@ describe.skipIf(!enabled)('real InstaBox MCP workflow and Kata overflow', () => 
     expect((push.structuredContent as any).error.code).toBe('REPOSITORY_OPERATION_NOT_AUTHORIZED');
     await call('files_write', { workspaceId, path: 'canary.txt', content: 'dirty retained\n' });
     await call('files_write', { workspaceId, path: 'untracked.txt', content: 'untracked retained\n' });
+    expect(await output(workspaceId, installDependencies, 240000)).toContain('dependency-install-online-ok');
+    evidence('pinned-pnpm-and-real-ui-go-dependencies-installed');
     const before = await output(workspaceId, 'git rev-parse HEAD; git status --porcelain; sha256sum canary.txt untracked.txt');
     await call('workspace_recover', { workspaceId, mode: 'stop' });
     await call('workspace_recover', { workspaceId, mode: 'resume' });
     expect(await output(workspaceId, 'git rev-parse HEAD; git status --porcelain; sha256sum canary.txt untracked.txt')).toBe(before);
+    expect(await output(workspaceId, verifyRetainedDependencies, 240000)).toContain('dependency-cache-offline-after-resume-ok');
+    evidence('pnpm-version-and-ui-go-offline-caches-survive-stop-resume');
     evidence('git-local-commit-broker-fetch-denied-push-stop-resume-retention');
 
     const second = await call('workspace_open', { repositoryUrl, ref: fixtureRef, idempotencyKey: 'remote-second' });

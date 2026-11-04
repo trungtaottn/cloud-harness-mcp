@@ -32,7 +32,7 @@ vi.mock('../src/remote-workspace.js', () => ({ RemoteWorkspace: class {
   async resume(record: WorkspaceRecord) { await boundary.resume(record); this.allocations.setState(this.ref(record), 'ACTIVE'); }
   async stop(record: WorkspaceRecord) { await boundary.stop(record); this.allocations.setState(this.ref(record), 'STOPPED'); }
   async release(record: WorkspaceRecord) { await boundary.release(record); const ref = this.ref(record); this.allocations.setState(ref, 'RELEASING'); this.allocations.release(ref); }
-  async invoke(record: WorkspaceRecord, command: string) { return boundary.invoke(record, command); }
+  async invoke(record: WorkspaceRecord, command: string, input?: Record<string, unknown>) { return boundary.invoke(record, command, input); }
   async snapshotCheckout(record: WorkspaceRecord) { return join(record.workspacePath, 'remote-skills'); }
 } }));
 import { WorkspaceService } from '../src/workspace-service.js';
@@ -47,7 +47,7 @@ function fixture(limit = 4) {
     maxActiveWorkspacesPerOwner: limit, allowedGitHosts: ['github.com'], executorImage: 'executor:test', maxArtifactBytes: 1024,
     instabox: { apiKey: 'test', principalId: owner, machineIds: ['one', 'two', 'three'], allowPublicNetwork: true } } as RunnerConfig;
   const service = new WorkspaceService(config, store);
-  boundary.invoke.mockImplementation(async (_record, command: string) => ({ stdout: command.startsWith('du ') ? '0\t/remote\n' : '', stderr: '', exitCode: 0, truncated: false }));
+  boundary.invoke.mockImplementation(async (_record, command: string) => ({ stdout: command.startsWith('sudo -n -- du ') ? '0\t/remote\n' : '', stderr: '', exitCode: 0, truncated: false }));
   fixtures.push({ service, store, dir });
   return { service, store, owner, principal, config };
 }
@@ -57,6 +57,21 @@ afterEach(async () => {
   vi.clearAllMocks(); boundary.provision.mockReset(); boundary.stop.mockReset(); boundary.jobs.clear(); boundary.payloads.clear();
 });
 describe('remote workspace service routing', () => {
+  it('measures the complete retained allocation through bounded noninteractive privilege and fails closed', async () => {
+    const { service, store, owner } = fixture();
+    await open(service, owner, 'quota');
+    const record = store.list(owner)[0]!;
+    const probe = service as unknown as { workspaceBytes(record: WorkspaceRecord): Promise<number | undefined> };
+    boundary.invoke.mockResolvedValueOnce({ stdout: '12345\t/remote\n', stderr: '', exitCode: 0, truncated: false });
+    expect(await probe.workspaceBytes(record)).toBe(12345);
+    expect(boundary.invoke).toHaveBeenLastCalledWith(record,
+      expect.stringMatching(/^sudo -n -- du -sb --apparent-size -- '\/data\/home\/\.cloud-harness\/[a-f0-9]{36}\/ws_/),
+      { timeoutMs: 30000, maxBytes: 8192 });
+    boundary.invoke.mockResolvedValueOnce({ stdout: '', stderr: 'permission denied', exitCode: 1, truncated: false });
+    expect(await probe.workspaceBytes(record)).toBeUndefined();
+    boundary.invoke.mockResolvedValueOnce({ stdout: 'not-a-size\t/remote\n', stderr: '', exitCode: 0, truncated: false });
+    expect(await probe.workspaceBytes(record)).toBeUndefined();
+  });
   it('reports paused compute and provider outages without waking or replacing retained machines', async () => {
     const { service, store, owner, principal } = fixture();
     await open(service, owner, 'status');

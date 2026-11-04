@@ -43,9 +43,12 @@ neither the key nor its path. Leave the feature disabled unless the operator has
 accepted the provider-managed public-network boundary; source changes do not
 claim production activation.
 
-Guests require Node.js, Bash and Python 3 with standard-library `ctypes` and
-Linux child-subreaper support. Bootstrap verifies the kernel capability before
-creating runtime files and fails with `kernel_subreaper_unavailable` if missing.
+Guests require Node.js, Bash, Python 3 with standard-library `ctypes`, Linux
+child-subreaper support, and passwordless noninteractive `sudo` for the scoped
+close cleanup and read-only allocation quota measurement. Bootstrap verifies
+both kernel/process containment and cleanup prerequisites before creating
+runtime files; it fails with
+`kernel_subreaper_unavailable` or `privileged_cleanup_unavailable` if missing.
 The subreaper keeps detached and reparented descendants owned by their job so
 cancellation, timeout and completion cannot leave those processes running.
 

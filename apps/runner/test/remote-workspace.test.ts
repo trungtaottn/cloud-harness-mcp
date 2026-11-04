@@ -168,7 +168,19 @@ it('ends the old boot before scoped cleanup and confirms final shutdown before r
   vi.spyOn(remote.backend, 'run').mockImplementation(async () => { order.push('cleanup'); return { stdout: '', stderr: '', exitCode: 0 }; });
   await remote.release(record);
   expect(order).toEqual(['stop', 'start', 'cleanup', 'stop']);
+  expect(vi.mocked(remote.backend.run).mock.calls[0]?.[1]).toContain("'sudo' '-n' '--' 'python3' '-c'");
   expect(allocations.isReleased(record.id, record.ownerId)).toBe(true);
+});
+it('keeps cleanup intent pinned when privileged scoped deletion fails', async () => {
+  const { remote, allocations, record } = setup();
+  allocations.reserve(record.id, record.ownerId, ['first']);
+  vi.spyOn(remote.backend, 'start').mockResolvedValue();
+  const stop = vi.spyOn(remote.backend, 'stop').mockResolvedValue();
+  vi.spyOn(remote.backend, 'run').mockResolvedValue({ stdout: '', stderr: '', exitCode: 1 });
+  await expect(remote.release(record)).rejects.toThrow('remote workspace cleanup failed');
+  expect(stop).toHaveBeenCalledOnce();
+  expect(allocations.byWorkspace(record.id)).toMatchObject({ state: 'QUARANTINED', cleanupRequested: true });
+  expect(allocations.isReleased(record.id, record.ownerId)).toBe(false);
 });
 it('does not report success after a provider effect loses its publication fence', async () => {
   const { remote, allocations, record } = setup();
