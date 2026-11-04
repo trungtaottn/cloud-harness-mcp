@@ -131,14 +131,14 @@ Explicitly renew the workspace idle lease duration or reactivate a recoverable e
 
 **Recover workspace state**
 
-Recover a recoverable expired workspace to active state, or inspect, patch, or export unpushed work.
+Recover a retained workspace, explicitly recreate an idle executor to mount current packages, or inspect, patch, or export unpushed work. mode recreate preserves files, package scope and network profile, rejects busy workspaces, and discards ephemeral container and terminal state.
 
 **Attributes:** <span class="badge-destructive">destructive</span>
 
 | Parameter | Type | Required | Constraints & Notes |
 |---|---|---|---|
 | `workspaceId` | `string` | No | pattern: `^ws_[A-Za-z0-9_-]{20,80}$` |
-| `mode` | `"resume"` \| `"status"` \| `"patch"` \| `"export"` | No | default: `"resume"` |
+| `mode` | `"resume"` \| `"recreate"` \| `"status"` \| `"patch"` \| `"export"` | No | default: `"resume"` |
 | `targetBranch` | `string` | No | length: 1–255 |
 
 ### `workspace_close`

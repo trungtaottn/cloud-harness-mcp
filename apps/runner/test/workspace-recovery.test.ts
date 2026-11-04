@@ -95,6 +95,7 @@ function resolutionFixture(ownerId: string) {
 afterEach(() => {
   docker.workerResult = { ok: true, message: 'worker complete', data: {}, truncated: false };
   docker.createdEnvFiles = [];
+  docker.inspectContainer.mockResolvedValue(undefined);
   vi.clearAllMocks();
   vi.clearAllMocks();
   for (const store of openStores.splice(0)) {
@@ -133,6 +134,102 @@ function createTestService(maxActiveWorkspacesPerOwner = 1): { service: Workspac
 }
 
 describe('Workspace Recovery and Lease Renewal (Issue #103)', () => {
+  function activeFixture() {
+    const fixture = createTestService();
+    const { store, ownerId, jobsRoot } = fixture;
+    const id = 'ws_recreate123456789012345';
+    const workspacePath = join(jobsRoot, id);
+    mkdirSync(join(workspacePath, 'repo'), { recursive: true });
+    writeFileSync(join(workspacePath, 'repo', 'uncommitted.txt'), 'keep this work');
+    const now = Date.now();
+    store.create({
+      id, ownerId, workspacePath, idempotencyKey: 'recreate-fixture',
+      repositoryUrl: 'https://github.com/example/repo.git', repositoryRef: 'main',
+      containerName: 'existing-executor', status: 'ACTIVE', networkProfile: 'network-none',
+      createdAt: now, lastActivityAt: now, expiresAt: now + 3600_000,
+      hardExpiresAt: now + 14_400_000, generation: 1, error: null
+    });
+    docker.inspectContainer.mockResolvedValue({ State: { Running: true } } as never);
+    return { ...fixture, record: store.byId(id)! };
+  }
+
+  it('explicitly recreates a running executor with current package mounts while preserving workspace data and policy', async () => {
+    const { service, store, ownerId, record } = activeFixture();
+    service['config'].packagesEnabled = true;
+    service['config'].packagesRoot = join(record.workspacePath, 'packages');
+    vi.spyOn(service['packages'], 'profileFor').mockReturnValue({
+      releaseIds: ['pkr_pnpm'], missingReleaseIds: [],
+      mounts: [{ source: '/packages/pnpm', target: '/opt/chm-packages/pkr_pnpm' }],
+      binDirs: ['/opt/chm-packages/pkr_pnpm/bin']
+    });
+    const result = await service.execute(ownerId, 'workspace_recover', { workspaceId: record.id, mode: 'recreate' });
+    expect(result.ok).toBe(true);
+    const create = docker.runDocker.mock.calls.find(([args]) => args[0] === 'create')?.[0];
+    expect(create).toContain('/packages/pnpm:/opt/chm-packages/pkr_pnpm:ro');
+    expect(create?.find((arg) => arg.startsWith('PATH='))).toContain('/opt/chm-packages/pkr_pnpm/bin');
+    expect(store.byId(record.id)).toMatchObject({
+      id: record.id, ownerId, networkProfile: 'network-none', status: 'ACTIVE',
+      hardExpiresAt: record.hardExpiresAt, expiresAt: record.expiresAt
+    });
+    expect(readFileSync(join(record.workspacePath, 'repo', 'uncommitted.txt'), 'utf8')).toBe('keep this work');
+  });
+
+  it('keeps ordinary resume non-disruptive for a running network-none executor', async () => {
+    const { service, ownerId, record } = activeFixture();
+    await service.execute(ownerId, 'workspace_recover', { workspaceId: record.id, mode: 'resume' });
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+    expect(docker.runDocker.mock.calls.some(([args]) => args[0] === 'create')).toBe(false);
+  });
+
+  it('refuses recreation while a mutation lease is held', async () => {
+    const { service, store, ownerId, record } = activeFixture();
+    store.acquireMutationLease(record.id, record.generation, Date.now() + 60_000);
+    await expect(service.execute(ownerId, 'workspace_recover', { workspaceId: record.id, mode: 'recreate' }))
+      .rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+  });
+
+  it('retains recoverable files when replacement creation fails', async () => {
+    const { service, store, ownerId, record } = activeFixture();
+    docker.runDocker.mockImplementationOnce(async () => ({ stdout: '', stderr: 'unavailable', exitCode: 1, truncated: false }));
+    await expect(service.execute(ownerId, 'workspace_recover', { workspaceId: record.id, mode: 'recreate' })).rejects.toThrow();
+    expect(store.byId(record.id)?.status).toBe('EXPIRED_RECOVERABLE');
+    expect(readFileSync(join(record.workspacePath, 'repo', 'uncommitted.txt'), 'utf8')).toBe('keep this work');
+  });
+
+  it('refuses recreation while a background command is registered', async () => {
+    const { service, ownerId, record } = activeFixture();
+    service['operations'].registerGenericOperation({ id: 'op_busy', workspaceId: record.id, kind: 'exec' });
+    await expect(service.execute(ownerId, 'workspace_recover', { workspaceId: record.id, mode: 'recreate' }))
+      .rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+  });
+
+  it('fences concurrent calls and a second recreate until replacement completes', async () => {
+    const { service, ownerId, record } = activeFixture();
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    docker.removeContainer.mockImplementationOnce(() => gate);
+    const replacing = service.execute(ownerId, 'workspace_recover', { workspaceId: record.id, mode: 'recreate' });
+    await expect(service.execute(ownerId, 'files_read', { workspaceId: record.id, path: 'uncommitted.txt' }))
+      .rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(service.execute(ownerId, 'workspace_recover', { workspaceId: record.id, mode: 'recreate' }))
+      .rejects.toMatchObject({ code: 'CONFLICT' });
+    finish();
+    expect((await replacing).ok).toBe(true);
+    expect((await service.execute(ownerId, 'workspace_status', { workspaceId: record.id })).ok).toBe(true);
+  });
+
+  it('rejects an expired wall-clock deadline and a different owner without touching Docker', async () => {
+    const { service, store, ownerId, record } = activeFixture();
+    await expect(service.execute('different-owner', 'workspace_recover', { workspaceId: record.id, mode: 'recreate' }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
+    store.update(record.id, { hardExpiresAt: Date.now() - 1 });
+    await expect(service.execute(ownerId, 'workspace_recover', { workspaceId: record.id, mode: 'recreate' }))
+      .rejects.toMatchObject({ code: 'EXPIRED' });
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+  });
+
   it('recovers an EXPIRED_RECOVERABLE workspace to ACTIVE state with default resume mode', async () => {
     const { service, store, ownerId, jobsRoot } = createTestService();
     const wsId = 'ws_recovertest123456789012';

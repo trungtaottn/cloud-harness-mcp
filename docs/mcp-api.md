@@ -784,6 +784,10 @@ ChatGPT subscription (see
     mounts the owner-scope releases the same way. Existing workspaces keep the
     releases they started with until they are recreated, and
     `packages_status` without `applyId` lists the ones that would change. A
+    client activates these changes by calling `workspace_recover` with
+    `mode: "recreate"` once commands/tasks/agents have finished and interactive
+    shells, sessions and terminals are closed. Do not close the workspace or
+    change package scope just to refresh mounts. A
     workspace-scope binding overrides the owner binding of the same package;
     any other binary-name collision is a `CONFLICT` listed in the plan.
   - **Rollback needs no approval.** `packages_rollback` points a binding back
@@ -1058,6 +1062,14 @@ ChatGPT subscription (see
     workspaces. In `resume` mode (default), it restores the workspace to `ACTIVE` state,
     recreates and starts the executor container on demand, and refreshes the idle lease
     while preserving all local Git and file state. In `status` and `patch` modes, it
+    does not replace the executor. Explicit `recreate` replaces an idle remote
+    executor with current package mounts while retaining workspace ID, checkout,
+    tools/cache volumes, secret snapshot, package scope, network profile and hard
+    expiry. Busy workspaces and concurrent calls return `CONFLICT`; ephemeral
+    container state is lost. A failed replacement leaves files recoverable for
+    another `recreate` attempt. Local mode returns `NOT_SUPPORTED`. The default
+    `resume` continues to reuse an existing running network-none container.
+    In `status` and `patch` modes, it
     non-destructively returns unpushed changes or unified diffs. In `export` mode, it
     creates a recovery snapshot commit and pushes it to a target remote branch as a
     safety escape hatch even if the hard wall-clock deadline was reached.

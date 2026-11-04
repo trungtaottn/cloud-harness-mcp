@@ -28,7 +28,7 @@ const ROOT_CHECK_TIMEOUT_MS = 2_000;
 /** Lifecycle tools that must reach a workspace even when its root is unavailable. */
 const ROOT_INDEPENDENT_OPERATIONS = new Set<RunnerOperation>(['workspace_status', 'workspace_close']);
 
-function failure(code: 'NOT_FOUND' | 'CONFLICT' | 'INVALID_INPUT' | 'UNAVAILABLE', message: string, retryable = false): RunnerResponse {
+function failure(code: 'NOT_FOUND' | 'CONFLICT' | 'INVALID_INPUT' | 'UNAVAILABLE' | 'NOT_SUPPORTED', message: string, retryable = false): RunnerResponse {
   return { ok: false, message, error: { code, message, retryable }, truncated: false };
 }
 
@@ -175,6 +175,9 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
       return { ok: true, message: 'Workspace status retrieved', data: await this.describe(member), truncated: false };
     }
 
+    if (operation === 'workspace_recover' && input.mode === 'recreate') {
+      return failure('NOT_SUPPORTED', 'Local workspaces have no executor container to recreate');
+    }
     if (operation === 'workspace_recover' && member.backend.closed) {
       member = this.pool.reopen(member);
     }

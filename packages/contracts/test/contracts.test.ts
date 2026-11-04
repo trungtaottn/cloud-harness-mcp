@@ -433,6 +433,7 @@ describe('contracts', () => {
     expect(TOOL_SCHEMA_BY_NAME.workspace_lease_renew.parse({ extensionSeconds: 3600 })).toMatchObject({ extensionSeconds: 3600 });
     expect(TOOL_SCHEMA_BY_NAME.workspace_recover.parse({})).toMatchObject({ mode: 'resume' });
     expect(TOOL_SCHEMA_BY_NAME.workspace_recover.parse({ mode: 'resume' })).toMatchObject({ mode: 'resume' });
+    expect(TOOL_SCHEMA_BY_NAME.workspace_recover.parse({ mode: 'recreate' })).toMatchObject({ mode: 'recreate' });
     expect(TOOL_SCHEMA_BY_NAME.workspace_recover.parse({ mode: 'patch' })).toMatchObject({ mode: 'patch' });
     expect(TOOL_SCHEMA_BY_NAME.workspace_recover.parse({ mode: 'status' })).toMatchObject({ mode: 'status' });
     expect(TOOL_SCHEMA_BY_NAME.workspace_recover.parse({ mode: 'export', targetBranch: 'backup' })).toMatchObject({ mode: 'export', targetBranch: 'backup' });

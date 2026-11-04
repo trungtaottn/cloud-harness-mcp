@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -180,6 +180,52 @@ describe.skipIf(prerequisiteIssue !== undefined)('managed packages through the w
     const planned = await plan('chm-clash', '1.0.0');
     approve(planned);
     expect(await code(service.execute(ownerId, 'packages_apply', applyInput(planned)))).toBe('CONFLICT');
+  });
+
+  it('recreates an existing executor to mount a newly verified workspace binding without losing files', async () => {
+    const workspaceId = 'ws_recreatepackages1234567890';
+    const workspacePath = join(config.jobsRoot, workspaceId);
+    mkdirSync(join(workspacePath, 'repo'), { recursive: true });
+    writeFileSync(join(workspacePath, 'repo', 'uncommitted.txt'), 'retained local work');
+    const now = Date.now();
+    store.create({
+      id: workspaceId, ownerId, workspacePath, idempotencyKey: 'package-recreate',
+      repositoryUrl: 'https://github.com/example/repo.git', repositoryRef: 'main',
+      status: 'EXPIRED_RECOVERABLE', containerName: null, networkProfile: 'network-none',
+      createdAt: now, lastActivityAt: now, expiresAt: now + 3600_000,
+      hardExpiresAt: now + 14_400_000, generation: 1, error: null
+    });
+    try {
+      await service.execute(ownerId, 'workspace_recover', { workspaceId, mode: 'resume' });
+      const before = await runDocker(['inspect', store.byId(workspaceId)!.containerName!, '--format', '{{.Id}}']);
+      const output = PackagesPlanOutputSchema.parse((await service.execute(ownerId, 'packages_plan', {
+        ecosystem: 'npm', name: 'chm-hello', version: '1.0.0', scope: 'workspace', workspaceId
+      })).data);
+      if ('resolutionId' in output) throw new Error('fixture resolution unexpectedly exceeded inline wait');
+      approve(output);
+      const applied = await applyAndWait(output);
+      expect(applied.state).toBe('SUCCEEDED');
+      const pending = await service.execute(ownerId, 'packages_status', {});
+      expect(pending.data).toMatchObject({ workspacesPendingRecreate: [workspaceId] });
+      await service.execute(ownerId, 'workspace_recover', { workspaceId, mode: 'recreate' });
+      const record = store.byId(workspaceId)!;
+      const inspection = await runDocker(['inspect', record.containerName!]);
+      const container = JSON.parse(inspection.stdout)[0] as {
+        Id: string; HostConfig: { NetworkMode: string }; Mounts: Array<{ Destination: string; RW: boolean }>;
+      };
+      expect(container.Id).not.toBe(before.stdout.trim());
+      expect(container.HostConfig.NetworkMode).toBe('none');
+      expect(container.Mounts).toContainEqual(expect.objectContaining({ Destination: `/opt/chm-packages/${applied.releaseId}`, RW: false }));
+      const run = await runDocker(['exec', record.containerName!, 'bash', '-lc', 'chm-hello']);
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toContain('hello from chm-hello');
+      expect(readFileSync(join(workspacePath, 'repo', 'uncommitted.txt'), 'utf8')).toBe('retained local work');
+      expect((await service.execute(ownerId, 'packages_status', {})).data).toMatchObject({ workspacesPendingRecreate: [] });
+    } finally {
+      await service.close(ownerId, workspaceId);
+      // Remove this test's now-unbound workspace release before later GC assertions.
+      await packages.collectGarbage(Date.now());
+    }
   });
 
   it('keeps the binding on its release when an upgrade fails verification, then rolls back', async () => {

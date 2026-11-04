@@ -202,7 +202,10 @@ poll `tasks_status`, `operation_wait`, or `agent_status` instead.
      `git_push` lease modes (`expectedAbsent` create-only lock, compare-and-swap,
      `delete` if match) and the commit-status, check-run, review-state, and
      workflow dispatch/run actions in `references/github-merge-train.md`.
-8. **Manage lifecycle and lease.** If work approaches the idle timeout, call
+8. **Manage lifecycle and lease.** To mount newly applied packages in an idle
+   workspace, call `workspace_recover` with `mode: "recreate"`; it preserves
+   the workspace and network profile and refuses active work. Never close a
+   workspace just to refresh its mounts. If work approaches the idle timeout, call
    `workspace_lease_renew`. If disconnected or recovering unpushed work, call
    `workspace_recover(mode: "resume" | "status" | "patch" | "export")`.
 9. **Clean up resources.** Close opened shells and sessions, cancel unfinished

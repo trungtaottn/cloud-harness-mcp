@@ -315,6 +315,18 @@ export class OperationManager {
       .sort((left, right) => left.createdAt - right.createdAt);
   }
 
+  hasActiveWorkspaceWork(workspaceId: string): boolean {
+    const records = [
+      ...this.tasks.values(),
+      ...this.shells.values(),
+      ...this.sessions.values(),
+      ...this.genericOperations.values(),
+      ...this.terminals.values()
+    ];
+    return records.some((record) => record.workspaceId === workspaceId
+      && (record.status === 'queued' || record.status === 'running'));
+  }
+
   private enforceOutputBudget(workspaceId: string): void {
     const records = this.records(workspaceId);
     let total = records.reduce((sum, record) => sum + record.output.length, 0);

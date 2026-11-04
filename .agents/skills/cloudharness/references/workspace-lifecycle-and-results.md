@@ -200,7 +200,16 @@ Explicitly renew the active workspace idle lease or reactivate a recoverable exp
 
 Recover an active or recoverable expired workspace to active state, or inspect, patch, or export unpushed work.
 
-- Optional: `workspaceId`, `mode` (`resume` (default), `status`, `patch`, or `export`), `targetBranch`.
+- Optional: `workspaceId`, `mode` (`resume` (default), `recreate`, `status`, `patch`, or `export`), `targetBranch`.
+- Use `recreate` after a managed package apply succeeds and this workspace is
+  listed in `workspacesPendingRecreate`. It replaces only the executor, keeping
+  the same workspace ID, checkout, tools/cache volumes, package scope, secret
+  snapshot, network profile and hard deadline. Finish work and close shells,
+  sessions and terminals first; busy or concurrent calls return `CONFLICT`.
+  Container scratch state is discarded. Failure retains recoverable files;
+  retry `recreate` after resolving the failure. Local mode returns `NOT_SUPPORTED`.
+- `resume` can reuse an existing container and does not refresh its mounts.
+  Never use `workspace_close` to refresh packages: close deletes workspace data.
 - Returns restored active workspace, recovery status, unpushed patch, or branch recovery details.
 
 <!-- cloudharness-example:workspace_recover

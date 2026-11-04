@@ -111,6 +111,8 @@ describe('LocalWorkspaceBackend', () => {
   });
 
   it('handles workspace_lease_renew and workspace_recover in local mode', async () => {
+    const recreateRes = await backend.call('workspace_recover', { workspaceId: backend.workspaceId, mode: 'recreate' });
+    expect(recreateRes.error?.code).toBe('NOT_SUPPORTED');
     const renewRes = await backend.call('workspace_lease_renew', { workspaceId: backend.workspaceId });
     expect(renewRes.ok).toBe(true);
     expect(renewRes.message).toContain('Local workspace lease is permanent');

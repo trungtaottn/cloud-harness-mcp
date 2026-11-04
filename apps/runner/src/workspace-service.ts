@@ -297,6 +297,8 @@ function internalWorkspaceDetail(record: WorkspaceRecord) {
 }
 
 export class WorkspaceService {
+  private readonly workspaceRequests = new Map<string, number>();
+  private readonly recreatingWorkspaces = new Set<string>();
   private readonly operations: OperationManager;
   private readonly repoCacheManager: RepositoryCacheManager;
   private readonly instanceId: string;
@@ -1045,13 +1047,16 @@ export class WorkspaceService {
     }
   }
 
-  private async ensureActiveExecutor(record: WorkspaceRecord): Promise<WorkspaceRecord> {
+  private async ensureActiveExecutor(record: WorkspaceRecord, recreate = false): Promise<WorkspaceRecord> {
     // Dependency-access requires a fresh attestation before reuse; a quarantined
     // record must never resume its existing container. Force removal and rebuild
     // through createExecutor (which re-attests) instead of reusing a container
     // that may sit behind a drifted firewall.
     const mustRebuild = record.networkProfile === 'dependency-access' || record.status === 'NETWORK_QUARANTINED';
-    if (record.containerName && mustRebuild) {
+    if (record.containerName && recreate) {
+      // A failed removal must not be silently treated as a completed replacement.
+      await removeContainer(record.containerName);
+    } else if (record.containerName && mustRebuild) {
       await removeContainer(record.containerName).catch(() => undefined);
     } else if (record.containerName) {
       const inspected = await inspectContainer(record.containerName);
@@ -2808,6 +2813,77 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   }
 
   async execute(principal: PrincipalSelector | string, operation: RunnerOperation, input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
+    return this.trackWorkspaceRequest(principal, input, () => this.executeRequest(principal, operation, input, signal));
+  }
+
+  private async trackWorkspaceRequest<T>(principal: PrincipalSelector | string, input: Record<string, unknown>, action: () => Promise<T>): Promise<T> {
+    const ownerId = this.store.resolvePrincipal(typeof principal === 'string' ? { kind: 'owner', ownerId: principal } : principal);
+    let record: WorkspaceRecord;
+    try {
+      record = this.store.resolveActiveWorkspace(ownerId, typeof input.workspaceId === 'string' ? input.workspaceId : undefined);
+    } catch {
+      // Workspace-independent calls and normal validation keep their existing paths.
+      return action();
+    }
+    if (this.recreatingWorkspaces.has(record.id)) {
+      throw new HarnessError('CONFLICT', 'workspace executor recreation is in progress; retry after it finishes', 409, true);
+    }
+    this.workspaceRequests.set(record.id, (this.workspaceRequests.get(record.id) ?? 0) + 1);
+    try {
+      return await action();
+    } finally {
+      const remaining = (this.workspaceRequests.get(record.id) ?? 1) - 1;
+      if (remaining === 0) this.workspaceRequests.delete(record.id);
+      else this.workspaceRequests.set(record.id, remaining);
+    }
+  }
+
+  private async recreateExecutor(record: WorkspaceRecord): Promise<RunnerResponse> {
+    const now = Date.now();
+    if (record.hardExpiresAt <= now) {
+      throw new HarnessError('EXPIRED', 'Workspace hard lease limit reached; export retained work instead of recreating', 410);
+    }
+    if ((this.workspaceRequests.get(record.id) ?? 0) > 1
+      || (record.mutationLockedUntil ?? 0) > now
+      || this.operations.hasActiveWorkspaceWork(record.id)
+      || this.agentManager?.hasActiveAgents(record.ownerId, record.id)) {
+      throw new HarnessError('CONFLICT', 'workspace is busy; finish commands, tasks, agents and close shells, sessions and terminals before recreating', 409, true);
+    }
+    this.recreatingWorkspaces.add(record.id);
+    // Persist a recoverable state before touching Docker. A crash during replacement
+    // must not make startup reconciliation prune the retained workspace files.
+    const claimed = this.store.updateFenced(record.id, record.generation,
+      ['ACTIVE', 'EXPIRED_RECOVERABLE', 'NETWORK_QUARANTINED'], {
+        status: 'EXPIRED_RECOVERABLE', generation: record.generation + 1,
+        error: 'executor recreation in progress; resume recovery if interrupted'
+      });
+    if (!claimed) {
+      this.recreatingWorkspaces.delete(record.id);
+      throw new HarnessError('CONFLICT', 'workspace lifecycle changed before recreation', 409, true);
+    }
+    try {
+      this.store.acquireRecoverableMutationLease(claimed.id, claimed.generation, now + 300_000);
+      const active = await this.ensureActiveExecutor(claimed, true);
+      const updated = this.store.updateFenced(active.id, active.generation, ['ACTIVE'], {
+        expiresAt: record.expiresAt > now ? record.expiresAt : Math.min(active.hardExpiresAt, now + this.idleTtlSecondsFor(active) * 1000),
+        error: null
+      });
+      if (!updated) throw new HarnessError('CONFLICT', 'workspace lifecycle changed during recreation', 409, true);
+      this.auditWorkspaceOutcome(record.ownerId, 'workspace.recreated', updated, {});
+      return { ok: true, message: 'Workspace executor recreated with current package mounts', data: publicRecord(updated), truncated: false };
+    } catch (error) {
+      this.store.updateFenced(claimed.id, claimed.generation, ['ACTIVE', 'EXPIRED_RECOVERABLE'], {
+        status: 'EXPIRED_RECOVERABLE',
+        error: 'executor recreation failed; workspace files retained; retry workspace_recover with mode recreate'
+      });
+      throw error;
+    } finally {
+      this.store.releaseMutationLease(claimed.id, claimed.generation);
+      this.recreatingWorkspaces.delete(record.id);
+    }
+  }
+
+  private async executeRequest(principal: PrincipalSelector | string, operation: RunnerOperation, input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
     const ownerId = this.store.resolvePrincipal(typeof principal === 'string' ? { kind: 'owner', ownerId: principal } : principal);
     RunnerOperationSchema.parse(operation);
     const validated = TOOL_SCHEMA_BY_NAME[operation].parse(input) as Record<string, unknown>;
@@ -3100,7 +3176,8 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       if (rec.status === 'CREATING' || rec.status === 'REAPING') {
         throw new HarnessError('CONFLICT', `workspace is ${rec.status.toLowerCase()}`, 409, true);
       }
-      const mode = (validated.mode as 'resume' | 'status' | 'patch' | 'export') ?? 'resume';
+      const mode = (validated.mode as 'resume' | 'recreate' | 'status' | 'patch' | 'export') ?? 'resume';
+      if (mode === 'recreate') return this.recreateExecutor(rec);
       if (mode === 'resume') {
         const now = Date.now();
         if (rec.hardExpiresAt <= now) {
@@ -4647,6 +4724,15 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     input: Record<string, unknown>,
     signal?: AbortSignal
   ): Promise<RunnerResponse> {
+    return this.trackWorkspaceRequest(principal, input, () => this.executeInternalRequest(principal, operation, input, signal));
+  }
+
+  private async executeInternalRequest(
+    principal: PrincipalSelector,
+    operation: InternalRunnerOperation,
+    input: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<RunnerResponse> {
     const parsed = InternalRunnerRequestSchema.parse({ version: 2, principal, operation, input });
     const ownerId = this.store.resolvePrincipal(parsed.principal);
     if (parsed.operation === 'toolkits_list') {
@@ -4808,6 +4894,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   }
 
   async close(ownerId: string, workspaceId: string): Promise<RunnerResponse> {
+    if (this.recreatingWorkspaces.has(workspaceId)) throw new HarnessError('CONFLICT', 'workspace executor recreation is in progress', 409, true);
     const record = this.requireWorkspace(ownerId, workspaceId, false, true);
     await this.closeRecord(record, 'closed by client');
     this.auditWorkspaceOutcome(ownerId, 'workspace.closed', record, { reason: 'closed by client' });

@@ -8,7 +8,12 @@ six tools return `FORBIDDEN` unless the operator set `PACKAGES_ENABLED=true`.
 Flow: `packages_plan` (→ `packages_status` with its `resolutionId` while it
 is `RESOLVING`) → (operator approves in the Dashboard when `approval` is
 `required`) → `packages_apply` → `packages_status` until `SUCCEEDED` → recreate
-a workspace or use `bash` with `target: "toolbox"`. `packages_remove`
+a workspace with `workspace_recover({workspaceId, mode: "recreate"})` after
+finishing active work, or use `bash` with `target: "toolbox"` for owner-scoped
+packages. Recreate keeps the same workspace and package scope; do not close
+the workspace or broaden scope just to refresh a mount. It preserves the
+network profile, so `network-none` still cannot download project dependencies.
+`packages_remove`
 uninstalls.
 
 <!-- cloudharness-tool:packages_plan -->

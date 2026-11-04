@@ -58,6 +58,13 @@ Each installed package shows:
 The **history** table lists up to five previous releases, with the generation, whether
 each came from an apply or a rollback, and whether an agent or the Dashboard made it.
 
+To use a new release in an existing workspace, finish its running work and close
+shells, sessions and terminals, then ask the agent to call `workspace_recover`
+with the same `workspaceId` and `mode: "recreate"`. This keeps the checkout,
+package scope and network profile while replacing the executor. Busy workspaces
+return `CONFLICT`. Plain `resume` may reuse the old mounts; `workspace_close`
+deletes workspace data and must not be used to refresh packages.
+
 ## Rolling back
 
 **Roll back to *version*** appears on a history row whose release is still verified and on
