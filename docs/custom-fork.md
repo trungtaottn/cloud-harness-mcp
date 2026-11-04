@@ -37,6 +37,9 @@ operator recovery rather than creating an empty replacement.
 Operator artifacts are `custom/install-kata-runtime.sh`,
 `custom/prepare-vm-network.sh`, and `custom/smoke-kata-runtime.sh`. Runtime
 installation and a smoke pass alone do not activate this backend in production.
+The local operator activation on 2026-11-04 at 17:08 passed exact-image, readiness,
+VM configuration, durable pre-start guard and public stop/resume retention canary
+checks. New workspaces use Kata; existing Docker workspaces were not converted.
 
 
 ### Approved project dependency downloads
