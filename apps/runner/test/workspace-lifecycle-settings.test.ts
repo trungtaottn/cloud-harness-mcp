@@ -351,6 +351,7 @@ describe('dependency download resource reaping', () => {
 
   it('measures only retained mounts when a paused executor forces a host size probe', async () => {
     const { service, record } = activeFixture();
+    for (const name of ['tools', 'cache']) mkdirSync(join(record.workspacePath, name), { recursive: true });
     record.containerName = 'paused-executor';
     docker.runDocker.mockImplementationOnce(async () => ({
       stdout: '', stderr: 'container is paused', exitCode: 1, truncated: false
@@ -362,6 +363,15 @@ describe('dependency download resource reaping', () => {
     const helperArgs = docker.runDocker.mock.calls.find(([args]) => args[0] === 'run' && args.includes('/usr/bin/du'))![0];
     expect(helperArgs.slice(helperArgs.indexOf('--apparent-size') + 1)).toEqual(['/target/repo', '/target/tools', '/target/cache']);
     expect(helperArgs).toContain(`${record.workspacePath}:/target:ro`);
+  });
+
+  it('measures a new checkout before optional tool and cache mounts exist', async () => {
+    const { service, record } = activeFixture();
+    record.containerName = null;
+    const probe = service as unknown as { workspaceBytes: (record: WorkspaceRecord) => Promise<number | undefined> };
+    expect(await probe.workspaceBytes(record)).toBe(0);
+    const helperArgs = docker.runDocker.mock.calls.find(([args]) => args[0] === 'run' && args.includes('/usr/bin/du'))![0];
+    expect(helperArgs.slice(helperArgs.indexOf('--apparent-size') + 1)).toEqual(['/target/repo']);
   });
 
   it('skips resource measurement while dependency staging is active', async () => {

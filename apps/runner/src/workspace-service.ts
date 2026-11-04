@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
-import { chmod, chown, cp, mkdir, readFile, readdir, realpath, rm, stat, statfs, writeFile } from 'node:fs/promises';
+import { chmod, chown, cp, lstat, mkdir, readFile, readdir, realpath, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import {
   AgentProxyOperationSchema,
@@ -874,6 +874,16 @@ export class WorkspaceService {
       );
     }
     if (!result || result.exitCode !== 0) {
+      // Clone admission precedes optional mount provisioning. Missing mounts
+      // count as zero; other filesystem failures must still fail closed.
+      const measuredPaths = ['/target/repo'];
+      for (const name of ['tools', 'cache']) {
+        const entry = await lstat(join(record.workspacePath, name)).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return undefined;
+          throw error;
+        });
+        if (entry) measuredPaths.push(`/target/${name}`);
+      }
       const helperName = `chm-size-${record.id.slice(3, 15)}-${randomBytes(4).toString('hex')}`;
       try {
         result = await runDocker([
@@ -883,7 +893,7 @@ export class WorkspaceService {
           '--network', 'none', '--user', '0:0', '--read-only',
           '--pids-limit', '32', '--memory', '128m', '--memory-swap', '128m', '--cpus', '0.25',
           '--volume', `${record.workspacePath}:/target:ro`, '--entrypoint', '/usr/bin/du', this.config.executorImage,
-          '-sb', '--apparent-size', '/target/repo', '/target/tools', '/target/cache'
+          '-sb', '--apparent-size', ...measuredPaths
         ], { timeoutMs: 30_000, maxBytes: 8_192 });
       } finally {
         await removeContainer(helperName);
