@@ -10,6 +10,10 @@ approved repository into a TTL-limited executor and exposes bounded MCP tools;
 this skill grants no credentials, host/Docker/deployment authority, or permission
 to weaken network isolation.
 
+Reconnecting refreshes a client session, not the deployed server or workspace.
+Read the live tool schema, `workspace_status` and `workspace_capabilities`; newer
+skill text alone does not prove a backend or recovery mode is enabled.
+
 ## Custom persistent VM workspaces
 
 Inspect `workspace_status` first. When `executorKind` is `kata`, the workspace

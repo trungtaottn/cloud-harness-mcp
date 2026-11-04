@@ -158,6 +158,25 @@ You are using the custom fork above, based on upstream 0.80.0. Read its
 workspace lifecycle and managed-package skill references instead of assuming
 the upstream skill lists every supported mode.
 
+### Resume work after reconnecting
+
+Reconnecting does not deploy a PR, enable an executor backend, migrate an existing
+workspace, or prove that the client received the current tool schema. Keep source
+documentation, the live server contract and the client's visible catalog separate.
+
+Use `workspace_list` to rediscover the existing workspace for the intended
+repository, then inspect `workspace_status` and `workspace_capabilities` with that
+exact ID. Check tasks and interactive sessions before changing lifecycle state.
+If a list is unexpectedly empty, verify the endpoint and authenticated principal;
+do not conclude that data was deleted or create a replacement immediately.
+
+Resume stopped retained compute only through a mode present in the live schema.
+After resume, inspect Git status/HEAD and installed tool versions against the
+project's manifests before continuing tests. A lost client connection does not
+prove the last command stopped: inspect its task/operation result before retrying.
+If the client lacks a required mode, report that precise mismatch; do not invent
+tool parameters, substitute close, or promise another reconnect will fix it.
+
 Start with `workspace_status` and `workspace_capabilities`. For `instabox` or
 `kata`, install tools and dependencies directly in the guest, following its
 reported network policy. Stop compute after work and resume the same workspace
@@ -175,8 +194,8 @@ workspaces.
    the workspace. Then call `workspace_recover` with the exact workspace ID and
    `mode: "recreate"`. A busy response means inspect and finish the work first.
 4. Verify package status no longer lists that workspace as pending recreation.
-   Through `exec_run`, check `command -v pnpm` and `pnpm --version`; for the
-   current Relaw request the expected version is **10.30.1**. Confirm checkout
+   Through `exec_run`, check `command -v pnpm` and `pnpm --version` against the
+   project's declared package-manager version. Confirm checkout
    and Git state remain intact before resuming tests.
 5. A `network-none` workspace stays network-none. Use `dependencies_plan` for project dependencies, obtain Dashboard approval,
    then call `dependencies_apply` and poll `dependencies_status`. This separate
