@@ -1,5 +1,11 @@
 # Cloud Harness MCP
 
+> **Custom fork:** this branch is maintained at
+> [trungtaottn/cloud-harness-mcp · custom](https://github.com/trungtaottn/cloud-harness-mcp/tree/custom).
+> It extends upstream 0.80.0 with explicit executor recreation for managed
+> package mounts. Read [custom behavior and agent handoff](docs/custom-fork.md)
+> before following the upstream lifecycle skill.
+
 ![Cloud Harness MCP — isometric cutaway of the authenticated control plane and isolated coding workspaces](docs/assets/cloud-harness-architecture-banner.png)
 
 Cloud Harness MCP is an MIT-licensed remote coding harness exposed through
