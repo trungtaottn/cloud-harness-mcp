@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { DASHBOARD_SHELL_PATHS } from '../src/dashboard-assets.js';
 import {
   WORKSPACE_TABS, renderFinalizeDialog, renderWorkspaceAttentionPanel, renderWorkspaceCockpitHeader,
-  renderWorkspaceSummary, renderWorkspaceArtifacts, renderWorkspaceActivity, renderWorkspaceTabs, workspaceAttention,
+  renderWorkspaceIndex, renderWorkspaceSummary, renderWorkspaceArtifacts, renderWorkspaceActivity, renderWorkspaceTabs, workspaceAttention,
   renderWorkspaceUnavailableTab, workspaceHasAction, workspaceTabAvailable, workspaceLeaseState
 } from '../dashboard/dashboard-render.js';
 import { pageForPath } from '../dashboard/dashboard-pages.js';
@@ -97,6 +97,35 @@ describe('workspace cockpit', () => {
     expect(workspaceAttention(base, { now })).toEqual([]);
     // Healthy workspace: the panel says so rather than rendering an empty list.
     expect(renderWorkspaceAttentionPanel(base, { now })).toContain('Nothing needs attention right now.');
+  });
+
+  it('reports the executor backend and its declared unsupported capabilities', () => {
+    const vm = {
+      ...base,
+      executionBackend: 'incus-vm',
+      backend: {
+        kind: 'incus-vm', templateId: 'cloudharness-ubuntu-2404',
+        capabilities: { exec: 'supported', 'packages-bind': 'unsupported', 'dashboard-repo-skills': 'unsupported' }
+      }
+    };
+    const header = renderWorkspaceCockpitHeader(vm);
+    expect(header).toContain('Incus VM');
+    expect(header).toContain('cloudharness-ubuntu-2404');
+    const summary = renderWorkspaceSummary({ workspace: vm, context: {} });
+    expect(summary).toContain('Incus VM · cloudharness-ubuntu-2404');
+    expect(summary).toContain('Repository skill browsing, Package binding');
+    // Docker workspaces declare their own matrix; an absent block reads "Not reported".
+    const docker = renderWorkspaceSummary({ workspace: { ...base, executionBackend: 'docker', backend: { kind: 'docker', capabilities: { exec: 'supported' } } } });
+    expect(docker).toContain('>Docker<');
+    expect(docker).toContain('None declared');
+    const unknown = renderWorkspaceSummary({ workspace: base });
+    expect(unknown).toContain('Not reported');
+    // The list restates the same projection in both its table and card forms.
+    const dockerWorkspace = { ...base, workspaceId: `ws_${'d'.repeat(24)}`, executionBackend: 'docker', backend: { kind: 'docker', capabilities: { exec: 'supported' } } };
+    const index = renderWorkspaceIndex([vm, dockerWorkspace, base], { q: '', status: '' });
+    expect(index).toContain('>Incus VM<');
+    expect(index).toContain('>Docker<');
+    expect(index).toContain('>Not reported<');
   });
 
   it('reports only observable summary state and never invents a number', () => {

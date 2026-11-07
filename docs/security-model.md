@@ -1109,6 +1109,75 @@ and [`deploy/provisioning-proxy.mjs`](../deploy/provisioning-proxy.mjs).
 Configuration is described in
 [configuration](configuration.md#managed-toolbox).
 
+## Incus VM executor backend
+
+`workspace_open` accepts an opt-in `executionBackend: 'incus-vm'` for newly
+opened workspaces only; Docker remains the default and no workspace converts
+in place. The kind is persisted at admit and immutable afterwards, and the
+open-request fingerprint includes it only for `incus-vm`, so an omitted backend
+and an explicit `'docker'` replay pre-backend idempotency keys
+byte-identically. The runner refuses the kind with `VM_BACKEND_DISABLED`
+unless `VM_BACKEND_ENABLED` is on and the supervisor stack is wired; the
+supervisor owns admission, and its fixed v1 envelope is a length-framed,
+authenticated record stream over a Unix socket
+([`apps/vm-supervisor/src/transport.ts`](../apps/vm-supervisor/src/transport.ts)),
+not an HTTP API. Workspace identity is a deterministic `chm-vm-<hash>` name
+plus a random instance id and an external generation fence; guest-reported
+UUID/generation fields are untrusted and every mutation is fenced on the
+persisted record.
+
+What the VM boundary does and does not buy, stated plainly:
+
+- Guest root is inside the trust boundary's untrusted side. It can read
+  runtime secrets injected for a single exec and tamper with **all** guest-side
+  state, including worker files baked into the template image. There is no
+  `chattr`, read-only bind, or in-guest digest check that authenticates guest
+  files; checksums the supervisor reports are integrity signals, not
+  authenticity proofs.
+- Control credentials never enter the guest: the supervisor token, runner
+  token, GitHub App key, and database credentials stay host-side. Per-exec
+  environment is explicit and is not persisted as a durable guest env file;
+  the supervisor journals env **keys** plus a supervisor-keyed HMAC digest —
+  never raw values and never a bare SHA-256 of low-entropy secrets.
+- Network enforcement is external. The egress guard's nftables rules are the
+  authority; the guest firewall is not trusted and `Incus security.*`
+  settings are supplementary only. The guard replaces its table atomically —
+  `destroy table` plus the canonical ruleset committed in a single `nft -f`
+  transaction after `nft -c`, with no fail-open window — which requires
+  nftables ≥ 1.0.7 and kernel ≥ 6.3; below those versions `nft -c` rejects
+  the payload and every apply fails closed. Drift detection is
+  polling-bounded — it is never a zero-window guarantee — and deliberate
+  removal of every enforcement layer by host root is outside the guarantee
+  entirely.
+- Git import into a fresh VM is git-native: there is no freeze, so a
+  concurrent guest observer can see lockfile contention or intermediate merge
+  states. `.git` consistency, unpushed-work safety, and the brokered CAS path
+  are preserved; there is no freeze/observer guarantee to rely on.
+- `skills_run` and privileged exec inside a VM workspace run with **guest**
+  privileges — a documented difference from Docker's helper-container model.
+  Workspace/repository skill reads are unsupported (`dashboard-repo-skills`)
+  because they are served from a host checkout path a guest checkout cannot
+  have; owner and built-in skill directories are unaffected.
+- Post-hard-expiry recovery is an offline `vm.export` clean-check through an
+  isolated libguestfs appliance — the guest filesystem is never mounted in the
+  host kernel. `VM_UNKNOWN_STATE` workspaces are retained and never
+  auto-deleted. Stop deadlines are scheduled as an operation cutoff plus a
+  bounded, measured stop latency, not a claim of physical-instant teardown.
+
+The capability matrix the runner reports per workspace
+([`apps/runner/src/vm-capabilities.ts`](../apps/runner/src/vm-capabilities.ts))
+is the declaration seam clients check before calling an operation; it is v1
+support intent, and enforcement still lives at each real entrypoint — an
+unknown operation name never aliases `host-only`, and the runner re-checks
+every call. Two v1 capabilities are explicitly `unsupported` on `incus-vm`:
+`packages-bind` (host package mounts have no guest path) and
+`dashboard-repo-skills` (no host checkout to serve from).
+
+Owners: [`apps/runner/src/vm-capabilities.ts`](../apps/runner/src/vm-capabilities.ts),
+[`apps/runner/src/vm-supervisor-client.ts`](../apps/runner/src/vm-supervisor-client.ts),
+[`apps/vm-supervisor/`](../apps/vm-supervisor/),
+[`packages/contracts/src/executor-backend.ts`](../packages/contracts/src/executor-backend.ts).
+
 ## Decision plane
 
 The Decision Plane ([ADR 0004](adr/0004-decision-plane.md)) is a second path,

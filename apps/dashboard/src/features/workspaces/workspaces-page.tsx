@@ -12,6 +12,7 @@ import { type BffEnvelope } from '@/lib/bff-query';
 import { formatRelative } from '@/lib/format';
 import { pageReadQuery } from '@/lib/page-read';
 import { OpenWorkspaceWizard } from './open-workspace-wizard';
+import { BackendBadge } from './backend-badge';
 import { filterWorkspaces, networkLabel, repositoryName, type Workspace, WORKSPACE_STATUSES, workspaceStatusLabel } from './workspace-model';
 
 export type WorkspacesSearch = { q?: string | undefined; status?: (typeof WORKSPACE_STATUSES)[number] | undefined; expiring?: number | undefined };
@@ -28,6 +29,7 @@ const COLUMNS: DataTableColumn<Workspace>[] = [
     )
   },
   { id: 'status', header: 'State', cell: (workspace) => <StatusBadge status={workspace.status} /> },
+  { id: 'backend', header: 'Backend', cell: (workspace) => <BackendBadge workspace={workspace} />, className: 'hidden lg:table-cell whitespace-nowrap' },
   { id: 'activity', header: 'Last activity', cell: (workspace) => formatRelative(workspace.lastActivityAt), className: 'whitespace-nowrap' },
   { id: 'expires', header: 'Expires', cell: (workspace) => formatRelative(workspace.expiresAt), className: 'whitespace-nowrap' },
   { id: 'network', header: 'Network', cell: (workspace) => networkLabel(workspace.networkProfile), className: 'hidden md:table-cell whitespace-nowrap' }

@@ -18,7 +18,73 @@ export type Workspace = {
   leaseState?: string;
   availableActions?: string[];
   error?: string;
+  /** Executor backend kind, projected by the BFF from the runner's capability result. */
+  executionBackend?: string;
+  /** Structured backend block: kind, optional VM template id, and the capability matrix. */
+  backend?: {
+    kind?: string;
+    templateId?: string;
+    capabilities?: Record<string, string>;
+  };
 };
+
+export type WorkspaceBackendKind = 'docker' | 'incus-vm';
+
+/** The fields the backend helpers read; a full Workspace satisfies it, and so does a partial projection. */
+type BackendCarrier = Pick<Workspace, 'backend' | 'executionBackend'>;
+
+/**
+ * The executor backend a workspace runs on. `backend.kind` is the structured
+ * block's own claim; `executionBackend` is the flat kind. Either may be absent
+ * on an older runner — the helpers return `undefined` rather than guessing, so
+ * the UI says "Not reported" instead of implying Docker.
+ */
+export function backendKindOf(workspace: BackendCarrier | undefined): WorkspaceBackendKind | undefined {
+  const kind = workspace?.backend?.kind ?? workspace?.executionBackend;
+  return kind === 'docker' || kind === 'incus-vm' ? kind : undefined;
+}
+
+export function backendLabel(kind: WorkspaceBackendKind | undefined): string {
+  if (kind === 'incus-vm') return 'Incus VM';
+  if (kind === 'docker') return 'Docker';
+  return 'Not reported';
+}
+
+/** The template id a VM workspace was admitted with; undefined for Docker or unreported. */
+export function backendTemplateId(workspace: BackendCarrier | undefined): string | undefined {
+  const templateId = workspace?.backend?.templateId;
+  return typeof templateId === 'string' && templateId.length > 0 ? templateId : undefined;
+}
+
+/**
+ * One capability's support on this workspace's backend. Only the structured
+ * `backend.capabilities` matrix counts — a rendered tab or button never implies
+ * support, and the runner re-checks every operation server-side.
+ */
+export function backendCapability(workspace: BackendCarrier | undefined, id: string): 'supported' | 'unsupported' | undefined {
+  const value = workspace?.backend?.capabilities?.[id];
+  return value === 'supported' || value === 'unsupported' ? value : undefined;
+}
+
+const CAPABILITY_LABELS: Record<string, string> = {
+  'packages-bind': 'Package binding',
+  'dashboard-repo-skills': 'Repository skill browsing'
+};
+
+/** Operator-facing name for a capability id; unknown ids humanize rather than leak the raw key. */
+export function capabilityLabel(id: string): string {
+  const known = CAPABILITY_LABELS[id];
+  if (known) return known;
+  const words = id.replace(/[-_]+/g, ' ').trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : id;
+}
+
+/** Capability ids the backend declares unsupported, sorted for stable display. */
+export function unsupportedBackendCapabilities(workspace: BackendCarrier | undefined): string[] {
+  const capabilities = workspace?.backend?.capabilities;
+  if (!capabilities) return [];
+  return Object.keys(capabilities).filter((id) => capabilities[id] === 'unsupported').sort();
+}
 
 export const WORKSPACE_STATUSES = ['CREATING', 'ACTIVE', 'EXPIRED_RECOVERABLE', 'NETWORK_QUARANTINED', 'REAPING', 'CLOSED', 'FAILED'] as const;
 

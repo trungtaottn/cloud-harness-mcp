@@ -1,0 +1,36 @@
+[Unit]
+Description=Cloud Harness VM network guard (independent watcher)
+Documentation=https://github.com/lebear/cloudharness-vm
+# Independent of the supervisor by design: no Requires=/BindsTo= on it, so a
+# supervisor crash, wedge or restart cannot suspend enforcement. Started
+# late enough that the uplink and Incus socket exist.
+After=network-online.target docker.service incus.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+# Guard-scoped VM_* configuration. Required keys: VM_INCUS_PROJECT,
+# VM_INCUS_SOCKET (default /var/lib/incus/unix.socket), VM_GUARD_STATE_PATH
+# (default /run/cloud-harness-vm/guard-state.json), plus the shared
+# VM_BRIDGE_PATTERN / VM_SUBNET_PLAN / VM_UPLINK / VM_DNS_RESOLVERS /
+# VM_NONPUBLIC_CIDRS network plan keys.
+EnvironmentFile=-/etc/cloud-harness-vm/guard.env
+ExecStart=/usr/bin/node /opt/cloud-harness-vm/repo/apps/vm-supervisor/dist/network/live.js
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+# The guard needs CAP_NET_ADMIN (nft/iptables/ip/sysctl) and Incus socket
+# access; it must NOT gain privileges it does not need.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/run/cloud-harness-vm /var/lib/cloud-harness-vm
+# If VM_GUARD_STATE_PATH or the claims sibling live outside those two
+# directories, add a drop-in with the matching ReadWritePaths entry.
+
+[Install]
+WantedBy=multi-user.target

@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { DEFAULT_MAX_ACTIVE_WORKSPACES_PER_OWNER, DEFAULT_RECOVERABLE_GRACE_SECONDS, RunnerPrincipalSelectorSchema, type ExecutorNetworkProfile } from '@cloud-harness/contracts';
+import { DEFAULT_MAX_ACTIVE_WORKSPACES_PER_OWNER, DEFAULT_RECOVERABLE_GRACE_SECONDS, ExecutorBackendKindSchema, RunnerPrincipalSelectorSchema, VmInstanceIdSchema, VmNameSchema, VmTemplateDigestSchema, VmTemplateIdSchema, type ExecutorBackendKind, type ExecutorNetworkProfile } from '@cloud-harness/contracts';
 import { emitTaskTerminalEvent, isTerminalTaskStatus, withEventSavepoint } from './event-outbox.js';
 import type { EncryptedSecret } from './secret-keyring.js';
 import {
@@ -176,9 +176,28 @@ export type WorkspaceRecord = {
   expiredAt?: number | null;
   /** When the reaper may next try to auto-close the recoverable record; cleared with `expiredAt`. */
   recoverableUntil?: number | null;
+  /**
+   * Executor backend this workspace runs on. Written once at admit; rows predating
+   * the VM backend read back as `'docker'`. Optional on the write path so existing
+   * construction sites keep compiling; reads always populate it.
+   */
+  backendKind?: ExecutorBackendKind;
+  /** incus-vm only: deterministic DNS-safe VM name `chm-vm-<sha256(workspaceId)[:32]>`, assigned at admit. */
+  vmName?: string | null;
+  /** incus-vm only: random UUIDv4 assigned at admit and persisted before any Incus call. */
+  backendInstanceId?: string | null;
+  /** incus-vm only: template identity the VM was created from, persisted at admit. */
+  templateId?: string | null;
+  templateDigest?: string | null;
 };
 
-/** Changes a fenced lifecycle write may apply to one workspace row. */
+/**
+ * Fields a fenced lifecycle write may change. Backend identity fields
+ * (`backendKind`, `vmName`, `backendInstanceId`, `templateId`, `templateDigest`)
+ * are deliberately absent: they are written once inside `create()`/`admit()` and
+ * no generic update path can rewrite executor identity. The claim* statements
+ * use fixed column lists that never name them either.
+ */
 type FencedWorkspaceChanges = Partial<Pick<WorkspaceRecord, 'containerName' | 'status' | 'lastActivityAt' | 'expiresAt' | 'generation' | 'error' | 'expiredAt' | 'recoverableUntil'>>;
 
 /** Dashboard overrides of the workspace lifecycle policy. `null` means the runner configuration applies. */
@@ -300,6 +319,8 @@ type Row = {
   generation: number; error: string | null; request_fingerprint?: string | null;
   idle_ttl_seconds?: number | null; recoverable_grace_seconds?: number | null;
   expired_at?: number | null; recoverable_until?: number | null;
+  backend_kind?: string | null; vm_name?: string | null; backend_instance_id?: string | null;
+  template_id?: string | null; template_digest?: string | null;
 };
 
 /**
@@ -342,6 +363,18 @@ function withRecoverableWindow(current: WorkspaceRecord, changes: Partial<Worksp
   return next;
 }
 
+/**
+ * A persisted `backend_kind` that is not a known executor backend is corrupt state,
+ * not a docker workspace: silently reading it as docker could run Docker operations
+ * against a VM record, so the read fails closed instead.
+ */
+function parseBackendKind(value: string | null | undefined): ExecutorBackendKind {
+  if (value === undefined || value === null || value === '') return 'docker';
+  const parsed = ExecutorBackendKindSchema.safeParse(value);
+  if (!parsed.success) throw new Error(`invalid persisted backend_kind: ${value}`);
+  return parsed.data;
+}
+
 const fromRow = (row: Row): WorkspaceRecord => ({
   id: row.id, ownerId: row.owner_id, idempotencyKey: row.idempotency_key, repositoryUrl: row.repository_url,
   repositoryRef: row.repository_ref, containerName: row.container_name, workspacePath: row.workspace_path,
@@ -355,7 +388,12 @@ const fromRow = (row: Row): WorkspaceRecord => ({
   idleTtlSeconds: row.idle_ttl_seconds ?? null,
   recoverableGraceSeconds: row.recoverable_grace_seconds ?? null,
   expiredAt: row.expired_at ?? null,
-  recoverableUntil: row.recoverable_until ?? null
+  recoverableUntil: row.recoverable_until ?? null,
+  backendKind: parseBackendKind(row.backend_kind),
+  vmName: row.vm_name ?? null,
+  backendInstanceId: row.backend_instance_id ?? null,
+  templateId: row.template_id ?? null,
+  templateDigest: row.template_digest ?? null
 });
 
 /**
@@ -485,6 +523,25 @@ export class StateStore {
     if (!cols.includes('request_fingerprint')) {
       this.database.exec('ALTER TABLE workspaces ADD COLUMN request_fingerprint TEXT;');
     }
+    // Backend identity columns must exist before migratePrincipalSchema: the fixed
+    // workspaces_v5/workspaces_v6 rebuild lists SELECT them, so every database at
+    // any schema version needs them present first. Existing rows backfill to
+    // backend_kind='docker' with NULL identity fields.
+    if (!cols.includes('backend_kind')) {
+      this.database.exec("ALTER TABLE workspaces ADD COLUMN backend_kind TEXT NOT NULL DEFAULT 'docker' CHECK(backend_kind IN ('docker','incus-vm'));");
+    }
+    if (!cols.includes('vm_name')) {
+      this.database.exec('ALTER TABLE workspaces ADD COLUMN vm_name TEXT;');
+    }
+    if (!cols.includes('backend_instance_id')) {
+      this.database.exec('ALTER TABLE workspaces ADD COLUMN backend_instance_id TEXT;');
+    }
+    if (!cols.includes('template_id')) {
+      this.database.exec('ALTER TABLE workspaces ADD COLUMN template_id TEXT;');
+    }
+    if (!cols.includes('template_digest')) {
+      this.database.exec('ALTER TABLE workspaces ADD COLUMN template_digest TEXT;');
+    }
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS workspace_secret_snapshots (
         workspace_id TEXT NOT NULL,
@@ -556,10 +613,31 @@ export class StateStore {
     return row.value;
   }
 
+  /**
+   * Backend identity is write-once at admit. A docker record must not carry VM
+   * identity fields, and an incus-vm record must carry the complete immutable
+   * identity (deterministic vm name, random instance id, template id + digest)
+   * in the exact persisted formats — before any Incus call can happen.
+   */
+  private assertBackendIdentity(record: WorkspaceRecord): void {
+    const kind = record.backendKind ?? 'docker';
+    if (kind === 'docker') {
+      if (record.vmName != null || record.backendInstanceId != null || record.templateId != null || record.templateDigest != null) {
+        throw new Error('docker workspace records cannot carry VM identity fields');
+      }
+      return;
+    }
+    VmNameSchema.parse(record.vmName);
+    VmInstanceIdSchema.parse(record.backendInstanceId);
+    VmTemplateIdSchema.parse(record.templateId);
+    VmTemplateDigestSchema.parse(record.templateDigest);
+  }
+
   create(record: WorkspaceRecord): void {
+    this.assertBackendIdentity(record);
     this.database.prepare(`INSERT INTO workspaces
-      (id, owner_id, idempotency_key, repository_url, repository_ref, container_name, workspace_path, environment_id, status, network_profile, created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, generation, error, request_fingerprint, idle_ttl_seconds, recoverable_grace_seconds, expired_at, recoverable_until)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      (id, owner_id, idempotency_key, repository_url, repository_ref, container_name, workspace_path, environment_id, status, network_profile, created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, generation, error, request_fingerprint, idle_ttl_seconds, recoverable_grace_seconds, expired_at, recoverable_until, backend_kind, vm_name, backend_instance_id, template_id, template_digest)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         record.id,
         record.ownerId,
@@ -584,7 +662,12 @@ export class StateStore {
         record.idleTtlSeconds ?? null,
         record.recoverableGraceSeconds ?? null,
         record.expiredAt ?? null,
-        record.recoverableUntil ?? null
+        record.recoverableUntil ?? null,
+        record.backendKind ?? 'docker',
+        record.vmName ?? null,
+        record.backendInstanceId ?? null,
+        record.templateId ?? null,
+        record.templateDigest ?? null
       );
   }
 
@@ -648,6 +731,19 @@ export class StateStore {
   /** Counts the workspaces currently occupying one owner's active slots. */
   countOwnerCountedWorkspaces(ownerId: string): number {
     return countOwnerCountedWorkspacesInDb(this.database, ownerId);
+  }
+
+  /**
+   * Counts workspaces of one executor backend that occupy — or may still occupy —
+   * an active slot: the counted statuses plus `REAPING`, whose VM can still be
+   * running until the supervisor confirms the stop. This is an early UX pre-check
+   * only; supervisor admission remains the authoritative gate.
+   */
+  countActiveByBackend(backendKind: ExecutorBackendKind): number {
+    const row = this.database.prepare(`SELECT COUNT(*) AS count FROM workspaces
+      WHERE backend_kind = ? AND status IN (${ENUMERATED_WORKSPACE_STATUS_PARAMS})`)
+      .get(backendKind, ...ENUMERATED_WORKSPACE_STATUSES) as { count: number } | undefined;
+    return row?.count ?? 0;
   }
 
   saveSecretSnapshot(
@@ -1012,7 +1108,11 @@ export class StateStore {
   private migrateWorkspaceLifecycleColumns(): void {
     const columns = new Set((this.database.prepare('PRAGMA table_info(workspaces)').all() as { name: string }[]).map((c) => c.name));
     for (const [name, type] of [
-      ['idle_ttl_seconds', 'INTEGER'], ['recoverable_grace_seconds', 'INTEGER'], ['expired_at', 'INTEGER'], ['recoverable_until', 'INTEGER']
+      ['idle_ttl_seconds', 'INTEGER'], ['recoverable_grace_seconds', 'INTEGER'], ['expired_at', 'INTEGER'], ['recoverable_until', 'INTEGER'],
+      // Executor backend identity: added here as well as in the pre-migration block and both
+      // principal-schema rebuild lists, so a database rebuilt at any point keeps them.
+      ['backend_kind', "TEXT NOT NULL DEFAULT 'docker' CHECK(backend_kind IN ('docker','incus-vm'))"],
+      ['vm_name', 'TEXT'], ['backend_instance_id', 'TEXT'], ['template_id', 'TEXT'], ['template_digest', 'TEXT']
     ] as const) {
       if (!columns.has(name)) this.database.exec(`ALTER TABLE workspaces ADD COLUMN ${name} ${type};`);
     }

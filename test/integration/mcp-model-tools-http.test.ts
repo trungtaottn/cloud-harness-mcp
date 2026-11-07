@@ -23,7 +23,7 @@ import type { WorkspaceService } from '../../apps/runner/src/workspace-service.j
 
 const bearer = 'integration-bearer-token-longer-than-32-characters';
 const serviceToken = 'runner-token-that-is-longer-than-32-characters';
-const SENTINEL_KEY = 'sk-sentinel-http-model-key-0123456789';
+const SENTINEL_KEY = 'sentinel-http-model-key-fixture-not-real';
 // The API forwards a bearer caller as the configured owner.
 const owner = { kind: 'owner' as const, ownerId: 'owner' };
 
@@ -190,7 +190,7 @@ describe('model tools over MCP HTTP', () => {
     const before = metadata.listAudit(store.resolvePrincipal(owner), 500).length;
     const result = await client.callTool({
       name: 'model_profile_create',
-      arguments: { profileId: 'other', apiKey: 'sk-not-accepted', idempotencyKey: 'http-create-key-2' }
+      arguments: { profileId: 'other', apiKey: 'not-accepted-fixture-key', idempotencyKey: 'http-create-key-2' }
     });
     transcripts.push(result);
     expect(result.isError).toBe(true);

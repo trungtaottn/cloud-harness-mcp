@@ -34,6 +34,33 @@ or target filenames already belong to another service. If this project was
 previously installed, back up those two exact files/symlinks before continuing
 instead of treating failed `test` commands as permission to overwrite them.
 
+### Optional: Incus VM executor backend
+
+The `incus-vm` workspace backend is opt-in and stays off until an operator
+enables it; it changes nothing for Docker workspaces. Enabling it is a live,
+owner-authorized operation with host prerequisites beyond this runbook's
+scope: an Incus install with the extension-gated build, the VM supervisor and
+egress-guard systemd units, a dedicated storage pool, and the opt-in
+`compose.vm.yaml` overlay that mounts the supervisor socket into the runner —
+the default Compose stack never sees `/run/cloud-harness-vm`. Include it after
+the base files: `docker compose -f compose.yaml -f compose.vm.yaml up -d` for
+development, and append `-f compose.vm.yaml` after `compose.production.yaml`
+in production. The egress guard additionally
+requires **nftables ≥ 1.0.7 and kernel ≥ 6.3**: it replaces its nft table
+atomically (`destroy table` plus the canonical ruleset in a single `nft -f`
+transaction after `nft -c`), and `destroy` is rejected on older hosts, so
+every apply fails closed. Verify the host's `nft --version` and kernel
+release live before enabling — these docs describe the source contract, not a
+completed deployment. Runner-side keys
+(`VM_BACKEND_ENABLED`, `VM_SUPERVISOR_SOCKET`, `VM_SUPERVISOR_TOKEN`,
+`VM_TEMPLATE_ID`, `VM_TEMPLATE_DIGEST`, and the sizing/admission bounds) are
+described in [configuration](configuration.md#incus-vm-executor-backend-opt-in);
+the supervisor's own Incus/pool/guard configuration lives with
+[`apps/vm-supervisor/`](../apps/vm-supervisor/) and its units under
+`deploy/vm-supervisor/`. Do not enable the backend on a host that has not completed those
+steps — `workspace_open` with `executionBackend: 'incus-vm'` then fails closed
+with `VM_BACKEND_DISABLED` or `VM_SUPERVISOR_UNAVAILABLE`.
+
 ## First install
 
 From a reviewed checkout:

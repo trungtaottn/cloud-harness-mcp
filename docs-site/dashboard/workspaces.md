@@ -10,6 +10,7 @@ The Workspaces panel lists all currently active and recently closed workspace en
 ## Workspace Management
 
 - **Status Indicators:** View workspace lifecycle phase (`ready`, `busy`, `closed`, `error`).
+- **Backend:** The list and cockpit show which executor backend runs the workspace — **Docker** (the default) or **Incus VM** (opt-in, operator-enabled). The Summary tab also lists capabilities the backend declares unsupported; on an Incus VM workspace that currently includes host package binding and repository skill browsing, and the runner refuses those operations rather than the UI implying support.
 - **TTL Countdown:** Inspect remaining wall-clock TTL and idle timer before automatic cleanup.
 - **Resource Details:** Check memory limits, container status, and the effective network profile (`dependency-access` or `network-none`).
 - **Force Close:** Immediately terminate a stuck container and permanently purge all temporary workspace files from the host disk.

@@ -1,0 +1,63 @@
+# Guest package set for the cloudharness-vm Debian 13 template.
+# One package per line; '#' starts a comment. Applied inside the build VM
+# with `apt-get install --no-install-recommends`, so anything the worker or
+# the scope tool list needs must be named explicitly (the pilot already lost
+# docker-cli to --no-install-recommends once).
+
+# --- executor parity (docker/executor.Dockerfile tool surface) ---
+bash
+ca-certificates
+curl
+git
+jq
+less
+patch
+procps
+ripgrep
+sudo
+universal-ctags
+vim
+openssh-client
+gnupg
+
+# --- common dev conveniences ---
+iproute2
+unzip
+zip
+xz-utils
+zstd
+sqlite3
+file
+tmux
+
+# --- build tooling (scope: Go/C build, Python) ---
+build-essential
+pkg-config
+cmake
+autoconf
+automake
+libtool
+flex
+bison
+python3
+python3-pip
+python3-venv
+python3-dev
+golang-go
+
+# --- guest isolation/runtime features (scope) ---
+bubblewrap
+iptables
+nftables
+
+# --- guest Docker + Compose (scope) ---
+# docker-cli, docker-buildx and docker-compose-v2 are Recommends of
+# docker.io, not Depends — they must be listed explicitly.
+docker.io
+docker-cli
+docker-buildx
+docker-compose-v2
+
+# --- database clients (scope: PostgreSQL client libs) ---
+postgresql-client
+libpq-dev

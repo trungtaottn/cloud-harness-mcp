@@ -184,7 +184,7 @@ describe('MCP gateway control operations', () => {
 
   it('enforces the credential purpose matrix and never leaks a value', async () => {
     const { controls } = setup();
-    const secret = 'ghp_A1b2C3d4E5f6G7h8I9j0K1l2';
+    const secret = 'fake-downstream-pat-fixture-value';
     await controls.execute(request('global_secret_create', { name: 'DOWNSTREAM_PAT', value: secret, expectedGeneration: 0 }));
     const server = await createServer(controls, {
       name: 'github',
@@ -274,8 +274,8 @@ describe('MCP gateway control operations', () => {
 
   it('returns the rotated plaintext after a global secret rotation', async () => {
     const { controls } = setup();
-    const first = 'ghp_firstSecretValue12345';
-    const second = 'ghp_secondSecretValue6789';
+    const first = 'first-secret-fixture-value';
+    const second = 'second-secret-fixture-value';
     await controls.execute(request('global_secret_create', { name: 'DOWNSTREAM_PAT', value: first, expectedGeneration: 0 }));
     const server = await createServer(controls, {
       name: 'github',

@@ -18,6 +18,7 @@ network isolation.
 | Install the skill, connect a client, use the MCP gateway surface, or understand trust boundaries | [Installation and security](references/installation-and-security.md) |
 | Choose a tool and locate its detailed contract | [Tool reference index](references/tool-reference.md) |
 | Open, recover, inspect, or close a workspace; interpret results/errors | [Workspace lifecycle and results](references/workspace-lifecycle-and-results.md) |
+| Select the Docker vs Incus VM executor backend or read its capability matrix | [Executor backend](references/executor-backend.md) |
 | List, read, write, patch, move, delete, grep, or search symbols | [Files and search](references/files-and-search.md) |
 | Run a command, interactive shell, coding session, or dependency task | [Execution and tasks](references/execution-and-tasks.md) |
 | Install, update, roll back, or uninstall a durable CLI tool for every workspace | [Managed packages](references/managed-packages.md) |
@@ -123,6 +124,23 @@ poll `tasks_status`, `operation_wait`, or `agent_status` instead.
    require operator-pinned registry key material and a stored licence token, are
    always `owner`-scoped, and fail closed with an actionable error when either is
    missing. Never pass a credential in a tool argument.
+   **Executor backend.** `workspace_open` accepts an optional
+   `executionBackend: 'docker' | 'incus-vm'`. Docker is the default; `incus-vm`
+   is opt-in for newly opened workspaces only (no in-place conversion) and only
+   works when the operator enabled it — otherwise the call fails with
+   `VM_BACKEND_DISABLED`. Omitting the parameter and passing `'docker'` are
+   idempotent-equivalent. Workspace results carry `executionBackend` and a
+   `backend.capabilities` matrix; check it before calling an operation. On
+   `incus-vm`, `packages-bind` and workspace/repository skill reads
+   (`dashboard-repo-skills`) are unsupported and fail with
+   `VM_CAPABILITY_UNSUPPORTED` — open a Docker workspace for those. VM errors:
+   `VM_QUOTA_EXCEEDED` (single-VM bound), `VM_UNKNOWN_STATE` and
+   `VM_SUPERVISOR_UNAVAILABLE` (retryable — reconcile via `workspace_status`
+   first), `VM_GENERATION_MISMATCH`/`VM_IDENTITY_MISMATCH` (409, refetch),
+   `VM_ATTESTATION_FAILED`, `VM_BACKEND_DISABLED` (terminal). Guest root can
+   read injected per-exec secrets and tamper with guest-side state; control
+   credentials never enter the guest. Details:
+   [Executor backend](references/executor-backend.md).
 2. **Open and set active context.** Call `workspace_open` with a fresh
    idempotency key. Preserve the returned opaque `workspaceId` exactly. A
    principal may hold several concurrent workspaces, bounded by the instance's

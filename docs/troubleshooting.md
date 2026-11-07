@@ -133,6 +133,32 @@ Never paste tokens, authorization codes, or callback URLs carrying `code` or
 - Private clone failure requires all GitHub App settings, installation access
   to the repository, and a valid PEM key. The optional path is not considered
   live-verified merely because configuration loads.
+- `VM_BACKEND_DISABLED` on `workspace_open` means `executionBackend:
+  'incus-vm'` was requested but the operator has not enabled the backend (or
+  the runner cannot resolve its supervisor stack). Docker workspaces are
+  unaffected; ask the operator to enable it per
+  [configuration](configuration.md#incus-vm-executor-backend-opt-in) or open
+  without the parameter.
+- `VM_CAPABILITY_UNSUPPORTED` means the operation is declared unsupported on
+  that workspace's backend — on `incus-vm` v1 that is `packages-bind` and
+  workspace/repository skill reads (`dashboard-repo-skills`). Open a Docker
+  workspace for those operations.
+- `VM_QUOTA_EXCEEDED` means the single-VM admission bound is full; close the
+  active VM workspace or wait for it to expire.
+- `VM_UNKNOWN_STATE` and `VM_SUPERVISOR_UNAVAILABLE` are retryable: reconcile
+  with `workspace_status` first — `VM_UNKNOWN_STATE` means a mutation's outcome
+  is unknown and the record is retained, never auto-deleted.
+- `VM_GENERATION_MISMATCH`/`VM_IDENTITY_MISMATCH` (409) mean the workspace's
+  identity or generation fence moved; refetch `workspace_status` rather than
+  replaying the mutation.
+- `VM_ATTESTATION_FAILED` means the supervisor could not verify the VM
+  against the pinned template digest; treat the workspace as suspect and
+  contact the operator — do not retry blindly. One operator-side cause is a
+  host below the guard's floor (**nftables ≥ 1.0.7, kernel ≥ 6.3**): the
+  guard's atomic `destroy table` + canonical `nft -f` commit is rejected by
+  `nft -c` there, so attestation can never pass. Check
+  `journalctl -u cloud-harness-vm-guard.service` for `nft` apply failures and
+  confirm `nft --version`/`uname -r` on the host.
 - In Access mode, GitHub login is not repository authorization. If the
   dashboard shows no grant, complete the principal-bound GitHub App setup:
   **Connect GitHub App**, then authorize with GitHub as the installation's

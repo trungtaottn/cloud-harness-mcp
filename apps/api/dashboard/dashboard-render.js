@@ -4,6 +4,29 @@ const escape = (value) => String(value ?? '').replace(/[&<>'"]/g, (character) =>
 export const escapeHtml = escape;
 const statusLabel = (status) => ({ CREATING: 'Creating', ACTIVE: 'Active', REAPING: 'Closing', CLOSED: 'Closed', FAILED: 'Failed', NETWORK_QUARANTINED: 'Quarantined' })[status] ?? 'Unknown';
 const networkLabel = (profile) => profile === 'dependency-access' ? 'Dependency access' : profile === 'local-host' ? 'Local host' : 'No network';
+// Executor backend display, mirroring the React model in
+// apps/dashboard/src/features/workspaces/workspace-model.ts. The badge only
+// restates the runner's projection; an absent kind reads "Not reported" rather
+// than implying Docker, and capabilities come only from backend.capabilities —
+// a rendered control never grants one.
+const backendKindOf = (workspace) => {
+  const kind = workspace?.backend?.kind ?? workspace?.executionBackend;
+  return kind === 'docker' || kind === 'incus-vm' ? kind : undefined;
+};
+const backendLabel = (kind) => kind === 'incus-vm' ? 'Incus VM' : kind === 'docker' ? 'Docker' : 'Not reported';
+const backendTemplateId = (workspace) => {
+  const templateId = workspace?.backend?.templateId;
+  return typeof templateId === 'string' && templateId.length > 0 ? templateId : undefined;
+};
+const backendSummary = (workspace) => `${backendLabel(backendKindOf(workspace))}${backendTemplateId(workspace) ? ` · ${backendTemplateId(workspace)}` : ''}`;
+const capabilityLabel = (id) => ({ 'packages-bind': 'Package binding', 'dashboard-repo-skills': 'Repository skill browsing' })[id]
+  ?? id.replace(/[-_]+/g, ' ').replace(/^./, (character) => character.toUpperCase());
+const unsupportedBackendCapabilities = (workspace) => {
+  const capabilities = workspace?.backend?.capabilities;
+  return capabilities && typeof capabilities === 'object'
+    ? Object.keys(capabilities).filter((id) => capabilities[id] === 'unsupported').sort()
+    : [];
+};
 const time = (value) => `<time datetime="${escape(value)}">${escape(new Date(value).toLocaleString())}</time>`;
 
 /**
@@ -82,9 +105,9 @@ export function renderWorkspaceIndex(workspaces, query) {
   });
   if (!workspaces.length) return '<h2 id="workspace-list-heading">Workspace list</h2><div class="empty"><h3>No workspaces yet.</h3><p>Open one from an MCP client and it will appear here.</p></div>';
   if (!filtered.length) return '<h2 id="workspace-list-heading">Workspace list</h2><div class="empty"><h3>No workspaces match these filters.</h3><button id="clear-filters" type="button">Clear filters</button></div>';
-  const rows = filtered.map((workspace) => `<tr><th scope="row"><a href="/dashboard/workspaces/${encodeURIComponent(workspace.workspaceId)}">${escape(repositoryName(workspace.repositoryUrl))}</a><small class="mono">${escape(workspace.workspaceId)}</small></th><td><span class="status ${escape(workspace.status.toLowerCase())}">${statusLabel(workspace.status)}</span></td><td>${time(workspace.lastActivityAt)}</td><td>${time(workspace.expiresAt)}</td><td>${networkLabel(workspace.networkProfile)}</td></tr>`).join('');
-  const cards = filtered.map((workspace) => `<li><h3><a href="/dashboard/workspaces/${encodeURIComponent(workspace.workspaceId)}">${escape(repositoryName(workspace.repositoryUrl))}</a></h3><dl><dt>State</dt><dd>${statusLabel(workspace.status)}</dd><dt>Last activity</dt><dd>${time(workspace.lastActivityAt)}</dd><dt>Expires</dt><dd>${time(workspace.expiresAt)}</dd></dl></li>`).join('');
-  return `<h2 id="workspace-list-heading">Workspace list</h2><div class="desktop-table"><table><caption>${filtered.length} workspaces</caption><thead><tr><th>Repository</th><th>State</th><th>Last activity</th><th>Expires</th><th>Network</th></tr></thead><tbody>${rows}</tbody></table></div><ul class="mobile-list">${cards}</ul>`;
+  const rows = filtered.map((workspace) => `<tr><th scope="row"><a href="/dashboard/workspaces/${encodeURIComponent(workspace.workspaceId)}">${escape(repositoryName(workspace.repositoryUrl))}</a><small class="mono">${escape(workspace.workspaceId)}</small></th><td><span class="status ${escape(workspace.status.toLowerCase())}">${statusLabel(workspace.status)}</span></td><td><span class="tag-badge">${escape(backendLabel(backendKindOf(workspace)))}</span></td><td>${time(workspace.lastActivityAt)}</td><td>${time(workspace.expiresAt)}</td><td>${networkLabel(workspace.networkProfile)}</td></tr>`).join('');
+  const cards = filtered.map((workspace) => `<li><h3><a href="/dashboard/workspaces/${encodeURIComponent(workspace.workspaceId)}">${escape(repositoryName(workspace.repositoryUrl))}</a></h3><dl><dt>State</dt><dd>${statusLabel(workspace.status)}</dd><dt>Backend</dt><dd>${escape(backendSummary(workspace))}</dd><dt>Last activity</dt><dd>${time(workspace.lastActivityAt)}</dd><dt>Expires</dt><dd>${time(workspace.expiresAt)}</dd></dl></li>`).join('');
+  return `<h2 id="workspace-list-heading">Workspace list</h2><div class="desktop-table"><table><caption>${filtered.length} workspaces</caption><thead><tr><th>Repository</th><th>State</th><th>Backend</th><th>Last activity</th><th>Expires</th><th>Network</th></tr></thead><tbody>${rows}</tbody></table></div><ul class="mobile-list">${cards}</ul>`;
 }
 
 /** Contextual workspace sections. These are never global rail entries. */
@@ -185,7 +208,7 @@ export function renderWorkspaceCockpitHeader(workspace, options = {}) {
   const actions = canOpen
     ? '<div class="cockpit-actions"><a class="secondary button" href="/dashboard/workspaces">Open new workspace</a></div>'
     : `<div class="cockpit-actions">${primaryActions}${secondaryActions ? `<details class="row-edit"><summary>More actions</summary>${secondaryActions}</details>` : ''}</div>`;
-  return `<div class="cockpit-header"><div class="record-heading"><div><h2 id="workspace-detail-title">${escape(repositoryName(workspace.repositoryUrl))}</h2><p>${renderCopyChip({ value: workspace.workspaceId, label: 'Workspace ID' })}</p></div><span class="status ${escape(String(workspace.status ?? '').toLowerCase())}">${escape(statusLabel(workspace.status))}</span></div><dl class="facts"><dt>Ref</dt><dd>${escape(workspace.ref ?? 'Default branch')}</dd><dt>Network</dt><dd>${escape(networkLabel(workspace.networkProfile))}</dd><dt>Lease</dt><dd class="lease-${escape(lease.state)}">${escape(lease.label)}</dd><dt>Attention</dt><dd>${attention.length ? `${escape(attention.length)} item(s) need action` : 'Nothing needs attention'}</dd></dl>${actions}</div>`;
+  return `<div class="cockpit-header"><div class="record-heading"><div><h2 id="workspace-detail-title">${escape(repositoryName(workspace.repositoryUrl))}</h2><p>${renderCopyChip({ value: workspace.workspaceId, label: 'Workspace ID' })}</p></div><span class="status ${escape(String(workspace.status ?? '').toLowerCase())}">${escape(statusLabel(workspace.status))}</span> <span class="tag-badge">${escape(backendLabel(backendKindOf(workspace)))}</span></div><dl class="facts"><dt>Ref</dt><dd>${escape(workspace.ref ?? 'Default branch')}</dd><dt>Backend</dt><dd>${escape(backendSummary(workspace))}</dd><dt>Network</dt><dd>${escape(networkLabel(workspace.networkProfile))}</dd><dt>Lease</dt><dd class="lease-${escape(lease.state)}">${escape(lease.label)}</dd><dt>Attention</dt><dd>${attention.length ? `${escape(attention.length)} item(s) need action` : 'Nothing needs attention'}</dd></dl>${actions}</div>`;
 }
 
 export function renderWorkspaceTabs(workspaceId, current) {
@@ -209,7 +232,11 @@ export function renderWorkspaceSummary({ workspace, context, options = {} }) {
   const manifest = context?.manifest ?? {};
   const capabilities = Object.entries(context?.capabilities ?? {}).filter(([, value]) => value === true).map(([key]) => escape(key)).join(', ');
   const itemCount = Number.isFinite(manifest.itemCount) ? `${escape(manifest.itemCount)} attributable item(s)${manifest.truncated === true ? ' (truncated)' : ''}` : 'Not reported';
-  return `${renderWorkspaceAttentionPanel(workspace, options)}<section class="panel" aria-labelledby="summary-heading"><h2 id="summary-heading">Summary</h2><dl class="facts"><dt>Status</dt><dd>${escape(statusLabel(workspace.status))}</dd><dt>Branch</dt><dd>${escape(context?.branch ?? workspace.ref ?? 'Default branch')}</dd><dt>Repository context</dt><dd>${itemCount}</dd><dt>Capabilities</dt><dd>${capabilities || 'Not reported'}</dd><dt>Network posture</dt><dd>${escape(networkLabel(workspace.networkProfile))}</dd><dt>Cost used</dt><dd>Not reported for workspaces yet</dd></dl><p class="page-note">Cost, budget, agent and task counts arrive with the phases that expose them; this panel never invents a number.</p></section>`;
+  const unsupported = unsupportedBackendCapabilities(workspace);
+  const unsupportedSummary = workspace?.backend?.capabilities
+    ? (unsupported.length ? unsupported.map((id) => escape(capabilityLabel(id))).join(', ') : 'None declared')
+    : 'Not reported';
+  return `${renderWorkspaceAttentionPanel(workspace, options)}<section class="panel" aria-labelledby="summary-heading"><h2 id="summary-heading">Summary</h2><dl class="facts"><dt>Status</dt><dd>${escape(statusLabel(workspace.status))}</dd><dt>Backend</dt><dd>${escape(backendSummary(workspace))}</dd><dt>Branch</dt><dd>${escape(context?.branch ?? workspace.ref ?? 'Default branch')}</dd><dt>Repository context</dt><dd>${itemCount}</dd><dt>Capabilities</dt><dd>${capabilities || 'Not reported'}</dd><dt>Not supported on this backend</dt><dd>${unsupportedSummary}</dd><dt>Network posture</dt><dd>${escape(networkLabel(workspace.networkProfile))}</dd><dt>Cost used</dt><dd>Not reported for workspaces yet</dd></dl><p class="page-note">Cost, budget, agent and task counts arrive with the phases that expose them; this panel never invents a number.</p></section>`;
 }
 
 /** Tabs are all backed by real adapters, so the cockpit never renders a placeholder.
@@ -1057,7 +1084,7 @@ export function renderWorkspaceDetail(workspace, dedicated = false, modal = fals
   const heading = dedicated ? 'h1' : 'h2';
   const warning = workspace.networkProfile === 'dependency-access' ? '<p class="warning">Executor network access is enabled for this workspace (public DNS/HTTP/HTTPS).</p>' : '';
   const close = modal ? '<button id="close-detail" class="drawer-close" type="button">Close workspace details</button>' : '';
-  return `${close}<${heading} id="workspace-detail-title">${escape(repositoryName(workspace.repositoryUrl))}</${heading}><p class="mono wrap">${escape(workspace.workspaceId)}</p><span class="status ${escape(workspace.status.toLowerCase())}">${statusLabel(workspace.status)}</span><ol class="lifecycle" aria-label="Workspace lifecycle"><li><strong>Created</strong>${time(workspace.createdAt)}</li><li><strong>Last activity</strong>${time(workspace.lastActivityAt)}</li><li><strong>Expires</strong>${time(workspace.expiresAt)}</li></ol><dl class="facts"><dt>Repository</dt><dd class="wrap">${escape(workspace.repositoryUrl)}</dd><dt>Ref</dt><dd>${escape(workspace.ref ?? 'Default branch')}</dd><dt>Network</dt><dd>${networkLabel(workspace.networkProfile)}</dd></dl>${warning}<nav class="detail-actions" aria-label="Workspace sections"><a href="/dashboard/workspaces/${encodeURIComponent(workspace.workspaceId)}/files">Files</a><a href="/dashboard/workspaces/${encodeURIComponent(workspace.workspaceId)}/runtime">Runtime</a></nav><div class="danger-zone"><button id="close-workspace" class="danger" type="button" ${workspace.version ? '' : 'disabled'}>Close workspace</button>${workspace.version ? '' : '<p>Close is unavailable until lifecycle fencing is ready.</p>'}</div>`;
+  return `${close}<${heading} id="workspace-detail-title">${escape(repositoryName(workspace.repositoryUrl))}</${heading}><p class="mono wrap">${escape(workspace.workspaceId)}</p><span class="status ${escape(workspace.status.toLowerCase())}">${statusLabel(workspace.status)}</span><ol class="lifecycle" aria-label="Workspace lifecycle"><li><strong>Created</strong>${time(workspace.createdAt)}</li><li><strong>Last activity</strong>${time(workspace.lastActivityAt)}</li><li><strong>Expires</strong>${time(workspace.expiresAt)}</li></ol><dl class="facts"><dt>Repository</dt><dd class="wrap">${escape(workspace.repositoryUrl)}</dd><dt>Ref</dt><dd>${escape(workspace.ref ?? 'Default branch')}</dd><dt>Backend</dt><dd>${escape(backendSummary(workspace))}</dd><dt>Network</dt><dd>${networkLabel(workspace.networkProfile)}</dd></dl>${warning}<nav class="detail-actions" aria-label="Workspace sections"><a href="/dashboard/workspaces/${encodeURIComponent(workspace.workspaceId)}/files">Files</a><a href="/dashboard/workspaces/${encodeURIComponent(workspace.workspaceId)}/runtime">Runtime</a></nav><div class="danger-zone"><button id="close-workspace" class="danger" type="button" ${workspace.version ? '' : 'disabled'}>Close workspace</button>${workspace.version ? '' : '<p>Close is unavailable until lifecycle fencing is ready.</p>'}</div>`;
 }
 
 export function renderProjectIndex(projects) {
