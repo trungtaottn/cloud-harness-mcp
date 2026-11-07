@@ -1,10 +1,17 @@
 import type { Response } from 'express';
-import type { RunnerResponse } from '@cloud-harness/contracts';
+import { ExecutorBackendKindSchema, WorkspaceBackendInfoSchema, type RunnerResponse } from '@cloud-harness/contracts';
 
 const statuses: Record<string, number> = {
   AUTHENTICATION_FAILED: 401, FORBIDDEN: 404, INVALID_INPUT: 400, NOT_FOUND: 404,
   CONFLICT: 409, STALE_GENERATION: 409, EXPIRED: 410, LIMIT_EXCEEDED: 429, TIMEOUT: 504,
-  CANCELLED: 409, UNAVAILABLE: 503, DEPENDENCY_EGRESS_UNAVAILABLE: 503, INTERNAL_ERROR: 500
+  CANCELLED: 409, UNAVAILABLE: 503, DEPENDENCY_EGRESS_UNAVAILABLE: 503, INTERNAL_ERROR: 500,
+  // Incus VM executor backend. Mirrors the runner's own status mapping
+  // (apps/runner/src/vm-supervisor-client.ts): capability refusals are client
+  // errors, fence/identity mismatches are conflicts, quota is throttling, and
+  // the disabled/attestation/supervisor/unknown-state failures are unavailable.
+  VM_BACKEND_DISABLED: 503, VM_CAPABILITY_UNSUPPORTED: 400, VM_QUOTA_EXCEEDED: 429,
+  VM_UNKNOWN_STATE: 503, VM_GENERATION_MISMATCH: 409, VM_ATTESTATION_FAILED: 503,
+  VM_SUPERVISOR_UNAVAILABLE: 503, VM_IDENTITY_MISMATCH: 409
 };
 
 const messages: Record<string, string> = {
@@ -20,13 +27,39 @@ const messages: Record<string, string> = {
   CANCELLED: 'The operation was cancelled.',
   UNAVAILABLE: 'The workspace service is temporarily unavailable.',
   DEPENDENCY_EGRESS_UNAVAILABLE: 'Dependency-access network egress is unavailable.',
-  INTERNAL_ERROR: 'The workspace service could not complete the request.'
+  INTERNAL_ERROR: 'The workspace service could not complete the request.',
+  // Static wording only: runner VM messages can embed supervisor detail, so the
+  // browser gets the same honest summary the shared table gives every other code.
+  VM_BACKEND_DISABLED: 'The requested executor backend is not enabled on this runner.',
+  VM_CAPABILITY_UNSUPPORTED: 'This operation is not supported by the workspace executor backend. Open a Docker workspace to use it.',
+  VM_QUOTA_EXCEEDED: 'The workspace backend quota was exceeded. Close other VM workspaces or wait and retry.',
+  VM_UNKNOWN_STATE: 'The workspace backend outcome is unknown. Retry the operation or check the workspace status.',
+  VM_GENERATION_MISMATCH: 'This item changed after you opened it.',
+  VM_ATTESTATION_FAILED: 'The workspace backend failed its security attestation.',
+  VM_SUPERVISOR_UNAVAILABLE: 'The workspace backend supervisor is temporarily unavailable.',
+  VM_IDENTITY_MISMATCH: 'The workspace backend identity check failed.'
 };
+
+/**
+ * The executor backend block, re-validated against the contract schemas rather
+ * than passed through: a misbehaving runner cannot smuggle an unknown kind, a
+ * malformed template id, or a capability value outside the declared vocabulary
+ * into the browser. Anything that fails the schema is dropped, not repaired.
+ */
+function cleanBackendFields(item: Record<string, unknown>): Record<string, unknown> {
+  const clean: Record<string, unknown> = {};
+  const kind = ExecutorBackendKindSchema.safeParse(item.executionBackend);
+  if (kind.success) clean.executionBackend = kind.data;
+  const backend = WorkspaceBackendInfoSchema.safeParse(item.backend);
+  if (backend.success) clean.backend = backend.data;
+  return clean;
+}
 
 function cleanWorkspace(value: unknown): Record<string, unknown> {
   const item = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   const allowed = ['workspaceId', 'repositoryUrl', 'ref', 'status', 'networkProfile', 'createdAt', 'lastActivityAt', 'expiresAt'];
   const clean = Object.fromEntries(allowed.filter((key) => item[key] !== undefined).map((key) => [key, item[key]]));
+  Object.assign(clean, cleanBackendFields(item));
   if (typeof item.generation === 'number') clean.version = item.generation;
   if (typeof item.canRenewLease === 'boolean') clean.canRenewLease = item.canRenewLease;
   if (typeof item.leaseCapped === 'boolean') clean.leaseCapped = item.leaseCapped;
@@ -52,8 +85,11 @@ function workspaceContextProjection(data: Record<string, unknown>): Record<strin
   const truncationReasons = Array.isArray(manifest.truncationReasons)
     ? manifest.truncationReasons.filter((reason): reason is string => typeof reason === 'string').slice(0, 8)
     : [];
+  // The runner nests the workspace record under `workspace`; a flat payload (an
+  // older runner or a test fixture) is used as the record itself.
+  const record = data.workspace && typeof data.workspace === 'object' ? data.workspace as Record<string, unknown> : data;
   return {
-    ...cleanWorkspace(data),
+    ...cleanWorkspace(record),
     ...(typeof data.branch === 'string' ? { branch: data.branch } : {}),
     ...(typeof identity.name === 'string' ? { gitIdentityName: identity.name } : {}),
     capabilities: Object.fromEntries(Object.entries(capabilities).filter(([, value]) => typeof value === 'boolean')),
@@ -1004,6 +1040,23 @@ export function buildActivityProjection(input: { events?: Record<string, unknown
   }));
   const events = [...liveRows, ...auditRows].sort((left, right) => String(right.at ?? '').localeCompare(String(left.at ?? ''))).slice(0, 200);
   return { events };
+}
+
+/**
+ * `workspace_detail` is the runner's internal projection and does not carry the
+ * executor backend block; `workspace_status` is the public record and does. The
+ * BFF composes the two so the cockpit sees the backend without changing the
+ * internal contract. Backend fields move only from a successful status read —
+ * detail stays authoritative for everything else, and a failed or backend-less
+ * status leaves the detail response untouched.
+ */
+export function mergeWorkspaceBackend(detail: RunnerResponse, status: RunnerResponse | undefined): RunnerResponse {
+  if (!detail.ok || !status?.ok) return detail;
+  const detailData = detail.data && typeof detail.data === 'object' ? detail.data as Record<string, unknown> : {};
+  const statusData = status.data && typeof status.data === 'object' ? status.data as Record<string, unknown> : {};
+  const backend = cleanBackendFields(statusData);
+  if (!Object.keys(backend).length) return detail;
+  return { ...detail, data: { ...detailData, ...backend } };
 }
 
 export function sendRunnerResponse(response: Response, operation: DashboardResponseOperation, result: RunnerResponse): void {

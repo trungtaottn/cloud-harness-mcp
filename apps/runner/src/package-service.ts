@@ -15,6 +15,7 @@ import {
   PackagesStatusInputSchema,
   type BuildablePackageEcosystem,
   type ErrorCode,
+  type ExecutorBackendKind,
   type PackageApplyResult,
   type PackageApplyState,
   type PackageBindingView,
@@ -48,6 +49,7 @@ import {
   type PackagePlanRecord,
   type PackageReleaseRecord
 } from './package-store.js';
+import { backendCapabilityMap } from './vm-capabilities.js';
 
 /**
  * Orchestrates managed toolbox packages: the MCP `packages_*` operations, the asynchronous apply jobs,
@@ -100,6 +102,12 @@ export type PackageWorkspaceDirectory = {
   isActive(ownerId: string, workspaceId: string): boolean;
   /** The owner's workspaces whose bindings and release profiles are retained (they may be recreated). */
   retained(ownerId: string): string[];
+  /**
+   * The executor backend kind persisted for the workspace, or undefined when it cannot be resolved.
+   * Optional for pre-phase-09 test doubles: a directory without it only ever served docker workspaces,
+   * so an absent method resolves to 'docker'. The default database implementation always provides it.
+   */
+  backendKind?(ownerId: string, workspaceId: string): ExecutorBackendKind | undefined;
 };
 
 export type PackageServiceOptions = {
@@ -319,8 +327,11 @@ export class PackageService {
     const lifecycleScripts = request.lifecycleScripts ?? false;
     this.requireLifecycleScriptsAllowed(lifecycleScripts);
     const workspaceId = request.scope === 'workspace' ? request.workspaceId! : null;
-    if (workspaceId !== null && !this.workspaces.isActive(ownerId, workspaceId)) {
-      throw harness('NOT_FOUND', 'workspace not found or not active', 404);
+    if (workspaceId !== null) {
+      if (!this.workspaces.isActive(ownerId, workspaceId)) {
+        throw harness('NOT_FOUND', 'workspace not found or not active', 404);
+      }
+      this.requireWorkspaceBindingSupported(ownerId, workspaceId);
     }
     this.requireRunning();
     const spec = {
@@ -473,6 +484,11 @@ export class PackageService {
     }
     const plan = this.store.getPlan(ownerId, request.planId);
     if (!plan) throw harness('NOT_FOUND', 'package plan not found', 404);
+    // A workspace-scope plan may predate the plan-time gate or arrive through a replay; the binding
+    // it would create is refused here for backends without a package-mount channel.
+    if (plan.scope === 'workspace' && plan.workspaceId !== null) {
+      this.requireWorkspaceBindingSupported(ownerId, plan.workspaceId);
+    }
     const now = this.clock();
     // Checks the store cannot make run only for a plan the store would otherwise accept, so a replay
     // still returns its apply and every other refusal keeps the store's code.
@@ -560,6 +576,12 @@ export class PackageService {
 
   /** Rebinds a release from history; shared by MCP (`mcp`) and the Dashboard (`dashboard`). */
   async rollbackBinding(ownerId: string, request: { bindingId: string; releaseId: string; expectedGeneration: number }, actor: PackageActor): Promise<PackagesRollbackResult> {
+    // Rollback re-points a binding rather than creating one, but a workspace binding on a backend
+    // without package mounts must still not be kept alive — refuse before the store mutates.
+    const existing = this.store.getBinding(ownerId, request.bindingId);
+    if (existing?.scope === 'workspace' && existing.workspaceId !== null) {
+      this.requireWorkspaceBindingSupported(ownerId, existing.workspaceId);
+    }
     const { binding } = this.store.rollback({
       ownerId, bindingId: request.bindingId, releaseId: request.releaseId, expectedGeneration: request.expectedGeneration,
       actor, now: this.clock(), releasePresent: (release) => this.releasePresent(release)
@@ -935,6 +957,24 @@ export class PackageService {
     }
   }
 
+  /**
+   * Phase-09 gate: a workspace-scope package binding mounts host release directories into the
+   * executor, which only the docker backend can honor. Backends whose capability map marks
+   * `packages-bind` unsupported (incus-vm) refuse the binding here — at plan, apply, and
+   * rollback — with the same named error the executor gate raises, never a silent skip.
+   */
+  private requireWorkspaceBindingSupported(ownerId: string, workspaceId: string): void {
+    const kind = this.workspaces.backendKind?.(ownerId, workspaceId) ?? 'docker';
+    if (backendCapabilityMap(kind)['packages-bind'] === 'unsupported') {
+      throw harness(
+        'VM_CAPABILITY_UNSUPPORTED',
+        `package bindings cannot target ${kind} workspaces: managed releases are mounted into docker executors only; bind the package at owner scope or use a docker workspace`,
+        400,
+        false
+      );
+    }
+  }
+
   private requireNoConflicts(plan: PackagePlanRecord, binaries: readonly string[]): void {
     const conflicts = this.store.binaryConflicts(plan.ownerId, {
       bindingId: plan.bindingId, scope: plan.scope, workspaceId: plan.workspaceId, ecosystem: plan.ecosystem,
@@ -1107,6 +1147,12 @@ export function databaseWorkspaceDirectory(database: DatabaseSync, store: Packag
       const row = database.prepare('SELECT status FROM workspaces WHERE id = ? AND owner_id = ?').get(workspaceId, ownerId) as { status: string } | undefined;
       return row?.status === 'ACTIVE';
     },
-    retained: (ownerId) => store.retainedWorkspaceIds(ownerId)
+    retained: (ownerId) => store.retainedWorkspaceIds(ownerId),
+    backendKind: (ownerId, workspaceId) => {
+      const row = database.prepare('SELECT backend_kind FROM workspaces WHERE id = ? AND owner_id = ?').get(workspaceId, ownerId) as { backend_kind?: string | null } | undefined;
+      if (row === undefined) return undefined;
+      // The column is CHECK-constrained to the ExecutorBackendKind enum; anything else is corrupt state.
+      return row.backend_kind === 'incus-vm' ? 'incus-vm' : 'docker';
+    }
   };
 }

@@ -1,0 +1,24 @@
+# Cloud Harness workspace link — rendered per-instance by the
+# cloud-harness-vm supervisor at provision time from supervisor-owned
+# settings (scripts/vm-template-build.sh render-network). Placeholders are
+# substituted verbatim before install to /etc/systemd/network/; never edit
+# this file inside a running guest.
+#
+# {{GUEST_MATCH_MAC}}  permanent MAC of the per-VM tap device
+# {{GUEST_CIDR}}       guest address/prefix, e.g. 10.203.71.2/30
+# {{GATEWAY}}          point-to-point gateway inside the /30
+# {{DNS_SERVERS}}      space-separated approved resolvers
+[Match]
+MACAddress={{GUEST_MATCH_MAC}}
+
+[Network]
+DHCP=no
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+DNS={{DNS_SERVERS}}
+
+[Address]
+Address={{GUEST_CIDR}}
+
+[Route]
+Gateway={{GATEWAY}}

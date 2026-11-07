@@ -26,6 +26,10 @@ services:
       ACCESS_LEGACY_ISSUER: ""
       ACCESS_LEGACY_SUBJECT: ""
       ACCESS_PRINCIPAL_RELINKS: ""
+      # The VM supervisor bearer token is runner-only; blank it so the shared
+      # env file cannot leak it into the API process.
+      VM_SUPERVISOR_TOKEN: ""
+      VM_SUPERVISOR_TOKEN_FILE: ""
     depends_on:
       runner:
         condition: service_healthy
@@ -99,6 +103,9 @@ services:
       # container paths must stay equal.
       - ${HOST_PACKAGES_ROOT:-/var/lib/cloud-harness/packages}:${PACKAGES_ROOT:-/var/lib/cloud-harness/packages}
       - ${AGENT_PROFILES_HOST_FILE:-./config/runner-agent-profiles.json}:/run/agent-config/profiles.json:ro
+      # NOTE: the opt-in Incus VM backend's supervisor socket mount is NOT here —
+      # it lives in compose.vm.yaml so the Docker-default deployment never sees
+      # /run/cloud-harness-vm. See that file for the -f opt-in invocation.
     networks: [control, runner-egress]
     depends_on:
       model-gateway:

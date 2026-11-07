@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { AgentIdSchema, ExecutorNetworkProfileSchema, IdempotencyKeySchema, OperationIdSchema, SessionIdSchema, ShellIdSchema, SkillRevisionIdSchema, SkillSetIdSchema, TaskIdSchema, WorkspaceIdSchema } from './identifiers.js';
 import { AgentProxyOperationSchema, AgentRuntimeKindSchema, AgentStatusSchema, HookEventSchema, MemoryScopeSchema, ProvenanceSourceSchema, type RunnerOperation } from './runner-api.js';
+import { ExecutorBackendKindSchema } from './executor-backend.js';
 import { SkillSuggestInputSchema } from './typesafe-schemas.js';
 import { GitHubRepositoryCreateInputSchema } from './github-repository-schemas.js';
 import {
@@ -695,6 +696,8 @@ const schemas = {
       .describe('Commits of history to clone; 0 clones full history. Omitted keeps the default single-commit clone.'),
     shallowSince: isoInstant.optional().describe('Clone history newer than this ISO date or datetime instead of a commit count.'),
     networkProfile: ExecutorNetworkProfileSchema.optional(),
+    executionBackend: ExecutorBackendKindSchema.optional()
+      .describe("Executor backend for the new workspace; omitted or 'docker' keeps the Docker default, 'incus-vm' opens a disposable Incus VM (opt-in, gated by runner configuration)."),
     networkMode: z.unknown().optional().meta({
       deprecated: true,
       description: 'Retired and rejected: this field was replaced by networkProfile.'

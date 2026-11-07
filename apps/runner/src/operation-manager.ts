@@ -13,7 +13,16 @@ import {
 } from '@cloud-harness/contracts';
 import { spawnDocker, terminateContainerProcessGroup } from './docker-engine.js';
 import { DockerPtyClient, type PtyConnection, type PtyEnd, type PtyTransport } from './docker-pty.js';
+import type { ExecutorBackend, ProvisionContext, StreamHandle } from './executor-backend.js';
 import type { DurableTaskStatus, StateStore } from './state-store.js';
+
+/**
+ * Backend-bound executor access for one workspace, supplied by WorkspaceService.
+ * When present, streams, process-group kills, and PTY transports route through
+ * the workspace's ExecutorBackend instead of the docker-engine helpers; when
+ * absent (standalone OperationManager use in tests), the legacy docker path runs.
+ */
+export type OperationExecutorAccess = { backend: ExecutorBackend; ctx: ProvisionContext };
 
 type ManagedStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'blocked';
 type Managed = {
@@ -43,6 +52,8 @@ type Managed = {
   generation?: number | undefined;
   startedAt?: number | undefined;
   finishedAt?: number | undefined;
+  /** Input written before the executor stream attached; flushed by track(). */
+  pendingInput?: string[] | undefined;
 };
 export type TrackedOperation = {
   id: string;
@@ -215,6 +226,8 @@ type TerminalRecord = {
   endReason?: string | undefined;
   output: TerminalOutput;
   connection?: PtyConnection | undefined;
+  /** The backend's PTY transport captured at open; falls back to the docker client. */
+  transport?: PtyTransport | undefined;
   redaction?: RedactionStream | undefined;
   waiters: Set<() => void>;
   idleTimer?: NodeJS.Timeout | undefined;
@@ -274,6 +287,8 @@ export class OperationManager {
   onTaskStart?: (workspaceId: string, timeoutMs: number) => void;
   onTaskSettle?: (workspaceId: string, taskId: string) => void;
   redactorProvider?: (workspaceId: string) => { createStream(): RedactionStream } | undefined;
+  /** Resolves the workspace's ExecutorBackend + ProvisionContext for stream/kill/PTY routing. */
+  executorAccessProvider?: (workspaceId: string) => OperationExecutorAccess | undefined;
   /** Called once per terminal when it stops running, for metadata-only audit. */
   onTerminalEnd?: (event: TerminalEndEvent) => void;
   /**
@@ -348,8 +363,81 @@ export class OperationManager {
     this.onTaskSettle?.(record.workspaceId, record.id);
   }
 
+  private executorAccess(workspaceId: string): OperationExecutorAccess | undefined {
+    return this.executorAccessProvider?.(workspaceId);
+  }
+
+  /**
+   * Routes a process-group kill through the workspace's executor backend when one
+   * is registered; the docker fallback preserves the standalone-manager path.
+   */
+  private async killInExecutor(workspaceId: string | undefined, container: string | undefined, pidFile: string): Promise<void> {
+    const access = workspaceId ? this.executorAccess(workspaceId) : undefined;
+    if (access) {
+      await access.backend.killProcessGroup(access.ctx, pidFile);
+      return;
+    }
+    if (container) await terminateContainerProcessGroup(container, pidFile);
+  }
+
+  /**
+   * Spawns an executor stream through the backend when registered. The record is
+   * already registered as running, so the spawn promise attaches the child when it
+   * resolves; a record cancelled before attach has its stream killed on arrival.
+   */
+  private spawnExecutorStream(
+    record: Managed,
+    request: { argv: string[]; cwd: string; environment: Record<string, string> },
+    maxBytes: number,
+    onStdinEnd = false
+  ): void {
+    const access = this.executorAccess(record.workspaceId);
+    if (!access) return;
+    // The VM contract is a COMPLETE per-stream environment: the provision
+    // context's workspace env is the base and request overrides (CH_COMMAND)
+    // layer on top. Docker records never reach this path — the provider only
+    // resolves non-docker backends, whose ctx.environment is already complete.
+    const environment = { ...access.ctx.environment, ...request.environment };
+    void access.backend.spawnStream(access.ctx, { ...request, environment })
+      .then((handle: StreamHandle) => {
+        if (record.status !== 'running') {
+          try { handle.kill(); } catch { /* already gone */ }
+          return;
+        }
+        if (onStdinEnd) handle.stdin?.end();
+        this.track(record, handle as unknown as ChildProcessWithoutNullStreams, maxBytes);
+      })
+      .catch((error: unknown) => {
+        record.status = 'failed';
+        record.errorCode = 'INTERNAL_ERROR';
+        record.errorMessage = error instanceof Error ? error.message : 'executor stream failed';
+        record.finishedAt = Date.now();
+        if (this.store && this.tasks.has(record.id)) {
+          try {
+            const current = this.store.getDurableTask(record.ownerId ?? '', record.workspaceId, record.id);
+            const gen = current?.generation ?? record.generation ?? 1;
+            this.store.updateDurableTaskStatus(record.id, gen, {
+              status: 'FAILED',
+              errorCode: record.errorCode,
+              errorMessage: record.errorMessage,
+              finishedAt: record.finishedAt,
+              outputBytes: record.outputBytes ?? 0
+            });
+            record.generation = gen + 1;
+          } catch { /* ignore */ }
+        }
+        this.reconcileQueued(record.workspaceId);
+        this.settleTask(record);
+      });
+  }
+
   private track(record: Managed, child: ChildProcessWithoutNullStreams, maxBytes: number): void {
     record.child = child;
+    if (record.pendingInput?.length) {
+      for (const pending of record.pendingInput.splice(0)) {
+        try { child.stdin.write(pending); } catch { /* stream already closed */ }
+      }
+    }
     const redactor = this.redactorProvider?.(record.workspaceId);
     const stdoutStream = redactor?.createStream();
     const stderrStream = redactor?.createStream();
@@ -452,6 +540,7 @@ export class OperationManager {
       throw new HarnessError('CONFLICT', `session ${name} is already running`, 409, false);
     }
     const recordId = id(prefix);
+    const guestCwd = `/workspace/${cwd === '.' ? '' : cwd}`;
     const record: Managed = {
       id: recordId,
       workspaceId,
@@ -463,12 +552,24 @@ export class OperationManager {
       idempotencyKey: mapKey,
       ...(name ? { name } : {})
     };
-    const child = spawnDocker([
-      'exec', '-i', '-w', `/workspace/${cwd === '.' ? '' : cwd}`,
-      container, '/usr/bin/setsid', '--wait', '/opt/harness/shell-runner.sh', recordId
-    ]);
     map.set(record.id, record);
     this.idempotency.set(mapKey, record.id);
+    if (this.executorAccess(workspaceId)) {
+      // Backend stream for non-docker records: `/usr/bin/setsid --wait
+      // /opt/harness/shell-runner.sh <id>` mapped onto the guest exec transport.
+      // Docker records keep the spawnDocker exec below. Empty env keeps the
+      // provision-baked environment.
+      this.spawnExecutorStream(record, {
+        argv: ['/usr/bin/setsid', '--wait', '/opt/harness/shell-runner.sh', recordId],
+        cwd: guestCwd,
+        environment: {}
+      }, maxBytes);
+      return record;
+    }
+    const child = spawnDocker([
+      'exec', '-i', '-w', guestCwd,
+      container, '/usr/bin/setsid', '--wait', '/opt/harness/shell-runner.sh', recordId
+    ]);
     this.track(record, child, maxBytes);
     return record;
   }
@@ -480,7 +581,10 @@ export class OperationManager {
   private interactiveIo(map: Map<string, Managed>, workspaceId: string, recordId: string, input?: string): Managed {
     const record = map.get(recordId);
     if (!record || record.workspaceId !== workspaceId) throw new HarnessError('NOT_FOUND', 'interactive session not found', 404, false);
-    if (input && record.status === 'running') record.child?.stdin.write(input);
+    if (input && record.status === 'running') {
+      if (record.child) record.child.stdin.write(input);
+      else (record.pendingInput ??= []).push(input);
+    }
     return record;
   }
 
@@ -491,7 +595,7 @@ export class OperationManager {
   private async closeInteractive(map: Map<string, Managed>, workspaceId: string, recordId: string): Promise<Managed> {
     const record = this.interactiveIo(map, workspaceId, recordId);
     if (record.status !== 'running') return record;
-    await terminateContainerProcessGroup(record.container!, `/tmp/cloud-harness-shells/${record.id}.pid`);
+    await this.killInExecutor(workspaceId, record.container, `/tmp/cloud-harness-shells/${record.id}.pid`);
     record.status = 'cancelled';
     record.child?.stdin.end();
     record.child?.kill();
@@ -664,11 +768,6 @@ export class OperationManager {
 
   private startTask(record: Managed): void {
     const timeoutSeconds = Math.max(1, Math.ceil(record.timeoutMs! / 1_000));
-    const child = spawnDocker([
-      'exec', '-i', '-w', `/workspace/${record.cwd === '.' ? '' : record.cwd}`, '-e', `CH_COMMAND=${record.command}`,
-      record.container!, '/opt/harness/task-runner.sh', record.id, String(timeoutSeconds)
-    ]);
-    child.stdin.end();
     record.status = 'running';
     record.startedAt = Date.now();
     if (this.store && this.tasks.has(record.id)) {
@@ -679,6 +778,22 @@ export class OperationManager {
       record.generation = (record.generation ?? 1) + 1;
     }
     this.onTaskStart?.(record.workspaceId, record.timeoutMs ?? 60_000);
+    if (this.executorAccess(record.workspaceId)) {
+      // Non-docker backends only: CH_COMMAND rides the complete per-stream env
+      // map so the command never appears in argv. Docker keeps the `-e` argv
+      // element below because its env-file channel rejects newline-bearing values.
+      this.spawnExecutorStream(record, {
+        argv: ['/opt/harness/task-runner.sh', record.id, String(timeoutSeconds)],
+        cwd: `/workspace/${record.cwd === '.' ? '' : record.cwd}`,
+        environment: { CH_COMMAND: String(record.command ?? '') }
+      }, record.maxBytes!, true);
+      return;
+    }
+    const child = spawnDocker([
+      'exec', '-i', '-w', `/workspace/${record.cwd === '.' ? '' : record.cwd}`, '-e', `CH_COMMAND=${record.command}`,
+      record.container!, '/opt/harness/task-runner.sh', record.id, String(timeoutSeconds)
+    ]);
+    child.stdin.end();
     this.track(record, child, record.maxBytes!);
   }
 
@@ -805,8 +920,8 @@ export class OperationManager {
       return record;
     }
     if (record.status !== 'running') return record;
-    if (record.container) {
-      await terminateContainerProcessGroup(record.container, `/tmp/cloud-harness-tasks/${record.id}.pid`);
+    if (record.container || this.executorAccess(workspaceId)) {
+      await this.killInExecutor(workspaceId, record.container, `/tmp/cloud-harness-tasks/${record.id}.pid`);
     }
     record.status = 'cancelled';
     record.finishedAt = Date.now();
@@ -1078,9 +1193,9 @@ export class OperationManager {
         if (op.child) {
           try { op.child.kill('SIGTERM'); } catch { /* process already exited */ }
         }
-        if (op.container) {
+        if (op.container || (op.workspaceId && this.executorAccess(op.workspaceId))) {
           try {
-            await terminateContainerProcessGroup(op.container, `/tmp/cloud-harness-operations/${id}.pid`);
+            await this.killInExecutor(op.workspaceId, op.container, `/tmp/cloud-harness-operations/${id}.pid`);
           } catch { /* container already stopped */ }
         }
         if (op.completion) await settleWithin(op.completion, CANCEL_CLEANUP_WAIT_MS);
@@ -1112,6 +1227,11 @@ export class OperationManager {
   private ptyTransport(): PtyTransport {
     this.terminalTransport ??= new DockerPtyClient();
     return this.terminalTransport;
+  }
+
+  /** The transport captured when the terminal opened (backend.pty for its workspace). */
+  private terminalTransportFor(record: TerminalRecord): PtyTransport {
+    return record.transport ?? this.ptyTransport();
   }
 
   /** Forget ended terminals past their read window, then cap how many ended ones a workspace keeps. */
@@ -1214,7 +1334,7 @@ export class OperationManager {
   /** End every process left in the terminal's session (job-control children in other process groups too). */
   private cleanTerminalSession(record: TerminalRecord): Promise<void> {
     if (record.sessionCleaned) return Promise.resolve();
-    record.cleaning ??= this.ptyTransport().killSession(record.container, record.id)
+    record.cleaning ??= this.terminalTransportFor(record).killSession(record.container, record.id)
       .then(() => { record.sessionCleaned = true; })
       .finally(() => { record.cleaning = undefined; });
     return record.cleaning;
@@ -1249,7 +1369,7 @@ export class OperationManager {
     let exitCode: number | null = null;
     try {
       for (let attempt = 0; attempt < 40; attempt += 1) {
-        const state = await this.ptyTransport().inspect(record.connection!.execId);
+        const state = await this.terminalTransportFor(record).inspect(record.connection!.execId);
         if (!state.running) {
           exitCode = state.exitCode;
           break;
@@ -1303,9 +1423,12 @@ export class OperationManager {
     };
     // Reserve the slot before the handshake so concurrent opens cannot exceed the limit.
     this.terminals.set(record.id, record);
+    const access = this.executorAccess(input.workspaceId);
+    const transport = access ? access.backend.pty(access.ctx) : this.ptyTransport();
+    record.transport = transport;
     let connection: PtyConnection;
     try {
-      connection = await this.ptyTransport().open({
+      connection = await transport.open({
         container: input.container,
         terminalId: record.id,
         workingDir: `/workspace/${input.cwd === '.' ? '' : input.cwd}`,
@@ -1315,7 +1438,7 @@ export class OperationManager {
     } catch (error) {
       this.terminals.delete(record.id);
       // The exec may already exist (a start handshake that timed out); end whatever it started, best effort.
-      void this.ptyTransport().killSession(input.container, record.id).catch(() => undefined);
+      void transport.killSession(input.container, record.id).catch(() => undefined);
       throw error;
     }
     if (!this.terminals.has(record.id)) {
@@ -1389,7 +1512,7 @@ export class OperationManager {
     const record = this.requireTerminal(ownerId, workspaceId, terminalId);
     if (record.status !== 'running' || !record.connection) throw new HarnessError('CONFLICT', 'terminal is not running', 409, false);
     this.noteWorkspaceActivity(record);
-    await this.ptyTransport().resize(record.connection.execId, cols, rows);
+    await this.terminalTransportFor(record).resize(record.connection.execId, cols, rows);
     record.cols = cols;
     record.rows = rows;
     this.touchTerminal(record);

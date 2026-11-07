@@ -55,7 +55,10 @@ export type SkillExtensionServiceOptions = {
   bundlePath: (ownerId: string, bundleSha256: string) => string;
   /**
    * The canonical checkout root of one of the owner's open workspaces. Must refuse, with one NOT_FOUND
-   * for every case, a workspace that is missing, another principal's, or no longer open.
+   * for every case, a workspace that is missing, another principal's, or no longer open. A workspace
+   * whose executor backend has no host checkout (incus-vm, `dashboard-repo-skills` unsupported) must
+   * refuse with VM_CAPABILITY_UNSUPPORTED instead — workspace/repository tier reads have no host path
+   * to serve, and silently skipping the tiers would hide the unsupported capability.
    */
   checkoutRoot?: (ownerId: string, workspaceId: string) => Promise<string>;
   /** The serialized size at which a list page stops; only tests lower it. */

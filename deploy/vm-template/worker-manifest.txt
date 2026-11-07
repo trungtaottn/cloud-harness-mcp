@@ -1,0 +1,28 @@
+# worker-manifest.txt — worker/ → guest /opt/harness bake map (phase-06).
+#
+# Grammar (one entry per line, '#' comments, TAB-separated fields):
+#   <guest-dest-path><TAB><worker-source-path>   bake into the image
+#   !<worker-source-path><TAB><reason>           host-only: never baked
+#
+# Every regular file under worker/ MUST be classified exactly once — either
+# a bake line above or a '!' host-only line below. The drift test fails on
+# unclassified, duplicate, or byte-divergent entries, so a worker change
+# must update this manifest (and the baked copies) in the same PR.
+#
+# Bake entries mirror docker/executor.Dockerfile's /opt/harness contents
+# exactly — the docker executor bakes every worker file, including the
+# git/gh helpers (they run as ephemeral helper containers today and are
+# available in-guest for the VM backend's git flow):
+/opt/harness/harness-worker.mjs	worker/harness-worker.mjs
+/opt/harness/worker-runner.sh	worker/worker-runner.sh
+/opt/harness/shell-runner.sh	worker/shell-runner.sh
+/opt/harness/task-runner.sh	worker/task-runner.sh
+/opt/harness/clone-helper.sh	worker/clone-helper.sh
+/opt/harness/git-transfer-helper.sh	worker/git-transfer-helper.sh
+/opt/harness/gh-helper.sh	worker/gh-helper.sh
+/opt/harness/bin/npx	worker/bin/npx-dispatcher
+/opt/harness/bin/skills	worker/bin/skills
+/opt/harness/bin/skillx	worker/bin/skillx
+#
+# Host-only — reserved for worker files that must never enter the guest.
+# (None today: the docker executor bakes the full worker/ tree.)

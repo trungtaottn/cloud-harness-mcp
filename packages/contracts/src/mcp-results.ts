@@ -41,7 +41,17 @@ export const ErrorCodeSchema = z.enum([
   'PACKAGE_VERIFICATION_FAILED',
   // A model profile change raises spend capacity, widens agent permissions, or sends a
   // key to a new host; only the owner can make it, on the Dashboard.
-  'OWNER_APPROVAL_REQUIRED'
+  'OWNER_APPROVAL_REQUIRED',
+  // Incus VM executor backend. VM_UNKNOWN_STATE and VM_SUPERVISOR_UNAVAILABLE are
+  // retryable; every other VM_* code is terminal for the attempted operation.
+  'VM_BACKEND_DISABLED',
+  'VM_CAPABILITY_UNSUPPORTED',
+  'VM_QUOTA_EXCEEDED',
+  'VM_UNKNOWN_STATE',
+  'VM_GENERATION_MISMATCH',
+  'VM_ATTESTATION_FAILED',
+  'VM_SUPERVISOR_UNAVAILABLE',
+  'VM_IDENTITY_MISMATCH'
 ]);
 export type ErrorCode = z.infer<typeof ErrorCodeSchema>;
 export const ToolResultSchema = z.object({

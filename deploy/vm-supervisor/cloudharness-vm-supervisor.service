@@ -1,0 +1,46 @@
+[Unit]
+Description=Cloud Harness VM supervisor (Incus backend control plane)
+Documentation=https://github.com/lebear/cloudharness-vm
+# The supervisor is the ONLY component that talks to Incus: it owns the
+# runner-facing Unix socket, the durable journal, admission, leases, exec/PTY
+# proxying, file transfer, vm.export, and the in-process network-guard hooks.
+# It starts after Incus is up. Ordering vs cloudharness-vm-guard.service is
+# soft: the supervisor's vm.start gate performs its own LIVE attestation and
+# never treats the guard-state.json file as start authorization.
+After=network-online.target incus.service cloudharness-vm-guard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+# Supervisor-scoped VM_* configuration. Required keys: VM_SUPERVISOR_TOKEN
+# (or VM_SUPERVISOR_TOKEN_FILE pointing at a root-owned 0600 file),
+# VM_INCUS_PROJECT (dedicated project, never "default"), VM_TEMPLATE_ID and
+# VM_TEMPLATE_DIGEST (the trusted template allowlist). Optional overrides:
+# VM_SUPERVISOR_SOCKET (default /run/cloud-harness-vm/supervisor.sock),
+# VM_SUPERVISOR_STATE_DIR (default /var/lib/cloud-harness-vm),
+# VM_INCUS_SOCKET (default /var/lib/incus/unix.socket),
+# VM_GUARD_STATE_PATH, VM_BRIDGE_PATTERN, VM_SUBNET_PLAN, VM_UPLINK,
+# VM_DNS_RESOLVERS, VM_NONPUBLIC_CIDRS, VM_POOL_PATH, VM_MAX_TTL_SECONDS,
+# VM_MAX_ACTIVE, VM_CPUS, VM_MEMORY_BYTES, VM_DISK_BYTES,
+# VM_POOL_RESERVE_BYTES.
+EnvironmentFile=-/etc/cloud-harness-vm/supervisor.env
+ExecStart=/usr/bin/node /opt/cloud-harness-vm/repo/apps/vm-supervisor/dist/index.js
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+# The supervisor needs Incus unix-socket access and CAP_NET_ADMIN for the
+# in-process guard hooks (nft/iptables/ip); it must NOT gain privileges it
+# does not need.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/run/cloud-harness-vm /var/lib/cloud-harness-vm
+# If VM_SUPERVISOR_STATE_DIR, VM_GUARD_STATE_PATH or VM_POOL_PATH live outside
+# those two directories, add a drop-in with the matching ReadWritePaths entry.
+
+[Install]
+WantedBy=multi-user.target

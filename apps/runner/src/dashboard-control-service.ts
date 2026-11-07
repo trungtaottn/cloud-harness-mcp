@@ -20,6 +20,7 @@ import type { MetadataStore } from './metadata-store.js';
 import { readSkillArchive } from './skill-archive.js';
 import { SkillExtensionService } from './skill-extension-service.js';
 import { SkillRegistryError, type PrivilegeGrantRecord, type StateStore } from './state-store.js';
+import { backendCapabilityMap } from './vm-capabilities.js';
 import { compareSemver, isSemver, parseSkillVersion, trustedSkillVersion } from './skill-version.js';
 import { IntegrationCredentialError, IntegrationCredentialRepository } from './integration-credential-repository.js';
 import type { SecretKeyring } from './secret-keyring.js';
@@ -284,9 +285,31 @@ export class DashboardControlService {
       builtinSkillsRoot: this.config.builtinSkillsRoot,
       store: this.principals,
       bundlePath: (ownerId, bundleSha256) => this.workspaces.toolkitCacheManager.bundlePath(ownerId, bundleSha256),
-      checkoutRoot: (ownerId, workspaceId) => this.workspaces.readableCheckoutRoot(ownerId, workspaceId)
+      checkoutRoot: (ownerId, workspaceId) => this.skillCheckoutRoot(ownerId, workspaceId)
     });
     return this.skillExtensionService;
+  }
+
+  /**
+   * Workspace/repository skill reads are served from a host checkout path. An incus-vm workspace has
+   * no host checkout — the repository lives inside the guest — so a request bound to one gets the
+   * explicit unsupported error rather than reading host staging. Unavailable workspaces keep the
+   * NOT_FOUND contract, and owner/built-in skill directories never pass through this callback.
+   */
+  private async skillCheckoutRoot(ownerId: string, workspaceId: string): Promise<string> {
+    const record = this.principals.byOwnerAndId(ownerId, workspaceId);
+    const now = Date.now();
+    const kind = record?.backendKind ?? 'docker';
+    if (record && record.status === 'ACTIVE' && record.expiresAt > now && record.hardExpiresAt > now
+        && backendCapabilityMap(kind)['dashboard-repo-skills'] === 'unsupported') {
+      throw new HarnessError(
+        'VM_CAPABILITY_UNSUPPORTED',
+        `workspace ${workspaceId} runs on the ${kind} backend, which has no host checkout for repository skill reads; use a docker workspace to browse repository skills`,
+        400,
+        false
+      );
+    }
+    return this.workspaces.readableCheckoutRoot(ownerId, workspaceId);
   }
 
   /**
