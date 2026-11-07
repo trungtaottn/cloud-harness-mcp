@@ -96,6 +96,19 @@ Docker socket or control-plane credentials. These controls reduce accidental
 impact; they do not create a hostile-tenant boundary because the executor
 shares the host kernel.
 
+An opt-in second executor backend, `incus-vm`, runs each selected workspace in
+its own Incus VM instead of a Docker container. The runner reaches it through
+`apps/vm-supervisor`, a host-side supervisor that owns Incus admission, the
+storage pool, VM identity/generation fencing, and the external egress guard;
+the runner talks to it over an authenticated, length-framed Unix-socket record
+stream — never HTTP — using `VM_SUPERVISOR_SOCKET`/`VM_SUPERVISOR_TOKEN`.
+Docker stays the default backend, the kind is immutable per workspace, and
+`workspace_open` refuses `incus-vm` with `VM_BACKEND_DISABLED` unless the
+operator enables it. Per-workspace capability declarations live in
+[`apps/runner/src/vm-capabilities.ts`](../apps/runner/src/vm-capabilities.ts);
+the boundary's honest limits are in
+[security-model](security-model.md#incus-vm-executor-backend).
+
 Remote Git is a runner-mediated boundary rather than executor egress. The
 runner pauses the executor while a no-network helper stages or imports a
 sibling transfer repository, and only the separate fetch/push helper receives

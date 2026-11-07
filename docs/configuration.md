@@ -432,6 +432,52 @@ their image. Custom images and local stdio mode must provide their own CLI.
 
 Skill registry imports follow the same policy. With `cache-only` an uncached `skills.sh` or `SkillX` import fails closed with `NOT_FOUND` and import guidance instead of opening a network channel; importing a new registry skill therefore requires `runner-fetch`. When fetching is enabled, acquisition runs in the runner provisioning containers behind `provisioning-proxy`, whose `ALLOWED_HOSTS` allowlist is the only egress authority: `skills.sh` references resolve to GitHub repositories and need no additional host, while `SkillX` imports call `skillx.sh`, which is on that allowlist.
 
+## Incus VM executor backend (opt-in)
+
+The `incus-vm` executor backend runs each opted-in workspace inside its own
+Incus VM instead of a Docker container. It is off by default; `workspace_open`
+with `executionBackend: 'incus-vm'` fails with `VM_BACKEND_DISABLED` until the
+operator enables it. There is no in-place conversion — only newly opened
+workspaces can select it. The key names and their schema are owned by
+[`packages/contracts/src/config.ts`](../packages/contracts/src/config.ts);
+the prose below says what each group controls.
+
+Enablement is a three-part gate:
+
+- `VM_BACKEND_ENABLED` turns the kind on. When enabled, `VM_SUPERVISOR_TOKEN`,
+  `VM_TEMPLATE_ID`, and `VM_TEMPLATE_DIGEST` are **required** — startup
+  validation refuses a partial configuration rather than admitting
+  unverifiable VMs.
+- `VM_SUPERVISOR_SOCKET` is the absolute path of the supervisor's
+  authenticated Unix socket (a length-framed record stream, not HTTP). The
+  supervisor token authenticates the runner to it and never enters a guest.
+  The runner only sees the socket directory when the opt-in
+  `compose.vm.yaml` overlay is included — the default Compose stack never
+  mounts `/run/cloud-harness-vm` (see
+  [deployment](deployment.md#optional-incus-vm-executor-backend)).
+- `VM_TEMPLATE_ID`/`VM_TEMPLATE_DIGEST` pin the exact VM template the
+  supervisor may instantiate; the digest is the attestation anchor.
+
+Sizing and admission bounds are runner-side **expected** values the runner
+asserts on supervisor read-back (the supervisor owns the actuals):
+`VM_CPUS`, `VM_MEMORY_BYTES`, `VM_DISK_BYTES` describe the fixed v1 shape
+(4 CPUs / 8 GiB / 20 GiB), `VM_MAX_ACTIVE` caps concurrent VM workspaces
+(default and shipped maximum `1`), `VM_POOL_RESERVE_BYTES` is the host
+statfs floor admission must preserve, `VM_MAX_WORKSPACE_BYTES` is the soft
+ceiling over guest workspace/tool/cache paths, and `VM_INLINE_MAX_BYTES`
+splits inline vs session-framed file transfers.
+
+The supervisor's own Incus/storage-pool/egress-guard configuration is **not**
+in this file: it lives with the supervisor unit and its environment
+(see [deployment](deployment.md) and
+[`apps/vm-supervisor/`](../apps/vm-supervisor/)). The guard's nft table
+replace is atomic (`destroy` + canonical rules in one `nft -f` transaction
+after `nft -c` checks it), so the host needs nftables ≥ 1.0.7 and kernel
+≥ 6.3 — below that the apply is rejected and fails closed. Enabling the
+backend without the supervisor stack, Incus extension-gated build, systemd
+units, storage pool, and the `compose.vm.yaml` socket-mount overlay is an
+operator task, not a config-only change.
+
 ## Operator-provided skills (`built-in` tier)
 
 `BUILTIN_SKILLS_ROOT` names an absolute **host** directory that is mounted

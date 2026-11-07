@@ -22,6 +22,35 @@ The systemd and Compose owners are
 [`compose.yaml`](../compose.yaml), and
 [`compose.production.yaml`](../compose.production.yaml).
 
+### Incus VM backend operations
+
+When `VM_BACKEND_ENABLED` is on, the runner depends on the host-side VM
+supervisor and egress guard (their own systemd units under
+`deploy/vm-supervisor/`, not the Compose stack). Check them alongside the
+Compose services:
+
+```bash
+sudo systemctl status cloudharness-vm-supervisor.service cloud-harness-vm-guard.service
+sudo journalctl -u cloudharness-vm-supervisor.service --since "30 minutes ago"
+sudo journalctl -u cloud-harness-vm-guard.service --since "30 minutes ago"
+incus list   # VM instances named chm-vm-<hash>
+```
+
+The guard needs **nftables ≥ 1.0.7 and kernel ≥ 6.3** on the host: it commits
+`destroy table` plus the canonical ruleset as one `nft -f` transaction, and
+`nft -c` rejects that payload on older hosts so every apply fails closed.
+Confirm the floor live with `nft --version` and `uname -r`; a guard journal
+full of `nft check`/`nft apply` failures on an older host means the backend
+cannot attest workspaces, not that the guard is merely noisy.
+
+A workspace stuck in `VM_UNKNOWN_STATE` is **retained, never auto-deleted** —
+reconcile it through `workspace_status`/`workspace_recover` rather than
+removing the Incus instance by hand. Post-hard-expiry recovery is an offline
+`vm.export` clean-check through an isolated libguestfs appliance; the guest
+filesystem is never mounted in the host kernel. Failure codes and retryability
+are listed in [mcp-api](mcp-api.md#executor-backend-selection) and
+[troubleshooting](troubleshooting.md#workspace-opening).
+
 ## Persistent and ephemeral data
 
 The production defaults place:
