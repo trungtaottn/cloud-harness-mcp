@@ -32,7 +32,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-const SENTINEL_KEY = 'sk-sentinel-mcp-tool-key-0123456789abcdef';
+const SENTINEL_KEY = 'sentinel-mcp-tool-key-fixture-not-real';
 const CUSTOM_URL = 'https://llm.example.org/v1/chat/completions';
 const LIMITS = { maxInputTokens: 10_000, maxOutputTokens: 2_000, maxCostMicros: 1_000_000 };
 const PRICING = { inputMicrosPerMillionTokens: 3_000_000, outputMicrosPerMillionTokens: 15_000_000 };
