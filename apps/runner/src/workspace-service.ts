@@ -1,6 +1,6 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
-import { chmod, chown, cp, mkdir, readFile, readdir, realpath, rm, stat, statfs, writeFile } from 'node:fs/promises';
+import { chmod, chown, cp, lstat, mkdir, readFile, readdir, realpath, rm, stat, statfs } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import {
   AgentProxyOperationSchema,
@@ -38,8 +38,19 @@ import {
   type WorkspaceLifecycleSettingsView,
   TERMINAL_MAX_INPUT_BYTES
 } from '@cloud-harness/contracts';
-import { inspectContainer, removeContainer, runDocker, terminateContainerProcessGroup } from './docker-engine.js';
-import { EXECUTOR_HARDENING_ARGS, EXECUTOR_RESOURCE_CEILINGS, TOOLBOX_STALE_AFTER_MS, managedPathEnvArgs, reapStaleToolboxContainers, runToolboxCommand, toolboxContainerName, withManagedBins, type ToolboxRunResult } from './toolbox-runner.js';
+import { inspectContainer, removeContainer, runDocker } from './docker-engine.js';
+import { DockerExecutorBackend } from './docker-executor-backend.js';
+import { DockerGitDataPlane, type GitDataPlane } from './git-data-plane.js';
+import { assertVmTransferOk, VM_MAX_BUNDLE_BYTES, type VmGitStaging } from './git-vm-staging.js';
+import type { VmGitRemoteOps } from './git-vm-transport.js';
+import { assertExecutorOperationSupported, executorOperationClass } from './vm-capabilities.js';
+import type {
+  ExecutorBackend,
+  ExecutorBackendKind,
+  ProvisionContext
+} from './executor-backend.js';
+import type { WorkspaceBackendInfo } from '@cloud-harness/contracts';
+import { EXECUTOR_RESOURCE_CEILINGS, TOOLBOX_STALE_AFTER_MS, reapStaleToolboxContainers, runToolboxCommand, toolboxContainerName, type ToolboxRunResult } from './toolbox-runner.js';
 import { PackageBuilder } from './package-builder.js';
 import { PACKAGE_OPERATIONS, PackageService, databaseWorkspaceDirectory, type PackageOperation } from './package-service.js';
 import { PackageStore } from './package-store.js';
@@ -92,8 +103,6 @@ interface RepositoryCredential {
   /** Set when a GitHub App mint failed and the fallback credential was used instead. */
   appMintError?: unknown;
 }
-/** The executor PATH before managed package `bin` directories are inserted ahead of `/usr/local/sbin`. */
-const EXECUTOR_PATH = '/workspace/node_modules/.bin:/opt/user-tools/bin:/opt/user-tools/pnpm/bin:/opt/user-tools/pnpm:/opt/user-tools/bun/bin:/tmp/cloud-harness-home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const PACKAGE_OPERATION_SET: ReadonlySet<string> = new Set(PACKAGE_OPERATIONS);
 
 function isPackageOperation(operation: RunnerOperation): operation is PackageOperation {
@@ -161,6 +170,7 @@ export function computeWorkspaceOpenFingerprint(input: {
   allowToolkitWorkspaceChanges?: boolean | undefined;
   fetchDepth?: number | undefined;
   shallowSince?: string | undefined;
+  executionBackend?: string | undefined;
 }): string {
   const canonicalToolkits = [...(input.toolkits ?? [])].sort((a, b) =>
     toolkitSelectionIdentity(a).localeCompare(toolkitSelectionIdentity(b)));
@@ -173,12 +183,54 @@ export function computeWorkspaceOpenFingerprint(input: {
     networkProfile: input.networkProfile ?? null,
     toolkits: canonicalToolkits,
     allowToolkitWorkspaceChanges: input.allowToolkitWorkspaceChanges ?? false,
+    // The executor backend joins the fingerprint only for incus-vm: omitted and
+    // explicit 'docker' must keep replaying pre-backend fingerprints byte-identically.
+    ...(input.executionBackend === 'incus-vm' ? { executionBackend: 'incus-vm' } : {}),
     // History options join the fingerprint only when set, so replays of earlier requests keep matching.
     ...(input.fetchDepth !== undefined ? { fetchDepth: input.fetchDepth } : {}),
     ...(input.shallowSince !== undefined ? { shallowSince: input.shallowSince } : {})
   };
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
+
+/** The executor backend plus its git data plane for one backend kind. */
+export type WorkspaceBackendStack = { backend: ExecutorBackend; git: GitDataPlane };
+
+/**
+ * Phase-08 offline export seam, feature-detected on the data plane: only the
+ * VM transport implements it (supervisor `vm.export` → staged tar → safe
+ * extract → untrusted checkout inspection). It is deliberately NOT part of the
+ * phase-02 GitDataPlane contract — docker workspaces never need it because the
+ * host mount is the checkout — so callers must treat its absence as "offline
+ * export unavailable", never as a reason to boot the guest. The result carries
+ * the staging op dir (`workDir`) and extracted checkout (`checkoutDir`) so the
+ * caller owns inspection-driven follow-up and cleanup.
+ */
+export type OfflineCheckoutExport = VmGitRemoteOps['exportCheckoutOffline'];
+
+/**
+ * Phase-08 remote-ops surface on the VM git plane (`VmGitTransport`), kept
+ * optional here because it sits outside the phase-02 `GitDataPlane` contract:
+ * every call site feature-detects the method and fails closed with
+ * VM_CAPABILITY_UNSUPPORTED when a plane does not provide it — never a silent
+ * fallback to the docker helper path.
+ */
+type VmGitRemoteSurface = Partial<VmGitRemoteOps> & { readonly gitStaging?: VmGitStaging };
+/**
+ * Phase-07 injection seam: resolves the registered ExecutorBackend + GitDataPlane
+ * for a backend kind. The default registers docker only and rejects every other
+ * kind with VM_BACKEND_DISABLED; the phase-07 backend factory supplies incus-vm.
+ */
+export type WorkspaceBackendFactory = (kind: ExecutorBackendKind) => WorkspaceBackendStack;
+
+/** Workspace lease synchronization hook; the default is a no-op until phase-07 wires the supervisor lease. */
+export type WorkspaceLeaseSync = {
+  set(record: WorkspaceRecord): unknown;
+  clear(record: WorkspaceRecord): unknown;
+};
+
+/** Outcome of one queued durable lease push — the queue itself never rejects. */
+type LeaseSyncOutcome = { ok: true } | { ok: false; error: unknown };
 
 /**
  * Whether a stored workspace may be replayed for this open request. An explicit profile must also
@@ -265,7 +317,9 @@ function publicRecord(record: WorkspaceRecord, capabilities?: WorkspaceCapabilit
     ...(capabilities ? {
       capabilities: capabilities.capabilities,
       permissions: capabilities.permissions,
-      operations: capabilities.operations
+      operations: capabilities.operations,
+      ...(capabilities.executionBackend ? { executionBackend: capabilities.executionBackend } : {}),
+      ...(capabilities.backend ? { backend: capabilities.backend } : {})
     } : {}),
     error: record.error
   };
@@ -339,6 +393,25 @@ export class WorkspaceService {
   private failureIntelligence?: FailureIntelligence | undefined;
   /** Workspace-independent organization repository creation through the principal's App installation. */
   readonly repositoryCreator: GitHubRepositoryCreator;
+  /**
+   * Phase-07 injection seam: resolves ExecutorBackend + GitDataPlane per backend
+   * kind. Defaults to docker-only registration; unwired kinds throw
+   * VM_BACKEND_DISABLED. Phase-07's backend factory replaces this at wiring time.
+   */
+  private readonly backendFactory: WorkspaceBackendFactory;
+  private readonly backendStacks = new Map<ExecutorBackendKind, WorkspaceBackendStack>();
+  private dockerBackendStack?: WorkspaceBackendStack | undefined;
+  /** Decrypted workspace env per (workspace, generation); secrets never leave this map. */
+  private readonly envMemo = new Map<string, { generation: number; env: Record<string, string> }>();
+  /** Lease push points for the supervisor lease; undefined = no-op until phase-07 wires it. */
+  leaseSync?: WorkspaceLeaseSync | undefined;
+  /**
+   * Early VM admission pre-check (UX only): wired by the entrypoint to
+   * `assertVmAdmissionAllowed` with the supervisor client. A pass here is
+   * never proof of admission — the supervisor's `vm.start` gate remains
+   * authoritative on every start path. Unset = skip the pre-check.
+   */
+  vmAdmission?: ((input: { ownerId: string }) => Promise<void>) | undefined;
   constructor(
     private readonly config: RunnerConfig,
     private readonly store: StateStore,
@@ -346,8 +419,10 @@ export class WorkspaceService {
     private readonly githubInstallations?: GitHubInstallationStore,
     private readonly githubBinding?: GitHubBindingService,
     private readonly artifacts?: ArtifactStore,
-    agentDependencies?: Omit<AgentManagerDependencies, 'toolExecutor'> & { manager?: AgentManager }
+    agentDependencies?: Omit<AgentManagerDependencies, 'toolExecutor'> & { manager?: AgentManager },
+    executorBackends?: WorkspaceBackendFactory
   ) {
+    this.backendFactory = executorBackends ?? ((kind) => this.defaultBackendFactory(kind));
     let metadata: MetadataStore | undefined;
     let agentDeps = agentDependencies;
     if (metadataOrDependencies && ('manager' in metadataOrDependencies || 'launcher' in metadataOrDependencies || 'gateway' in metadataOrDependencies)) {
@@ -391,6 +466,9 @@ export class WorkspaceService {
       }
     });
     this.operations.redactorProvider = (wsId) => this.getRedactor(wsId);
+    // Streams, process-group kills, and PTY transports resolve the workspace's
+    // executor backend per call so a mixed fleet routes each workspace correctly.
+    this.operations.executorAccessProvider = (wsId) => this.operationExecutorAccess(wsId);
     this.repositoryCreator = new GitHubRepositoryCreator({
       config: this.config,
       installations: this.githubInstallations,
@@ -466,6 +544,318 @@ export class WorkspaceService {
   /** Attaches the Decision Plane. Without it every failure keeps only its deterministic classification. */
   useDecisionPlane(plane: DecisionPlane): void {
     this.failureIntelligence = new FailureIntelligence(plane);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Executor backend seams (phase-03)                                    */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * The docker-only default factory. Every non-docker kind is rejected with
+   * VM_BACKEND_DISABLED until phase-07 registers its adapter — an unwired
+   * backend must fail loudly, never silently fall back to docker or a
+   * host-staging path.
+   */
+  private defaultBackendFactory(kind: ExecutorBackendKind): WorkspaceBackendStack {
+    if (kind !== 'docker') {
+      throw new HarnessError('VM_BACKEND_DISABLED', `executor backend '${kind}' is not registered on this runner`, 503, false);
+    }
+    this.dockerBackendStack ??= (() => {
+      const backend = new DockerExecutorBackend({
+        config: this.config,
+        instanceId: this.instanceId,
+        network: this.networkProfileManager,
+        packages: { profileFor: (ownerId, workspaceId) => this.packages.profileFor(ownerId, workspaceId) }
+      });
+      return { backend, git: new DockerGitDataPlane({ backend, config: this.config, instanceId: this.instanceId }) };
+    })();
+    return this.dockerBackendStack;
+  }
+
+  private backendStack(kind: ExecutorBackendKind): WorkspaceBackendStack {
+    let stack = this.backendStacks.get(kind);
+    if (!stack) {
+      stack = this.backendFactory(kind);
+      this.backendStacks.set(kind, stack);
+    }
+    return stack;
+  }
+
+  /** Host git-staging dir under the job path; phase-08 owns its bundle layout. */
+  private stagingDirFor(record: WorkspaceRecord): string {
+    return join(record.workspacePath, 'git-staging');
+  }
+
+  /**
+   * The workspace's complete environment (global + environment secrets,
+   * decrypted), memoized per generation. This is the ProvisionContext
+   * `environment` contract; per-exec overrides travel on ExecRequest instead.
+   */
+  private workspaceEnvironment(record: WorkspaceRecord): Record<string, string> {
+    const cached = this.envMemo.get(record.id);
+    if (cached && cached.generation === record.generation) return cached.env;
+    let environment: Record<string, string> = {};
+    try {
+      const snapshotResult = this.store.getSecretSnapshot(record.id);
+      if (snapshotResult.initialized) {
+        const decrypted: Record<string, string> = {};
+        for (const item of snapshotResult.secrets) {
+          decrypted[item.name] = this.metadata?.decryptEnvelope(record.ownerId, item.environmentId, item.name, item.version, item.envelope) ?? '';
+        }
+        environment = decrypted;
+      } else if (record.environmentId) {
+        environment = this.metadata?.environmentValues(record.ownerId, record.environmentId) ?? {};
+      }
+    } catch (error) {
+      if (error instanceof HarnessError) throw error;
+      throw new HarnessError('UNAVAILABLE', 'Workspace secret injection is temporarily unavailable', 503, false);
+    }
+    const env = validatedWorkspaceEnvironment(environment);
+    this.envMemo.set(record.id, { generation: record.generation, env });
+    return env;
+  }
+
+  private provisionContextFor(record: WorkspaceRecord, signal?: AbortSignal, environment?: Record<string, string>, leaseExpiresAt?: number): ProvisionContext {
+    return {
+      record,
+      environment: environment ?? this.workspaceEnvironment(record),
+      networkProfile: record.networkProfile,
+      stagingDir: this.stagingDirFor(record),
+      ...(signal ? { signal } : {}),
+      ...(leaseExpiresAt !== undefined ? { leaseExpiresAt } : {})
+    };
+  }
+
+  /**
+   * Executor access handed to OperationManager for stream/kill/PTY routing.
+   * Docker records return undefined on purpose: their interactive paths are the
+   * historical spawnDocker/DockerPtyClient/terminateContainerProcessGroup calls,
+   * which the backend seam replicates but cannot improve — notably `CH_COMMAND`
+   * travels as a `-e` argv element today, while the backend env-file channel
+   * rejects newline-bearing values. Non-docker records resolve through the
+   * injected backend; any resolution failure yields no access so the manager's
+   * legacy path fails loudly against the executor name rather than silently
+   * degrading a backend error into a wrong-backend success.
+   */
+  private operationExecutorAccess(workspaceId: string): { backend: ExecutorBackend; ctx: ProvisionContext } | undefined {
+    try {
+      const record = this.store.byId(workspaceId);
+      if (!record) return undefined;
+      const kind = record.backendKind ?? 'docker';
+      if (kind === 'docker') return undefined;
+      const { backend } = this.backendStack(kind);
+      return { backend, ctx: this.provisionContextFor(record) };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** provision() through the record's backend; returns the persisted executor id. */
+  private async provisionExecutor(record: WorkspaceRecord, environment: Record<string, string>, signal?: AbortSignal): Promise<string> {
+    const { backend } = this.backendStack(record.backendKind ?? 'docker');
+    const ref = await backend.provision(this.provisionContextFor(record, signal, environment));
+    return ref.executorId;
+  }
+
+  /** destroy() tolerant of an executorId that was never persisted on the record. */
+  private async destroyExecutor(record: WorkspaceRecord, executorId?: string): Promise<void> {
+    const { backend } = this.backendStack(record.backendKind ?? 'docker');
+    const ctxRecord = executorId !== undefined && executorId !== record.containerName
+      ? { ...record, containerName: executorId }
+      : record;
+    // Lifecycle verbs never consume the provision environment.
+    await backend.destroy(this.provisionContextFor(ctxRecord, undefined, {}));
+  }
+
+  /**
+   * Release the running executor while keeping workspace data: docker records
+   * destroy the container exactly as before; VM records stop the VM so its disk
+   * survives for workspace_recover. Explicit close always uses destroyExecutor.
+   */
+  private async releaseExecutor(record: WorkspaceRecord): Promise<void> {
+    const kind = record.backendKind ?? 'docker';
+    const { backend } = this.backendStack(kind);
+    if (kind === 'docker') {
+      await backend.destroy(this.provisionContextFor(record, undefined, {}));
+    } else {
+      await backend.stop(this.provisionContextFor(record, undefined, {}));
+    }
+  }
+
+  /** Times most recently pushed per workspace — dedup for touch-driven sync. */
+  private readonly leaseSyncSent = new Map<string, { generation: number; expiresAt: number; hardExpiresAt: number }>();
+  /** Latest coalescible push per workspace — touch/compensation updates collapse into it. */
+  private readonly leaseSyncPending = new Map<string, WorkspaceRecord>();
+  /** Workspaces with a flush entry already queued — bounds depth to stricts + one flusher. */
+  private readonly leaseSyncFlushQueued = new Set<string>();
+  /** Serialized per-workspace lease queue: every push chains behind the prior one. */
+  private readonly leaseSyncQueues = new Map<string, Promise<LeaseSyncOutcome>>();
+  /** Bumped on lease clear so pushes enqueued before it cannot resurrect the lease. */
+  private readonly leaseSyncEpochs = new Map<string, number>();
+  /** Per-workspace mutex serializing whole acknowledged lease transitions (L2). */
+  private readonly leaseTransitionLocks = new Map<string, Promise<void>>();
+
+  /** Max pending records one flush entry drains before rescheduling — bounds strict starvation. */
+  private static readonly LEASE_FLUSH_DRAIN_LIMIT = 8;
+
+  private leaseSyncNoteSent(record: WorkspaceRecord): void {
+    if ((record.backendKind ?? 'docker') === 'docker' || !this.leaseSync) return;
+    this.leaseSyncSent.set(record.id, { generation: record.generation, expiresAt: record.expiresAt, hardExpiresAt: record.hardExpiresAt });
+  }
+
+  /**
+   * Append one serialized lease operation. Entries run strictly in enqueue
+   * order — which matches store-commit order because every caller commits the
+   * store first and enqueues synchronously after — so the durable lease always
+   * converges on the newest acknowledged times. The epoch re-check drops ops
+   * enqueued before a lease.clear. The queue never rejects: each entry settles
+   * independently so one failure cannot poison later syncs.
+   */
+  private enqueueLeaseOp(workspaceId: string, op: (epoch: number) => Promise<void>): Promise<LeaseSyncOutcome> {
+    const epoch = this.leaseSyncEpochs.get(workspaceId) ?? 0;
+    const prior = this.leaseSyncQueues.get(workspaceId) ?? Promise.resolve<LeaseSyncOutcome>({ ok: true });
+    const next = prior.then(async (): Promise<LeaseSyncOutcome> => {
+      if ((this.leaseSyncEpochs.get(workspaceId) ?? 0) !== epoch) return { ok: true };
+      try {
+        await op(epoch);
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error };
+      }
+    });
+    this.leaseSyncQueues.set(workspaceId, next);
+    const cleanup = () => { if (this.leaseSyncQueues.get(workspaceId) === next) this.leaseSyncQueues.delete(workspaceId); };
+    void next.then(cleanup, cleanup);
+    return next;
+  }
+
+  /**
+   * Schedule the coalesced flush for a workspace. At most one flush entry is
+   * ever queued, so high-frequency touches collapse into bounded queue depth
+   * instead of N promise entries. Each entry drains up to
+   * LEASE_FLUSH_DRAIN_LIMIT pending records then reschedules itself when more
+   * arrived, so acknowledged strict transitions are never starved behind
+   * continuous activity.
+   */
+  private scheduleLeaseFlush(workspaceId: string): void {
+    if (this.leaseSyncFlushQueued.has(workspaceId) || !this.leaseSyncPending.has(workspaceId)) return;
+    this.leaseSyncFlushQueued.add(workspaceId);
+    void this.enqueueLeaseOp(workspaceId, async (epoch) => {
+      this.leaseSyncFlushQueued.delete(workspaceId);
+      for (let drained = 0; drained < WorkspaceService.LEASE_FLUSH_DRAIN_LIMIT; drained += 1) {
+        if ((this.leaseSyncEpochs.get(workspaceId) ?? 0) !== epoch) return;
+        const record = this.leaseSyncPending.get(workspaceId);
+        if (!record) return;
+        this.leaseSyncPending.delete(workspaceId);
+        try {
+          await this.leaseSync!.set(record);
+          this.leaseSyncNoteSent(record);
+        } catch { /* under-grant direction only — see leaseSyncSet */ }
+      }
+      if (this.leaseSyncPending.has(workspaceId)) this.scheduleLeaseFlush(workspaceId);
+    });
+  }
+
+  /**
+   * Serialize a whole acknowledged lease transition per workspace: durable
+   * pre-set → store publish → final sync → compensation must be atomic versus
+   * other transitions, or a failed transition's rollback could restore older
+   * times over a newer successful one (L2). The critical section re-reads the
+   * record inside the lock so fencing and rollback target the pre-transition
+   * state, never the caller's possibly-stale snapshot.
+   */
+  private async withLeaseTransitionLock<T>(workspaceId: string, action: () => Promise<T>): Promise<T> {
+    const prior = this.leaseTransitionLocks.get(workspaceId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = prior.then(() => gate);
+    this.leaseTransitionLocks.set(workspaceId, tail);
+    const cleanup = () => { if (this.leaseTransitionLocks.get(workspaceId) === tail) this.leaseTransitionLocks.delete(workspaceId); };
+    void tail.then(cleanup, cleanup);
+    await prior;
+    try {
+      return await action();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Best-effort lease push for non-acknowledged seams (open/adopt re-assert,
+   * failure compensation). Coalesces into the pending slot — only the latest
+   * record matters since lease.set applies absolute times — and awaits the
+   * queue tail so the push is attempted before returning. Failures are
+   * swallowed: the durable lease can only end up SHORTER than the store.
+   */
+  private async leaseSyncSet(record: WorkspaceRecord): Promise<void> {
+    if ((record.backendKind ?? 'docker') === 'docker' || !this.leaseSync) return;
+    this.leaseSyncPending.set(record.id, record);
+    this.scheduleLeaseFlush(record.id);
+    const tail = this.leaseSyncQueues.get(record.id);
+    if (tail) await tail;
+  }
+
+  /**
+   * Acknowledged-transition lease push: propagates failure so the caller can
+   * roll the store transition back. NEVER deduplicated or coalesced — the
+   * backend writes leases through its own channel that the sent-map cannot
+   * observe, so only an unconditional ordered push guarantees the durable
+   * deadline matches the record being published. VM records without a wired
+   * leaseSync fail closed. Docker records are a no-op.
+   */
+  private async leaseSyncSetStrict(record: WorkspaceRecord): Promise<void> {
+    if ((record.backendKind ?? 'docker') === 'docker') return;
+    if (!this.leaseSync) {
+      throw new HarnessError('UNAVAILABLE', 'VM lease sync is not wired on this runner', 503, true);
+    }
+    const outcome = await this.enqueueLeaseOp(record.id, async () => {
+      await this.leaseSync!.set(record);
+      this.leaseSyncNoteSent(record);
+    });
+    if (!outcome.ok) throw outcome.error;
+  }
+
+  /**
+   * Every expiry-extending touch must reach the durable supervisor lease or
+   * the watchdog stops the VM at the stale deadline while the store claims
+   * ACTIVE. Coalesced into the pending slot (only the newest times matter),
+   * deduplicated on the exact times triple, flushed through the serialized
+   * queue, bounded by the adapter's call timeout. Under-grant only: a failed
+   * push leaves the durable lease shorter — never longer than acknowledged.
+   */
+  private enqueueLeaseSync(record: WorkspaceRecord): void {
+    if ((record.backendKind ?? 'docker') === 'docker' || !this.leaseSync) return;
+    const sent = this.leaseSyncSent.get(record.id);
+    if (sent && sent.generation === record.generation
+      && sent.expiresAt === record.expiresAt && sent.hardExpiresAt === record.hardExpiresAt) return;
+    this.leaseSyncPending.set(record.id, record);
+    this.scheduleLeaseFlush(record.id);
+  }
+
+  private leaseSyncClear(record: WorkspaceRecord): void {
+    this.leaseSyncEpochs.set(record.id, (this.leaseSyncEpochs.get(record.id) ?? 0) + 1);
+    this.leaseSyncSent.delete(record.id);
+    this.leaseSyncPending.delete(record.id);
+    this.leaseSyncFlushQueued.delete(record.id);
+    this.leaseSyncQueues.delete(record.id);
+    try { void Promise.resolve(this.leaseSync?.clear(record)).catch(() => undefined); } catch { /* ignore */ }
+  }
+
+  /**
+   * Phase-09 capability gate. The operation→capability classification is owned
+   * by vm-capabilities.ts (exhaustive over RunnerOperation and
+   * InternalRunnerOperation); an operation missing from both records is a
+   * contract bug and fails closed rather than aliasing host-only. Host-only
+   * operations return before the backend stack is even resolved.
+   */
+  private assertExecutorCapability(record: WorkspaceRecord, operation: string): void {
+    const cls = executorOperationClass(operation);
+    if (cls === undefined) {
+      throw new HarnessError('INTERNAL_ERROR', `operation ${operation} has no executor capability classification`, 500, false);
+    }
+    if (cls === 'host-only') return;
+    const { backend } = this.backendStack(record.backendKind ?? 'docker');
+    assertExecutorOperationSupported(backend, operation);
   }
 
   /**
@@ -576,19 +966,41 @@ export class WorkspaceService {
     }
     await mkdir(this.config.jobsRoot, { recursive: true, mode: 0o700 });
     for (const record of this.store.active()) {
+      const recordKind = record.backendKind ?? 'docker';
       if (record.status === 'NETWORK_QUARANTINED') {
         if (record.containerName) {
           try {
-            await removeContainer(record.containerName);
-            this.store.update(record.id, { containerName: null });
+            if (recordKind === 'docker') {
+              await removeContainer(record.containerName);
+              this.store.update(record.id, { containerName: null });
+            } else {
+              // Quarantine stops the VM but keeps its disk: the checkout lives
+              // only inside the guest, so identity must survive for recovery.
+              const { backend } = this.backendStack(recordKind);
+              await backend.stop(this.provisionContextFor(record, undefined, {}));
+            }
           } catch {
             // retain record.containerName for retry
           }
         }
         continue;
       }
-      if (record.status === 'CREATING') await this.closeRecord(record, 'runner restarted during workspace creation');
-      else if (!record.containerName || !(await inspectContainer(record.containerName))) await this.closeRecord(record, 'executor missing during startup reconciliation');
+      if (record.status === 'CREATING') { await this.closeRecord(record, 'runner restarted during workspace creation'); continue; }
+      if (recordKind !== 'docker') {
+        // VM executors are not docker containers: inspect through the backend.
+        // A definitively missing VM means its disk is gone, so the workspace
+        // closes exactly like a missing docker executor; an unreachable or
+        // unknown supervisor state is left alone rather than destroyed.
+        const { backend } = this.backendStack(recordKind);
+        const inspection = await backend.inspect(this.provisionContextFor(record, undefined, {})).catch(() => undefined);
+        if (!record.containerName || inspection?.state === 'missing') {
+          await this.closeRecord(record, 'executor missing during startup reconciliation');
+        } else if (inspection && inspection.state !== 'unknown') {
+          await this.ensureActiveExecutor(record);
+        }
+        continue;
+      }
+      if (!record.containerName || !(await inspectContainer(record.containerName))) await this.closeRecord(record, 'executor missing during startup reconciliation');
       else {
         const inspection = await inspectContainer(record.containerName);
         const hostConfig = inspection?.HostConfig as { NetworkMode?: string } | undefined;
@@ -751,6 +1163,7 @@ export class WorkspaceService {
    * and the recoverable window opens from the expiry itself rather than from the last tool activity.
    */
   private markExpiredRecoverable(claimed: WorkspaceRecord, now: number): WorkspaceRecord | undefined {
+    this.leaseSyncClear(claimed);
     return this.store.updateFenced(claimed.id, claimed.generation, ['REAPING'], {
       status: 'EXPIRED_RECOVERABLE',
       containerName: null,
@@ -789,7 +1202,7 @@ export class WorkspaceService {
         if (claimed) {
           this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
           if (claimed.containerName) {
-            await removeContainer(claimed.containerName).catch(() => undefined);
+            await this.releaseExecutor(claimed).catch(() => undefined);
           }
           this.markExpiredRecoverable(claimed, now);
         }
@@ -805,40 +1218,46 @@ export class WorkspaceService {
     if (freeBytes < this.config.minFreeBytes) throw new HarnessError('LIMIT_EXCEEDED', 'host free-space reserve would be violated', 507, true);
   }
 
+  /**
+   * Host-side byte total of a directory tree, capped at `capBytes`: the walk
+   * stops as soon as the cap is exceeded so an oversized tree fails fast
+   * instead of being fully enumerated. Used only where no executor exists to
+   * measure inside (a VM that has not been provisioned yet).
+   */
+  private async measureHostTreeBytes(root: string, capBytes: number): Promise<number> {
+    let total = 0;
+    let capped = false;
+    const walk = async (dir: string): Promise<void> => {
+      if (capped) return;
+      const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (capped) return;
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(path);
+        } else if (entry.isFile()) {
+          total += (await stat(path).catch(() => undefined))?.size ?? 0;
+        } else if (entry.isSymbolicLink()) {
+          total += (await lstat(path).catch(() => undefined))?.size ?? 0;
+        }
+        if (total > capBytes) capped = true;
+      }
+    };
+    await walk(root);
+    return total;
+  }
+
   private async workspaceBytes(record: WorkspaceRecord): Promise<number | undefined> {
-    let result;
-    if (record.containerName) {
-      result = await runDocker(
-        ['exec', record.containerName, '/usr/bin/du', '-sb', '--apparent-size', '/workspace', '/opt/user-tools', '/var/cache/harness'],
-        { timeoutMs: 30_000, maxBytes: 8_192 }
-      );
+    const kind = record.backendKind ?? 'docker';
+    if (kind !== 'docker' && !record.containerName) {
+      // Before the VM exists there is no guest to measure; the host staging
+      // tree under the job path is the only real usage, so measure it directly.
+      return await this.measureHostTreeBytes(record.workspacePath, this.config.maxWorkspaceBytes + 1);
     }
-    if (!result || result.exitCode !== 0) {
-      const helperName = `chm-size-${record.id.slice(3, 15)}-${randomBytes(4).toString('hex')}`;
-      try {
-        result = await runDocker([
-          'run', '--rm', '--pull', 'never', '--name', helperName,
-          '--label', 'cloud-harness.role=size-helper', '--label', 'cloud-harness.ephemeral=true',
-          '--label', `cloud-harness.instance=${this.instanceId}`, '--label', `cloud-harness.workspace=${record.id}`,
-          '--network', 'none', '--user', '0:0', '--read-only',
-          '--pids-limit', '32', '--memory', '128m', '--memory-swap', '128m', '--cpus', '0.25',
-          '--volume', `${record.workspacePath}:/target:ro`, '--entrypoint', '/usr/bin/du', this.config.executorImage,
-          '-sb', '--apparent-size', '/target'
-        ], { timeoutMs: 30_000, maxBytes: 8_192 });
-      } finally {
-        await removeContainer(helperName);
-      }
-    }
-    if (result.exitCode !== 0) return undefined;
-    const lines = result.stdout.trim().split('\n');
-    let totalBytes = 0;
-    for (const line of lines) {
-      const bytes = Number(line.trim().split(/\s+/, 1)[0]);
-      if (Number.isSafeInteger(bytes) && bytes >= 0) {
-        totalBytes += bytes;
-      }
-    }
-    return totalBytes >= 0 ? totalBytes : undefined;
+    // The backend owns the 3-path du measurement plus the host helper fallback;
+    // it throws UNAVAILABLE when the size cannot be measured safely.
+    const { backend } = this.backendStack(kind);
+    return await backend.measureWorkspaceBytes(this.provisionContextFor(record, undefined, {}));
   }
 
   private async resourceViolation(record: WorkspaceRecord): Promise<string | undefined> {
@@ -976,169 +1395,41 @@ export class WorkspaceService {
       : undefined;
   }
 
-  private async provisionMountDirectories(record: WorkspaceRecord): Promise<{ toolsPath: string; cachePath: string; ownerSkillsPath: string }> {
-    const jobPath = record.workspacePath;
-    const toolsPath = join(jobPath, 'tools');
-    const cachePath = join(jobPath, 'cache');
-    const ownerSkillsPath = join(jobPath, 'toolkit-projection', 'owner-skills');
-    await mkdir(toolsPath, { recursive: true, mode: 0o755 });
-    await mkdir(cachePath, { recursive: true, mode: 0o755 });
-    await mkdir(ownerSkillsPath, { recursive: true, mode: 0o755 });
-    try {
-      await chown(toolsPath, 10001, 10001);
-      await chown(cachePath, 10001, 10001);
-      await chown(ownerSkillsPath, 10001, 10001);
-      await chmod(toolsPath, 0o755);
-      await chmod(cachePath, 0o755);
-      await chmod(ownerSkillsPath, 0o755);
-    } catch {
-      const helperName = `chm-chown-${record.id.slice(3, 15)}-${randomBytes(4).toString('hex')}`;
-      try {
-        const result = await runDocker([
-          'run', '--rm', '--pull', 'never', '--name', helperName,
-          '--label', 'cloud-harness.role=chown-helper', '--label', 'cloud-harness.ephemeral=true',
-          '--label', `cloud-harness.instance=${this.instanceId}`, '--label', `cloud-harness.workspace=${record.id}`,
-          '--network', 'none', '--user', '0:0',
-          '--volume', `${jobPath}:/job`,
-          '--entrypoint', '/bin/sh', this.config.executorImage,
-          '-c', 'mkdir -p /job/tools /job/cache /job/toolkit-projection/owner-skills && chown -R 10001:10001 /job/tools /job/cache /job/toolkit-projection/owner-skills && chmod -R 0755 /job/tools /job/cache /job/toolkit-projection/owner-skills'
-        ], { timeoutMs: 30_000, maxBytes: 8_192 });
-        if (result.exitCode !== 0) {
-          throw new HarnessError('UNAVAILABLE', `mount directory provisioning failed: ${result.stderr || result.stdout}`.slice(0, 2_000), 502, true);
-        }
-      } finally {
-        await removeContainer(helperName);
-      }
+  /**
+   * Adopt, gated-start, or provision the workspace executor through its backend.
+   * The docker adapter reproduces the historical inspect/start/rebuild flow;
+   * the incus backend adopts only on full identity match. Persisted executor
+   * identity (`containerName`) changes only when the backend returns a new id —
+   * callers own the ACTIVE status transition either way.
+   */
+  private async ensureActiveExecutor(record: WorkspaceRecord, leaseExpiresAt?: number): Promise<WorkspaceRecord> {
+    const { backend } = this.backendStack(record.backendKind ?? 'docker');
+    const ref = await backend.ensureActive(this.provisionContextFor(record, undefined, undefined, leaseExpiresAt));
+    if (record.containerName && ref.executorId === record.containerName) {
+      // Existing executor adopted or restarted in place; identity unchanged.
+      return record;
     }
-    return { toolsPath, cachePath, ownerSkillsPath };
-  }
-
-  private async createExecutor(record: WorkspaceRecord, repositoryPath: string, environment: Record<string, string> = {}): Promise<string> {
-    const name = `cloud-harness-ws-${record.id.slice(3, 19).toLowerCase()}`;
-    await removeContainer(name).catch(() => undefined);
-    const { toolsPath, cachePath, ownerSkillsPath } = await this.provisionMountDirectories(record);
-    // Recorded as the workspace's profile; later binding changes apply only when the executor is recreated.
-    const packageProfile = this.config.packagesEnabled === true
-      ? this.packages.profileFor(record.ownerId, record.id)
-      : { mounts: [], binDirs: [] };
-    const envEntries = Object.entries(environment);
-    const envFilePath = join(record.workspacePath, `.env.injected-${randomBytes(6).toString('hex')}`);
-    let useEnvFile = false;
-    if (envEntries.length > 0) {
-      const content = envEntries.map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
-      await writeFile(envFilePath, content, { mode: 0o600, encoding: 'utf8' });
-      useEnvFile = true;
-    }
-    try {
-      await this.networkProfileManager.ensureProfileReady(record.networkProfile);
-      const networkArgs = this.networkProfileManager.dockerLaunchArgs(record.networkProfile);
-      const args = [
-        'create', '--name', name,
-        '--label', 'cloud-harness.managed=true', '--label', `cloud-harness.instance=${this.instanceId}`,
-        '--label', `cloud-harness.workspace=${record.id}`,
-        ...EXECUTOR_HARDENING_ARGS, '--workdir', '/workspace',
-        ...networkArgs,
-        '--volume', `${repositoryPath}:/workspace:rw`,
-        '--volume', `${toolsPath}:/opt/user-tools:rw`,
-        '--volume', `${cachePath}:/var/cache/harness:rw`,
-        '--volume', `${ownerSkillsPath}:/opt/cloud-harness/owner-skills:ro`,
-        ...builtinSkillsMountArgs(this.config.builtinSkillsRoot),
-        ...packageProfile.mounts.flatMap((mount) => ['--volume', `${mount.source}:${mount.target}:ro`]),
-        '--env', 'HOME=/tmp/cloud-harness-home',
-        '--env', 'GIT_CONFIG_NOSYSTEM=1',
-        '--env', 'XDG_CONFIG_HOME=/tmp/cloud-harness-home/.config',
-        '--env', 'XDG_CACHE_HOME=/var/cache/harness',
-        '--env', 'XDG_DATA_HOME=/opt/user-tools/data',
-        '--env', 'NPM_CONFIG_PREFIX=/opt/user-tools',
-        '--env', 'NPM_CONFIG_CACHE=/var/cache/harness/npm',
-        '--env', 'UV_CACHE_DIR=/var/cache/harness/uv',
-        '--env', 'BUN_INSTALL=/opt/user-tools/bun',
-        '--env', 'PNPM_HOME=/opt/user-tools/pnpm',
-        '--env', 'UV_TOOL_BIN_DIR=/opt/user-tools/bin',
-        '--env', `PATH=${withManagedBins(EXECUTOR_PATH, packageProfile.binDirs)}`,
-        ...managedPathEnvArgs(packageProfile.binDirs),
-        ...(useEnvFile ? ['--env-file', envFilePath] : []),
-        this.config.executorImage
-      ];
-      const created = await runDocker(args, { timeoutMs: 30_000 });
-      if (created.exitCode !== 0) throw new HarnessError('UNAVAILABLE', `executor creation failed: ${created.stderr}`.slice(0, 2_000), 502, true);
-      const started = await runDocker(['start', name], { timeoutMs: 30_000 });
-      if (started.exitCode !== 0) {
-        await removeContainer(name);
-        throw new HarnessError('UNAVAILABLE', `executor start failed: ${started.stderr}`.slice(0, 2_000), 502, true);
-      }
-      return name;
-    } finally {
-      if (useEnvFile) {
-        await rm(envFilePath, { force: true }).catch(() => undefined);
-      }
-    }
-  }
-
-  private async ensureActiveExecutor(record: WorkspaceRecord): Promise<WorkspaceRecord> {
-    // Dependency-access requires a fresh attestation before reuse; a quarantined
-    // record must never resume its existing container. Force removal and rebuild
-    // through createExecutor (which re-attests) instead of reusing a container
-    // that may sit behind a drifted firewall.
-    const mustRebuild = record.networkProfile === 'dependency-access' || record.status === 'NETWORK_QUARANTINED';
-    if (record.containerName && mustRebuild) {
-      await removeContainer(record.containerName).catch(() => undefined);
-    } else if (record.containerName) {
-      const inspected = await inspectContainer(record.containerName);
-      if (inspected) {
-        const state = inspected.State as { Running?: boolean } | undefined;
-        if (state?.Running) {
-          return record;
-        }
-        const started = await runDocker(['start', record.containerName], { timeoutMs: 30_000 });
-        if (started.exitCode === 0) {
-          return record;
-        }
-      }
-      await removeContainer(record.containerName).catch(() => undefined);
-    }
-    const repositoryPath = join(record.workspacePath, 'repo');
-    const repoExists = await stat(repositoryPath).then(() => true).catch(() => false);
-    if (!repoExists) {
-      throw new HarnessError('EXPIRED', 'workspace repository data is no longer retained on disk and cannot be recovered', 410);
-    }
-    let environment: Record<string, string> = {};
-    try {
-      const snapshotResult = this.store.getSecretSnapshot(record.id);
-      if (snapshotResult.initialized) {
-        const decrypted: Record<string, string> = {};
-        for (const item of snapshotResult.secrets) {
-          decrypted[item.name] = this.metadata?.decryptEnvelope(record.ownerId, item.environmentId, item.name, item.version, item.envelope) ?? '';
-        }
-        environment = decrypted;
-      } else if (record.environmentId) {
-        environment = this.metadata?.environmentValues(record.ownerId, record.environmentId) ?? {};
-      }
-    } catch (error) {
-      if (error instanceof HarnessError) throw error;
-      throw new HarnessError('UNAVAILABLE', 'Workspace secret injection is temporarily unavailable', 503, false);
-    }
-    const containerName = await this.createExecutor(record, repositoryPath, validatedWorkspaceEnvironment(environment));
     let updated: WorkspaceRecord | undefined;
     try {
       updated = this.store.activateWithLimit(
         record.id,
         record.generation,
         ['ACTIVE', 'EXPIRED_RECOVERABLE', 'NETWORK_QUARANTINED'],
-        { containerName, status: 'ACTIVE', error: null },
+        { containerName: ref.executorId, status: 'ACTIVE', error: null },
         this.configuredActiveWorkspaceLimit()
       );
     } catch (error) {
-      await removeContainer(containerName).catch(() => undefined);
+      await this.destroyExecutor({ ...record, containerName: ref.executorId }).catch(() => undefined);
       if (error instanceof ActiveWorkspaceLimitReachedError) {
         throw this.activeWorkspaceLimitError(error.active, error.limit);
       }
       throw error;
     }
     if (!updated) {
-      await removeContainer(containerName).catch(() => undefined);
+      await this.destroyExecutor({ ...record, containerName: ref.executorId }).catch(() => undefined);
       throw new HarnessError('CONFLICT', 'workspace lifecycle changed during executor activation', 409, true);
     }
+    await this.leaseSyncSet(updated);
     return updated;
   }
 
@@ -1152,11 +1443,36 @@ export class WorkspaceService {
       }
       return { ok: prior.status === 'ACTIVE', message: 'Idempotent workspace result', data: this.openedWorkspaceData(prior), truncated: false };
     }
+    const backendKind: ExecutorBackendKind = parsed.executionBackend ?? 'docker';
+    // Resolve the backend before admission: an unwired kind fails fast instead
+    // of admitting a record that could never provision. Docker is the default.
+    this.backendStack(backendKind);
     await this.ensureCapacity(ownerId);
     const url = await validateRepositoryUrl(parsed.repositoryUrl, this.config.allowedGitHosts);
     if (parsed.ref?.startsWith('-')) throw new HarnessError('INVALID_INPUT', 'ref cannot start with a dash');
     const now = Date.now();
     const workspaceId = opaqueId('ws');
+    // Immutable VM identity is generated at admission — before any backend call —
+    // so a lost provision reply can always be reconciled against the persisted
+    // name/instance/template triple. Docker records keep all four fields null.
+    let vmIdentity: { vmName: string; backendInstanceId: string; templateId: string; templateDigest: string } | undefined;
+    if (backendKind === 'incus-vm') {
+      const templateId = this.config.vmTemplateId;
+      const templateDigest = this.config.vmTemplateDigest;
+      if (!templateId || !templateDigest) {
+        throw new HarnessError('VM_BACKEND_DISABLED', 'incus-vm workspaces require VM_TEMPLATE_ID and VM_TEMPLATE_DIGEST on the runner', 503, false);
+      }
+      // UX pre-check only (wired by the entrypoint): rejects obvious quota
+      // violations before a record exists. The supervisor's vm.start gate
+      // stays authoritative on every start path regardless of this result.
+      await this.vmAdmission?.({ ownerId });
+      vmIdentity = {
+        vmName: `chm-vm-${createHash('sha256').update(workspaceId).digest('hex').slice(0, 32)}`,
+        backendInstanceId: randomUUID(),
+        templateId,
+        templateDigest
+      };
+    }
     // The lifecycle policy is snapshotted here: a later Settings change applies to workspaces opened after
     // it and never shortens or extends this one. The hard deadline is the wall-TTL snapshot.
     const policy = this.effectiveLifecyclePolicy();
@@ -1165,6 +1481,8 @@ export class WorkspaceService {
       id: workspaceId, ownerId, idempotencyKey: parsed.idempotencyKey, repositoryUrl: url.toString(),
       repositoryRef: parsed.ref ?? null, containerName: null, workspacePath: join(this.config.jobsRoot, workspaceId),
       environmentId: parsed.environmentId ?? null,
+      backendKind,
+      ...(vmIdentity ?? {}),
       // Resolution order: explicit request, then the operator's persisted instance
       // default, then the runner configuration (shipped default: dependency-access).
       status: 'CREATING', networkProfile: parsed.networkProfile ?? this.store.getWorkspaceDefaultNetworkProfile() ?? this.config.networkProfile, createdAt: now,
@@ -1256,11 +1574,25 @@ export class WorkspaceService {
 
       const cloneViolation = await this.resourceViolation(record);
       if (cloneViolation) throw new HarnessError('LIMIT_EXCEEDED', cloneViolation, 507, false);
-      const containerName = await this.createExecutor(record, repositoryPath, validatedWorkspaceEnvironment(environment ?? {}));
-      const active = this.store.updateFenced(workspaceId, record.generation, ['CREATING'], { containerName, status: 'ACTIVE', lastActivityAt: Date.now(), error: null });
+      const executorId = await this.provisionExecutor(record, validatedWorkspaceEnvironment(environment ?? {}));
+      const active = this.store.updateFenced(workspaceId, record.generation, ['CREATING'], { containerName: executorId, status: 'ACTIVE', lastActivityAt: Date.now(), error: null });
       if (!active) {
-        await removeContainer(containerName);
+        await this.destroyExecutor({ ...record, containerName: executorId }).catch(() => undefined);
         throw new HarnessError('CONFLICT', 'workspace creation lost its lifecycle lease', 409, true);
+      }
+      await this.leaseSyncSet(active);
+      if (backendKind !== 'docker') {
+        // The host clone at workspacePath/repo is staging only for a VM: seed
+        // the guest /workspace checkout, then project owner skills through the
+        // backend's tree channel (docker mounts them; a VM cannot).
+        const stack = this.backendStack(backendKind);
+        const seedCtx = this.provisionContextFor(active);
+        await stack.git.seedCheckout(seedCtx, repositoryPath);
+        const ownerSkillsHost = join(record.workspacePath, 'toolkit-projection', 'owner-skills');
+        const ownerSkillsReady = await stat(ownerSkillsHost).then((s) => s.isDirectory()).catch(() => false);
+        if (ownerSkillsReady) {
+          await stack.backend.pushTree(seedCtx, ownerSkillsHost, '/opt/cloud-harness/owner-skills');
+        }
       }
       await this.runLifecycleHooks(active, 'on_workspace_open').catch(() => undefined);
       // Eager guidance bootstrap: scanned after open hooks so the snapshot reflects the checkout an
@@ -1280,6 +1612,7 @@ export class WorkspaceService {
       this.store.updateFenced(workspaceId, record.generation, ['CREATING'], { status: 'FAILED', error: message.slice(0, 2_000) });
       this.store.deleteSecretSnapshot(workspaceId);
       this.redactorCache.delete(workspaceId);
+      this.envMemo.delete(workspaceId);
       await this.safeRemovePath(record.workspacePath);
       throw error;
     }
@@ -1553,10 +1886,28 @@ export class WorkspaceService {
     // Privileged execution is approved on the operator Dashboard, so only a mode that serves it can offer it.
     const privileged = hasOperatorDashboard(this.config.authMode);
 
+    // Phase-03 backend seam: report which executor backend this workspace runs on
+    // plus its capability matrix. An unwired backend still reports its kind; the
+    // structured block appears once a factory can resolve it.
+    const backendKind: ExecutorBackendKind = record.backendKind ?? 'docker';
+    let backendInfo: WorkspaceBackendInfo | undefined;
+    try {
+      const { backend } = this.backendStack(backendKind);
+      backendInfo = {
+        kind: backendKind,
+        ...(record.templateId ? { templateId: record.templateId } : {}),
+        capabilities: backend.capabilities()
+      };
+    } catch {
+      backendInfo = undefined;
+    }
+
     return {
       workspaceId: record.id,
       repository: repoName,
       repositoryUrl: record.repositoryUrl,
+      executionBackend: backendKind,
+      ...(backendInfo ? { backend: backendInfo } : {}),
       capabilities: {
         repository: {
           read: contentsRead,
@@ -1714,7 +2065,7 @@ export class WorkspaceService {
       if (claimed) {
         this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
         if (claimed.containerName) {
-          void removeContainer(claimed.containerName).catch(() => undefined);
+          void this.releaseExecutor(claimed).catch(() => undefined);
         }
         this.markExpiredRecoverable(claimed, now);
         throw new HarnessError('EXPIRED', 'workspace expired', 410);
@@ -1726,13 +2077,22 @@ export class WorkspaceService {
 
   private touch(record: WorkspaceRecord): WorkspaceRecord {
     if (record.status === 'EXPIRED_RECOVERABLE' || record.status === 'NETWORK_QUARANTINED') return record;
+    // Re-read the authoritative row: callers can hold a record loaded before a
+    // concurrent lease_renew extended expiresAt, and deriving from the stale
+    // copy would shorten the acknowledged deadline — in the store AND in the
+    // durable lease this now mirrors (M1).
+    const current = this.store.byId(record.id) ?? record;
     const now = Date.now();
     // Activity extends the idle lease but never shortens one that workspace_lease_renew already extended.
-    const touched = this.store.updateFenced(record.id, record.generation, ['ACTIVE'], {
+    const touched = this.store.updateFenced(current.id, current.generation, ['ACTIVE'], {
       lastActivityAt: now,
-      expiresAt: Math.min(record.hardExpiresAt, Math.max(record.expiresAt, this.expiry(record, now)))
+      expiresAt: Math.min(current.hardExpiresAt, Math.max(current.expiresAt, this.expiry(current, now)))
     });
     if (!touched) throw new HarnessError('EXPIRED', 'workspace lifecycle changed', 410);
+    // Every expiry extension must reach the durable supervisor lease: without
+    // it the watchdog stops the VM at the stale deadline while the store
+    // claims ACTIVE. Serialized + deduplicated + bounded inside the helper.
+    this.enqueueLeaseSync(touched);
     return touched;
   }
 
@@ -1892,6 +2252,9 @@ export class WorkspaceService {
     }
     if (!record.containerName) throw new HarnessError('UNAVAILABLE', 'workspace executor is unavailable', 503, true);
     const containerName = record.containerName;
+    const kind = record.backendKind ?? 'docker';
+    const { backend } = this.backendStack(kind);
+    const ctx = this.provisionContextFor(record, signal);
     const timeout = typeof input.timeoutMs === 'number' ? input.timeoutMs + 5_000 : 65_000;
     const operationId = (typeof input.operationId === 'string' && input.operationId) || opaqueId('op');
     const pidFile = `/tmp/cloud-harness-operations/${operationId}.pid`;
@@ -1906,10 +2269,16 @@ export class WorkspaceService {
 
     let result;
     try {
-      result = await runDocker([
-        'exec', '-i', containerName, '/usr/bin/setsid', '--wait', '/opt/harness/worker-runner.sh', operationId
-      ], {
-        stdin: JSON.stringify({ operation, input }), timeoutMs: Math.min(timeout, 305_000), maxBytes: jsonMaxBytes,
+      // The worker-runner protocol is identical on both backends; the docker
+      // adapter reproduces the historical `docker exec -i` argv byte-for-byte
+      // (empty env map → no env file), while the VM backend receives the full
+      // workspace environment because guest execs have no baked env.
+      result = await backend.exec(ctx, {
+        argv: ['/usr/bin/setsid', '--wait', '/opt/harness/worker-runner.sh', operationId],
+        stdin: JSON.stringify({ operation, input }),
+        environment: this.execEnvironmentFor(record),
+        timeoutMs: Math.min(timeout, 305_000),
+        maxBytes: jsonMaxBytes,
         abortKillGraceMs: 2_000,
         ...(signal ? { signal } : {})
       });
@@ -1919,7 +2288,7 @@ export class WorkspaceService {
         error: { code: signal?.aborted ? 'CANCELLED' : 'INTERNAL_ERROR', message: error instanceof Error ? error.message : 'worker failed', retryable: false }
       });
       if (signal?.aborted) {
-        await terminateContainerProcessGroup(containerName, pidFile);
+        await backend.killProcessGroup(ctx, pidFile).catch(() => undefined);
         throw new HarnessError('CANCELLED', 'request cancelled', 499, false);
       }
       throw error;
@@ -1962,6 +2331,84 @@ export class WorkspaceService {
     signal?: AbortSignal,
     writable = false
   ): Promise<RunnerResponse> {
+    const recordKind = record.backendKind ?? 'docker';
+    if (recordKind !== 'docker') {
+      const { backend } = this.backendStack(recordKind);
+      const mode = typeof input.mode === 'string' ? input.mode : '';
+      // close_check is an expiry-path probe and expired workspaces have NO
+      // exec path (phase-07/08 contract): the checkout leaves the VM only
+      // through the supervisor's offline vm.export — never ensureActive,
+      // never guest code, at any point relative to the hard deadline.
+      if (mode === 'close_check') {
+        const plane = this.vmGitRemoteOps(record);
+        const exportOffline = plane.exportCheckoutOffline;
+        if (typeof exportOffline !== 'function') {
+          throw new HarnessError('UNAVAILABLE', 'offline VM checkout export is not wired for this backend', 503, true);
+        }
+        // Offline export never execs guest code, so the workspace environment
+        // (and its secret materialization) is deliberately not resolved. The
+        // returned workDir holds the FULL extracted checkout — canonical VM
+        // data stays in the guest; this host staging copy must not accumulate
+        // across expiry sweeps, so it is removed on every outcome (unknown
+        // included — the verdict was already computed by then). Cleanup
+        // failure never masks the inspection result or a primary error.
+        const staging = plane.gitStaging;
+        let exportedWorkDir: string | undefined;
+        try {
+          const inspection = await exportOffline(this.provisionContextFor(record, signal, {}), {
+            maxBytes: this.config.vmMaxWorkspaceBytes,
+            ...(typeof input.cloneRef === 'string' && input.cloneRef ? { cloneRef: input.cloneRef } : {})
+          });
+          exportedWorkDir = typeof inspection.workDir === 'string' ? inspection.workDir : undefined;
+          if (inspection.verdict === 'unknown') {
+            return {
+              ok: false,
+              message: `offline checkout inspection failed: ${inspection.reason ?? 'unknown'}`,
+              data: { verdict: 'unknown' },
+              truncated: false
+            };
+          }
+          // Same data contract the worker's close_check mode returns, so
+          // autoCloseBlocker keeps its defer-on-unknown semantics unchanged.
+          return {
+            ok: true,
+            message: 'Workspace recovery status',
+            data: {
+              uncommittedPaths: inspection.uncommittedPaths ?? 0,
+              stashes: inspection.stashes ?? 0,
+              unpushedCommits: inspection.unpushedCommits ?? 0,
+              verdict: inspection.verdict
+            },
+            truncated: false
+          };
+        } finally {
+          if (exportedWorkDir && staging) {
+            await staging.removeOpDir(exportedWorkDir).catch(() => undefined);
+          }
+        }
+      }
+      // Past the hard deadline no recovery mode may start or exec the guest:
+      // resume already refuses earlier, and status/patch/snapshot_commit await
+      // the phase-08 offline transport instead of bypassing the TTL. Throwing
+      // here is the fail-closed answer until that transport is wired.
+      if (record.hardExpiresAt <= Date.now()) {
+        throw new HarnessError('EXPIRED', 'workspace hard lease limit reached; VM guest recovery is closed past the hard deadline', 410);
+      }
+      // Within the recoverable window a VM checkout exists only inside the
+      // guest: recovery modes start the executor through the backend without
+      // touching the persisted lifecycle, run the worker, then stop it again
+      // unless the record was already ACTIVE.
+      const ref = await backend.ensureActive(this.provisionContextFor(record, signal));
+      const effective = ref.executorId === record.containerName ? record : { ...record, containerName: ref.executorId };
+      const wasActive = record.status === 'ACTIVE';
+      try {
+        return await this.runWorker(effective, operation, input, signal);
+      } finally {
+        if (!wasActive) {
+          await backend.stop(this.provisionContextFor(effective, signal, {})).catch(() => undefined);
+        }
+      }
+    }
     if (record.containerName) {
       return await this.runWorker(record, operation, input, signal);
     }
@@ -1996,6 +2443,62 @@ export class WorkspaceService {
     }
   }
 
+  /** Defense in depth: the docker helper path must never see a non-docker record (VM records route through VmGitTransport before reaching here). */
+  private assertDockerGitRemote(record: WorkspaceRecord): void {
+    if ((record.backendKind ?? 'docker') !== 'docker') {
+      throw new HarnessError('VM_CAPABILITY_UNSUPPORTED', 'brokered remote Git transport is not wired for the incus-vm backend', 400, false);
+    }
+  }
+
+  /**
+   * The record's git plane viewed through the optional phase-08 remote-ops
+   * surface. Only meaningful for non-docker records; callers feature-detect
+   * each method and fail closed when absent.
+   */
+  private vmGitRemoteOps(record: WorkspaceRecord): VmGitRemoteSurface {
+    const { git } = this.backendStack(record.backendKind ?? 'docker');
+    return git as GitDataPlane & VmGitRemoteSurface;
+  }
+
+  /** Fail closed when the VM git plane lacks the named remote op. */
+  private assertVmGitRemoteAvailable(record: WorkspaceRecord, op: 'fetch' | 'push' | 'probe'): void {
+    const plane = this.vmGitRemoteOps(record);
+    const present = op === 'fetch' ? plane.remoteFetch : op === 'push' ? plane.remotePush : plane.probeRemoteRefOid;
+    if (typeof present !== 'function') {
+      throw new HarnessError('VM_CAPABILITY_UNSUPPORTED', `VM git ${op} transport is not wired for this backend`, 400, false);
+    }
+  }
+
+  /**
+   * Write-scoped push credential with the `git_push` authorization contract —
+   * shared by the online push path and the offline VM export so both enforce
+   * identical mint/fallback/required-token policy.
+   */
+  private async requirePushCredential(record: WorkspaceRecord, repositoryUrl: URL): Promise<{ token: string; repositoryUrl: URL }> {
+    const repoStr = this.extractRepositoryName(repositoryUrl);
+    let token: string | undefined;
+    try {
+      token = (await this.repositoryToken(record.ownerId, repositoryUrl, 'write'))?.token;
+    } catch (err: unknown) {
+      if (err instanceof HarnessError && (err.code === 'FORBIDDEN' || err.code === 'REPOSITORY_OPERATION_NOT_AUTHORIZED')) {
+        throw new HarnessError('REPOSITORY_OPERATION_NOT_AUTHORIZED', err.message, 403, false, {
+          operation: 'git_push',
+          repository: repoStr ?? undefined,
+          requiredCapability: 'repository.push'
+        });
+      }
+      throw err;
+    }
+    if (!token) {
+      throw new HarnessError('REPOSITORY_OPERATION_NOT_AUTHORIZED', 'Git push requires a configured GitHub App with repository write access', 403, false, {
+        operation: 'git_push',
+        repository: repoStr ?? undefined,
+        requiredCapability: 'repository.push'
+      });
+    }
+    return { token, repositoryUrl };
+  }
+
   private async runGitTransferHelper(
     record: WorkspaceRecord,
     mode: 'fetch' | 'import' | 'stage-push' | 'push',
@@ -2006,6 +2509,7 @@ export class WorkspaceService {
     signal?: AbortSignal,
     historySpec = ''
   ) {
+    this.assertDockerGitRemote(record);
     const helperName = `chm-git-${mode.replaceAll('-', '').slice(0, 5)}-${randomBytes(6).toString('hex')}`;
     const network = mode === 'fetch' || mode === 'push' ? 'bridge' : 'none';
     try {
@@ -2070,6 +2574,7 @@ export class WorkspaceService {
   }
 
   private async withPausedExecutor<T>(record: WorkspaceRecord, action: () => Promise<T>): Promise<T> {
+    this.assertDockerGitRemote(record);
     if (!record.containerName) throw new HarnessError('UNAVAILABLE', 'workspace executor is unavailable', 503, true);
     const paused = await runDocker(['pause', record.containerName], { timeoutMs: 30_000, maxBytes: 8_192 });
     if (paused.exitCode !== 0) throw new HarnessError('UNAVAILABLE', 'executor could not be paused for an atomic Git transfer', 503, true);
@@ -2084,31 +2589,29 @@ export class WorkspaceService {
     return value!;
   }
 
+  /** ProvisionContext for credential-free guest git; docker execs keep the empty env override. */
+  private gitContextFor(record: WorkspaceRecord, signal?: AbortSignal): ProvisionContext {
+    const kind = record.backendKind ?? 'docker';
+    return this.provisionContextFor(record, signal, kind === 'docker' ? {} : undefined);
+  }
+
+  /**
+   * Per-exec environment: docker keeps its baked-image environment (empty
+   * override → no env file, byte-identical argv), while the VM backend
+   * receives the complete workspace environment because guest execs have no
+   * baked env. Values travel through the backend's env channel — never argv.
+   */
+  private execEnvironmentFor(record: WorkspaceRecord): Record<string, string> {
+    return (record.backendKind ?? 'docker') === 'docker' ? {} : this.workspaceEnvironment(record);
+  }
+
   private async currentBranch(record: WorkspaceRecord, signal?: AbortSignal): Promise<string> {
-    if (record.containerName) {
-      const result = await runDocker([
-        'exec', record.containerName, 'git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.pager=cat', 'branch', '--show-current'
-      ], { timeoutMs: 30_000, maxBytes: 8_192, ...(signal ? { signal } : {}) });
-      if (result.exitCode !== 0) throw new HarnessError('CONFLICT', 'current Git branch could not be determined', 409, false);
-      return result.stdout.trim();
-    }
-    const helperName = `chm-br-${record.id.slice(3, 15)}-${randomBytes(4).toString('hex')}`;
-    try {
-      const result = await runDocker([
-        'run', '--rm', '--name', helperName,
-        '--label', 'cloud-harness.ephemeral=true',
-        '--network', 'none', '--user', '10001:10001', '--read-only',
-        '--volume', `${record.workspacePath}/repo:/workspace:ro`,
-        '--workdir', '/workspace',
-        '--entrypoint', 'git',
-        this.config.executorImage,
-        '-c', 'core.hooksPath=/dev/null', '-c', 'core.pager=cat', 'branch', '--show-current'
-      ], { timeoutMs: 30_000, maxBytes: 8_192, ...(signal ? { signal } : {}) });
-      if (result.exitCode !== 0) throw new HarnessError('CONFLICT', 'current Git branch could not be determined', 409, false);
-      return result.stdout.trim();
-    } finally {
-      await removeContainer(helperName);
-    }
+    const { git } = this.backendStack(record.backendKind ?? 'docker');
+    const result = await git.guestGit(this.gitContextFor(record, signal), [
+      '-c', 'core.hooksPath=/dev/null', '-c', 'core.pager=cat', 'branch', '--show-current'
+    ], { ...(signal ? { signal } : {}) });
+    if (result.exitCode !== 0) throw new HarnessError('CONFLICT', 'current Git branch could not be determined', 409, false);
+    return result.stdout.trim();
   }
   /**
    * Moves the checkout's remote-tracking ref to what a successful push left on the remote. The push runs
@@ -2125,34 +2628,33 @@ export class WorkspaceService {
   private async currentHead(record: WorkspaceRecord, signal?: AbortSignal, revision = 'HEAD'): Promise<string> {
     const revParse = revision === 'HEAD' ? ['rev-parse', 'HEAD'] : ['rev-parse', '--verify', '--quiet', `${revision}^{commit}`];
     const unresolved = revision === 'HEAD' ? 'current Git HEAD could not be determined' : `Git revision ${revision} could not be resolved`;
-    if (record.containerName) {
-      const result = await runDocker([
-        'exec', record.containerName, 'git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.pager=cat', ...revParse
-      ], { timeoutMs: 30_000, maxBytes: 8_192, ...(signal ? { signal } : {}) });
-      if (result.exitCode !== 0) throw new HarnessError('CONFLICT', unresolved, 409, false);
-      return result.stdout.trim();
-    }
-    const helperName = `chm-hd-${record.id.slice(3, 15)}-${randomBytes(4).toString('hex')}`;
-    try {
-      const result = await runDocker([
-        'run', '--rm', '--name', helperName,
-        '--label', 'cloud-harness.ephemeral=true',
-        '--network', 'none', '--user', '10001:10001', '--read-only',
-        '--volume', `${record.workspacePath}/repo:/workspace:ro`,
-        '--workdir', '/workspace',
-        '--entrypoint', 'git',
-        this.config.executorImage,
-        '-c', 'core.hooksPath=/dev/null', '-c', 'core.pager=cat', ...revParse
-      ], { timeoutMs: 30_000, maxBytes: 8_192, ...(signal ? { signal } : {}) });
-      if (result.exitCode !== 0) throw new HarnessError('CONFLICT', unresolved, 409, false);
-      return result.stdout.trim();
-    } finally {
-      await removeContainer(helperName);
-    }
+    const { git } = this.backendStack(record.backendKind ?? 'docker');
+    const result = await git.guestGit(this.gitContextFor(record, signal), [
+      '-c', 'core.hooksPath=/dev/null', '-c', 'core.pager=cat', ...revParse
+    ], { ...(signal ? { signal } : {}) });
+    if (result.exitCode !== 0) throw new HarnessError('CONFLICT', unresolved, 409, false);
+    return result.stdout.trim();
   }
 
   /** The branch's remote object ID, `null` when the remote answered that the branch does not exist, or `undefined` when the probe failed. */
   private async probeRemoteRefOid(record: WorkspaceRecord, branch: string, token?: string, signal?: AbortSignal): Promise<string | null | undefined> {
+    if ((record.backendKind ?? 'docker') !== 'docker') {
+      this.assertVmGitRemoteAvailable(record, 'probe');
+      const plane = this.vmGitRemoteOps(record);
+      const repositoryUrl = await validateRepositoryUrl(record.repositoryUrl, this.config.allowedGitHosts);
+      try {
+        return await plane.probeRemoteRefOid!(this.gitContextFor(record, signal), {
+          repositoryUrl: repositoryUrl.toString(),
+          branch,
+          ...(token !== undefined ? { token } : {})
+        });
+      } catch {
+        // Same tri-state contract as the docker probe: any transport failure
+        // is "unknown", which callers surface as UNKNOWN_REMOTE_STATE.
+        return undefined;
+      }
+    }
+    this.assertDockerGitRemote(record);
     const repositoryUrl = await validateRepositoryUrl(record.repositoryUrl, this.config.allowedGitHosts);
     const helperName = `chm-probe-${randomBytes(6).toString('hex')}`;
     try {
@@ -2200,6 +2702,19 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   }
 
   private async remoteFetch(record: WorkspaceRecord, remoteRef: string | undefined, signal?: AbortSignal, historySpec = '') {
+    if ((record.backendKind ?? 'docker') !== 'docker') {
+      this.assertVmGitRemoteAvailable(record, 'fetch');
+      const plane = this.vmGitRemoteOps(record);
+      const repositoryUrl = await validateRepositoryUrl(record.repositoryUrl, this.config.allowedGitHosts);
+      const token = (await this.repositoryToken(record.ownerId, repositoryUrl, 'read'))?.token;
+      return await plane.remoteFetch!(this.gitContextFor(record, signal), {
+        repositoryUrl: repositoryUrl.toString(),
+        remoteRef: remoteRef ?? '',
+        ...(historySpec ? { historySpec } : {}),
+        ...(token !== undefined ? { token } : {})
+      });
+    }
+    this.assertDockerGitRemote(record);
     const repositoryUrl = await validateRepositoryUrl(record.repositoryUrl, this.config.allowedGitHosts);
     const token = (await this.repositoryToken(record.ownerId, repositoryUrl, 'read'))?.token;
     const transferName = `git-transfer-${randomBytes(12).toString('hex')}`;
@@ -2217,28 +2732,9 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   }
 
   private async remotePush(record: WorkspaceRecord, input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
+    if ((record.backendKind ?? 'docker') !== 'docker') this.assertVmGitRemoteAvailable(record, 'push');
     const repositoryUrl = await validateRepositoryUrl(record.repositoryUrl, this.config.allowedGitHosts);
-    const repoStr = this.extractRepositoryName(repositoryUrl);
-    let token: string | undefined;
-    try {
-      token = (await this.repositoryToken(record.ownerId, repositoryUrl, 'write'))?.token;
-    } catch (err: unknown) {
-      if (err instanceof HarnessError && (err.code === 'FORBIDDEN' || err.code === 'REPOSITORY_OPERATION_NOT_AUTHORIZED')) {
-        throw new HarnessError('REPOSITORY_OPERATION_NOT_AUTHORIZED', err.message, 403, false, {
-          operation: 'git_push',
-          repository: repoStr ?? undefined,
-          requiredCapability: 'repository.push'
-        });
-      }
-      throw err;
-    }
-    if (!token) {
-      throw new HarnessError('REPOSITORY_OPERATION_NOT_AUTHORIZED', 'Git push requires a configured GitHub App with repository write access', 403, false, {
-        operation: 'git_push',
-        repository: repoStr ?? undefined,
-        requiredCapability: 'repository.push'
-      });
-    }
+    const { token } = await this.requirePushCredential(record, repositoryUrl);
     const idempotencyKey = input.idempotencyKey as string | undefined;
     const requestedRefspec = input.refspec as string | undefined;
     const branch = requestedRefspec ? '' : await this.currentBranch(record, signal);
@@ -2345,25 +2841,40 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     }
 
     const transferName = `git-transfer-${randomBytes(12).toString('hex')}`;
+    const vmRemote = (record.backendKind ?? 'docker') !== 'docker';
     try {
-      if (record.containerName) {
-        await this.withPausedExecutor(record, async () =>
-          await this.runGitTransferHelper(record, 'stage-push', transferName, '', undefined, undefined, signal)
-        );
+      let pushed: { exitCode: number | null; stdout: string; stderr: string; truncated: boolean };
+      if (vmRemote) {
+        // The transport owns the whole push: guest bundle → pullTree →
+        // staging bare → credentialed helper with the same lease CAS, and it
+        // classifies failures (UNKNOWN_REMOTE_STATE included) via
+        // assertVmTransferOk — errors are already final.
+        const plane = this.vmGitRemoteOps(record);
+        pushed = await plane.remotePush!(this.gitContextFor(record, signal), {
+          repositoryUrl: repositoryUrl.toString(),
+          refspec,
+          ...(lease !== undefined ? { expectedRemoteOid: lease } : {}),
+          token
+        });
       } else {
-        await this.runGitTransferHelper(record, 'stage-push', transferName, '', undefined, undefined, signal);
-      }
-      let pushed: { exitCode: number; stdout: string; stderr: string; truncated: boolean };
-      try {
-        pushed = await this.runGitTransferHelper(record, 'push', transferName, refspec, token, lease, signal);
-      } catch (err: unknown) {
-        if (err instanceof HarnessError && (err.code === 'TIMEOUT' || err.code === 'UNAVAILABLE')) {
-          throw new HarnessError('UNKNOWN_REMOTE_STATE', `Git push interrupted by timeout or transport failure (${err.message})`.slice(0, 2_000), 504, true, {
-            expectedRemoteOid,
-            resumeAction: 'reconcile_push'
-          });
+        if (record.containerName) {
+          await this.withPausedExecutor(record, async () =>
+            await this.runGitTransferHelper(record, 'stage-push', transferName, '', undefined, undefined, signal)
+          );
+        } else {
+          await this.runGitTransferHelper(record, 'stage-push', transferName, '', undefined, undefined, signal);
         }
-        throw err;
+        try {
+          pushed = await this.runGitTransferHelper(record, 'push', transferName, refspec, token, lease, signal);
+        } catch (err: unknown) {
+          if (err instanceof HarnessError && (err.code === 'TIMEOUT' || err.code === 'UNAVAILABLE')) {
+            throw new HarnessError('UNKNOWN_REMOTE_STATE', `Git push interrupted by timeout or transport failure (${err.message})`.slice(0, 2_000), 504, true, {
+              expectedRemoteOid,
+              resumeAction: 'reconcile_push'
+            });
+          }
+          throw err;
+        }
       }
       const response: RunnerResponse = {
         ok: true,
@@ -2384,6 +2895,162 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       throw err;
     } finally {
       await this.safeRemovePath(join(record.workspacePath, transferName));
+    }
+  }
+
+  /**
+   * Stopped/hard-expired VM export: the checkout leaves the guest exclusively
+   * through the supervisor's offline `vm.export` — guest code never runs, at
+   * any point relative to the hard deadline. The extracted copy is untrusted
+   * input: branch detection, the snapshot commit, and bundle creation all run
+   * through the credential-free staging helpers inside the op dir, and the
+   * push reuses the same staging-bare + lease-CAS helper as the online path.
+   * Returns the same response contract as the guest export path.
+   */
+  private async exportVmCheckoutOffline(
+    record: WorkspaceRecord,
+    validated: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<RunnerResponse> {
+    const plane = this.vmGitRemoteOps(record);
+    const staging = plane.gitStaging;
+    if (typeof plane.exportCheckoutOffline !== 'function' || !staging) {
+      throw new HarnessError('VM_CAPABILITY_UNSUPPORTED', 'offline VM checkout export is not wired for this backend', 503, true);
+    }
+    const repositoryUrl = await validateRepositoryUrl(record.repositoryUrl, this.config.allowedGitHosts);
+    // Lifecycle stop only — never guest exec: vm.export reads the disk through
+    // the supervisor's appliance and needs the VM quiesced. Already-stopped
+    // VMs make this a supervisor no-op.
+    const { backend } = this.backendStack(record.backendKind ?? 'docker');
+    await backend.stop(this.provisionContextFor(record, signal, {}));
+    // Offline export never execs guest code — no workspace environment.
+    const exported = await plane.exportCheckoutOffline(this.provisionContextFor(record, signal, {}), {
+      maxBytes: this.config.vmMaxWorkspaceBytes,
+      ...(typeof record.repositoryRef === 'string' && record.repositoryRef !== '' ? { cloneRef: record.repositoryRef } : {})
+    });
+    const workDir = exported.workDir;
+    const checkoutDir = exported.checkoutDir;
+    if (typeof workDir !== 'string' || workDir === '') {
+      throw new HarnessError('UNAVAILABLE', 'offline VM export did not return a staging directory', 502, true);
+    }
+    try {
+      if (!checkoutDir) {
+        return {
+          ok: false,
+          message: 'VM export contains no git checkout to push',
+          data: { step: 'export', error: 'exported archive has no .git checkout' },
+          error: { code: 'INVALID_INPUT', message: 'exported archive has no .git checkout', retryable: false },
+          truncated: false
+        };
+      }
+      // Every git invocation mounts the staging op dir at /job so the bundle
+      // lands at the op-dir root stagePushBare expects; the extracted checkout
+      // is untrusted input inside that mount.
+      const checkoutContainerPath = `/job/${relative(workDir, checkoutDir).split(sep).join('/')}`;
+      const stagingGit = (args: string[], opts: { readOnly?: boolean } = {}) => staging.git(workDir, ['-C', checkoutContainerPath, ...args], {
+        ...(opts.readOnly !== undefined ? { readOnly: opts.readOnly } : {}),
+        ...(signal ? { signal } : {}),
+        workspaceId: record.id
+      });
+      const snapshotFailed = (message: string): RunnerResponse => ({
+        ok: false,
+        message: `Recovery snapshot failed: ${message}`,
+        data: { step: 'snapshot_commit', error: message },
+        error: { code: 'INTERNAL_ERROR', message, retryable: true },
+        truncated: false
+      });
+
+      // The target branch comes from the exported data — never the guest.
+      const branchResult = await stagingGit(['branch', '--show-current'], { readOnly: true });
+      if (branchResult.exitCode !== 0 || branchResult.truncated) {
+        throw new HarnessError('UNAVAILABLE', 'exported checkout branch could not be determined', 502, true);
+      }
+      const derivedBranch = branchResult.stdout.trim();
+      const targetBranch = (validated.targetBranch as string | undefined) ?? (derivedBranch === '' ? undefined : derivedBranch);
+      if (!targetBranch) {
+        throw new HarnessError('CONFLICT', 'workspace export requires a branch when the exported HEAD is detached', 409, false);
+      }
+      if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(targetBranch) || targetBranch.includes('..') || targetBranch.endsWith('/')) {
+        throw new HarnessError('INVALID_INPUT', 'export target branch is invalid', 400, false);
+      }
+
+      // snapshot_commit parity with the worker mode: commit dirty work on the
+      // extracted copy with the recovery identity before bundling. Status flags
+      // match inspectVmCheckout's close-check accounting (--no-optional-locks,
+      // --ignore-submodules=none) so the hasChanges verdict sees the same
+      // dirtiness the close-check verdict reported, including submodules.
+      const statusResult = await stagingGit(['--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], { readOnly: true });
+      if (statusResult.exitCode !== 0 || statusResult.truncated) {
+        return snapshotFailed(statusResult.stderr || statusResult.stdout || 'git status failed');
+      }
+      const hasChanges = statusResult.stdout.split('\n').some((line) => line.trim() !== '');
+      let committedChanges = false;
+      if (hasChanges) {
+        const addResult = await stagingGit(['add', '--all']);
+        if (addResult.exitCode !== 0) {
+          return snapshotFailed(addResult.stderr || addResult.stdout || 'git add failed during recovery snapshot');
+        }
+        const commitResult = await stagingGit([
+          '-c', 'user.name=Cloud Harness Recovery',
+          '-c', 'user.email=recovery@cloud-harness.local',
+          'commit', '--no-gpg-sign', '-m', `chore(recovery): export snapshot for ${targetBranch}`
+        ]);
+        if (commitResult.exitCode !== 0) {
+          return snapshotFailed(commitResult.stderr || commitResult.stdout || 'git commit failed during recovery snapshot');
+        }
+        committedChanges = true;
+      }
+      const headResult = await stagingGit(['rev-parse', 'HEAD'], { readOnly: true });
+      if (headResult.exitCode !== 0 || headResult.truncated) {
+        return snapshotFailed(headResult.stderr || headResult.stdout || 'failed to resolve HEAD after recovery snapshot');
+      }
+      const headCommitSha = headResult.stdout.trim();
+
+      // Bundle the exported objects, then push through the same staging-bare +
+      // credentialed-helper path the online remotePush uses.
+      const bundleResult = await stagingGit(['bundle', 'create', '/job/push.bundle', '--branches', '--tags', 'HEAD']);
+      if (bundleResult.exitCode !== 0) {
+        const text = `${bundleResult.stderr}\n${bundleResult.stdout}`;
+        if (/bad revision|ambiguous argument|unknown revision|invalid object name|does not match/i.test(text)) {
+          throw new HarnessError('INVALID_INPUT', `git bundle export failed: ${text}`.slice(0, 2_000), 400, false);
+        }
+        throw new HarnessError('UNAVAILABLE', `git bundle export failed: ${text}`.slice(0, 2_000), 502, true);
+      }
+      const bundleInfo = await stat(join(workDir, 'push.bundle')).catch(() => undefined);
+      if (!bundleInfo?.isFile() || bundleInfo.size === 0) {
+        throw new HarnessError('UNAVAILABLE', 'git bundle export produced no bundle file', 502, true);
+      }
+      if (bundleInfo.size > VM_MAX_BUNDLE_BYTES) {
+        throw new HarnessError('LIMIT_EXCEEDED', 'git bundle exceeds the maximum transfer size', 413, false);
+      }
+      await staging.stagePushBare(workDir, 'push.bundle', {
+        ...(signal ? { signal } : {}),
+        workspaceId: record.id
+      });
+      const { token } = await this.requirePushCredential(record, repositoryUrl);
+      const pushed = await staging.pushBare(workDir, {
+        repositoryUrl: repositoryUrl.toString(),
+        refspec: `HEAD:refs/heads/${targetBranch}`,
+        token,
+        ...(signal ? { signal } : {}),
+        workspaceId: record.id
+      });
+      assertVmTransferOk('push', pushed);
+      const refspec = `HEAD:refs/heads/${targetBranch}`;
+      return {
+        ok: true,
+        message: `Recovered work exported to ${targetBranch}`,
+        data: {
+          workspace: publicRecord(record),
+          branch: targetBranch,
+          commitSha: headCommitSha,
+          committedChanges,
+          pushResult: { output: pushed.stdout || pushed.stderr, refspec }
+        },
+        truncated: pushed.truncated
+      };
+    } finally {
+      await staging.removeOpDir(workDir).catch(() => undefined);
     }
   }
 
@@ -2584,54 +3251,29 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     },
     signal?: AbortSignal
   ): Promise<RunnerResponse> {
-    const privName = `chm-priv-${record.id.slice(3, 15)}-${randomBytes(4).toString('hex')}`;
-    const toolsPath = join(record.workspacePath, 'tools');
-    const cachePath = join(record.workspacePath, 'cache');
     const normalizedCwd = input.cwd.replaceAll('\\', '/').replace(/^\/+/, '').replace(/\/+$/, '') || '.';
     const workdir = normalizedCwd === '.' ? '/workspace' : `/workspace/${normalizedCwd}`;
-    try {
-      await this.networkProfileManager.ensureProfileReady(record.networkProfile);
-      const result = await runDocker([
-        'run', '-i', '--rm', '--name', privName,
-        '--label', 'cloud-harness.managed=true',
-        '--label', `cloud-harness.instance=${this.instanceId}`,
-        '--label', `cloud-harness.workspace=${record.id}`,
-        '--label', 'cloud-harness.role=priv-exec',
-        '--label', 'cloud-harness.ephemeral=true',
-        ...this.networkProfileManager.dockerLaunchArgs(record.networkProfile),
-        '--user', input.runAs === 'unprivileged' ? '10001:10001' : '0:0',
-        ...(input.runAs === 'unprivileged' ? ['--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true'] : []),
-        '--workdir', workdir,
-        '--pids-limit', '256',
-        '--memory', '1g', '--memory-swap', '1g', '--cpus', '1',
-        '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=128m',
-        '--tmpfs', '/run:rw,nosuid,nodev,size=8m',
-        '--volume', `${record.workspacePath}/repo:/workspace:rw`,
-        '--volume', `${toolsPath}:/opt/user-tools:rw`,
-        '--volume', `${cachePath}:/var/cache/harness:rw`,
-        '--env', 'HOME=/tmp/cloud-harness-home',
-        '--env', 'BUN_INSTALL=/opt/user-tools/bun',
-        '--env', 'PNPM_HOME=/opt/user-tools/pnpm',
-        '--env', 'UV_TOOL_BIN_DIR=/opt/user-tools/bin',
-        '--env', 'PATH=/workspace/node_modules/.bin:/opt/user-tools/bin:/opt/user-tools/pnpm/bin:/opt/user-tools/pnpm:/opt/user-tools/bun/bin:/tmp/cloud-harness-home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-        '--entrypoint', '/bin/bash',
-        this.config.executorImage,
-        '-c', input.command
-      ], {
-        timeoutMs: input.timeoutMs,
-        maxBytes: input.maxOutputBytes,
-        ...(signal ? { signal } : {})
-      });
+    const { backend } = this.backendStack(record.backendKind ?? 'docker');
+    const result = await backend.exec(this.provisionContextFor(record, signal), {
+      argv: ['/bin/bash', '-c', input.command],
+      cwd: workdir,
+      // The grant's runAs selects the uid WITHIN the helper mode: root keeps
+      // today's privileged variant, anything else the cap-dropped unprivileged
+      // one; root is never granted by omission.
+      user: input.runAs === 'unprivileged' ? 'workspace' : 'root',
+      executionMode: 'ephemeral-helper',
+      environment: this.execEnvironmentFor(record),
+      timeoutMs: input.timeoutMs,
+      maxBytes: input.maxOutputBytes,
+      ...(signal ? { signal } : {})
+    });
 
-      return {
-        ok: result.exitCode === 0,
-        message: result.exitCode === 0 ? 'Privileged execution completed successfully' : `Privileged execution failed with exit code ${result.exitCode}`,
-        data: { output: result.stdout || result.stderr, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode },
-        truncated: result.truncated
-      };
-    } finally {
-      await removeContainer(privName);
-    }
+    return {
+      ok: result.exitCode === 0,
+      message: result.exitCode === 0 ? 'Privileged execution completed successfully' : `Privileged execution failed with exit code ${result.exitCode}`,
+      data: { output: result.stdout || result.stderr, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode },
+      truncated: result.truncated
+    };
   }
 
   private async runBrokeredGitHubAction(
@@ -2640,6 +3282,12 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     args: string[],
     signal?: AbortSignal
   ): Promise<{ result: RunnerResponse; credentialSource: 'app' | 'runner-environment' | 'principal-global-secret' }> {
+    // gh-helpers are host-side broker containers for every backend kind. Every
+    // action resolves the repo through GH_REPO and explicit args — none read
+    // /workspace — but the mount stays the host staging clone at
+    // workspacePath/repo (created by clone() for VM records too, seeded into
+    // the guest at open), read-only, never the guest filesystem (phase-08
+    // broker boundary).
     const requirement = requiredGitHubPermissions(action);
     if (!requirement) throw new HarnessError('INVALID_INPUT', `unsupported github_action: ${action}`);
     const isWrite = requirement.write;
@@ -3116,29 +3764,104 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         const extSec = (validated.extensionSeconds as number) ?? this.idleTtlSecondsFor(rec);
         const requestedExpires = now + extSec * 1000;
         const newExpires = Math.min(rec.hardExpiresAt, requestedExpires);
-        let activeRecord = rec;
-        if (isRecoverable) {
-          activeRecord = await this.ensureActiveExecutor(rec);
-        }
-        let updated: WorkspaceRecord | undefined;
-        try {
-          updated = this.store.activateWithLimit(
-            activeRecord.id,
-            activeRecord.generation,
-            ['ACTIVE', 'EXPIRED_RECOVERABLE'],
-            { status: 'ACTIVE', lastActivityAt: now, expiresAt: newExpires },
-            this.configuredActiveWorkspaceLimit()
-          );
-        } catch (error) {
-          if (error instanceof ActiveWorkspaceLimitReachedError) {
-            throw this.activeWorkspaceLimitError(error.active, error.limit);
+        // Durable-before-store for a non-recoverable record: nothing else
+        // pushes the renewed lease, so it is published BEFORE the store
+        // writes — a failed push aborts the renewal with the store untouched.
+        // For a recoverable record the backend's recovery lease carries
+        // ctx.leaseExpiresAt = the intended newExpires (set before vm.start);
+        // a service-side pre-set would idempotency-collide with the final
+        // sync if the backend did not consume the field. The whole transition
+        // runs under the per-workspace lease lock so a rollback can never
+        // restore older times over a newer completed renewal (L2).
+        return await this.withLeaseTransitionLock(rec.id, async () => {
+          // Re-read inside the lock: the entry snapshot may predate a completed
+          // concurrent transition — fencing, publish and rollback must target
+          // the pre-transition state, never the stale copy.
+          const base = this.store.byId(rec.id) ?? rec;
+          // The entry snapshot may predate a concurrent close/reap — the base
+          // must still be a state this transition can publish from, or the
+          // durable pre-set would extend a lease on a terminal record.
+          if (base.status !== 'ACTIVE' && base.status !== 'EXPIRED_RECOVERABLE') {
+            throw new HarnessError('CONFLICT', 'workspace lifecycle changed during lease transition', 409);
           }
-          throw error;
-        }
-        if (!updated) {
-          throw new HarnessError('CONFLICT', 'workspace lifecycle changed or was reaped during renewal', 409);
-        }
-        return renewedLeaseResult(updated, rec.expiresAt, requestedExpires);
+          let leasePushed = false;
+          let storePublished = false;
+          try {
+            if (!isRecoverable) {
+              await this.leaseSyncSetStrict({ ...base, expiresAt: newExpires });
+              leasePushed = true;
+            }
+            let activeRecord = base;
+            if (isRecoverable) {
+              // Pessimistic: the backend may have pushed the intended lease and
+              // started the VM before any later step fails — compensate either way.
+              leasePushed = true;
+              activeRecord = await this.ensureActiveExecutor(base, newExpires);
+            }
+            let updated: WorkspaceRecord | undefined;
+            try {
+              updated = this.store.activateWithLimit(
+                activeRecord.id,
+                activeRecord.generation,
+                ['ACTIVE', 'EXPIRED_RECOVERABLE'],
+                { status: 'ACTIVE', lastActivityAt: now, expiresAt: newExpires },
+                this.configuredActiveWorkspaceLimit()
+              );
+            } catch (error) {
+              if (error instanceof ActiveWorkspaceLimitReachedError) {
+                throw this.activeWorkspaceLimitError(error.active, error.limit);
+              }
+              throw error;
+            }
+            if (!updated) {
+              throw new HarnessError('CONFLICT', 'workspace lifecycle changed or was reaped during renewal', 409);
+            }
+            storePublished = true;
+            // The acknowledged publish is not complete until the durable lease
+            // carries the same times — propagate failure and roll back below.
+            await this.leaseSyncSetStrict(updated);
+            return renewedLeaseResult(updated, base.expiresAt, requestedExpires);
+          } catch (error) {
+            if (leasePushed) {
+              // The durable lease is compensated with the row the store
+              // actually acknowledges — never a stale snapshot (R1).
+              let compensation: WorkspaceRecord | undefined = base;
+              if (storePublished) {
+                // Store already shows ACTIVE+newExpires: revert it so the
+                // acknowledged transition is not left half-published. A
+                // concurrent touch may have committed a newer expiry inside
+                // the publish→revert window — never restore below it.
+                const atRevert = this.store.byId(rec.id);
+                const concurrentExpiresAt = atRevert && atRevert.status === 'ACTIVE' && atRevert.expiresAt !== newExpires
+                  ? atRevert.expiresAt
+                  : undefined;
+                const revertExpiresAt = concurrentExpiresAt !== undefined
+                  ? Math.max(base.expiresAt, concurrentExpiresAt)
+                  : base.expiresAt;
+                // Restore the recoverable-window fields too — publishing ACTIVE
+                // cleared them and a bare status revert would lose the window.
+                const reverted = this.store.updateFenced(base.id, base.generation, ['ACTIVE'], isRecoverable
+                  ? { status: 'EXPIRED_RECOVERABLE', expiresAt: revertExpiresAt, lastActivityAt: base.lastActivityAt, error: base.error, expiredAt: base.expiredAt ?? null, recoverableUntil: base.recoverableUntil ?? null }
+                  : { expiresAt: revertExpiresAt, lastActivityAt: base.lastActivityAt, error: base.error, expiredAt: base.expiredAt ?? null, recoverableUntil: base.recoverableUntil ?? null });
+                // Push the post-revert row — it carries the preserved newer
+                // expiry — so durable==store. A fenced-out revert means the
+                // row moved on without this transition; only a live
+                // acknowledged row is pushed (terminal rows are owned by the
+                // close path's leaseSyncClear).
+                const acknowledged = reverted ?? this.store.byId(rec.id);
+                compensation = acknowledged && (acknowledged.status === 'ACTIVE' || acknowledged.status === 'EXPIRED_RECOVERABLE' || acknowledged.status === 'NETWORK_QUARANTINED')
+                  ? acknowledged
+                  : undefined;
+              }
+              // Restore the acknowledged lease times (best-effort): for a
+              // recoverable record that is the already-past expiry, which
+              // bounds any VM the failed activation may have started; VM data
+              // is never touched — only deadlines and status move.
+              if (compensation) await this.leaseSyncSet(compensation);
+            }
+            throw error;
+          }
+        });
       } finally {
         if (isRecoverable) {
           this.store.releaseMutationLease(rec.id, rec.generation);
@@ -3174,33 +3897,94 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
           }
         }
         try {
-          const activeRecord = await this.ensureActiveExecutor(rec);
-          const extSec = this.idleTtlSecondsFor(activeRecord);
-          const newExpires = Math.min(activeRecord.hardExpiresAt, now + extSec * 1000);
-          let updated: WorkspaceRecord | undefined;
-          try {
-            updated = this.store.activateWithLimit(
-              activeRecord.id,
-              activeRecord.generation,
-              ['ACTIVE', 'EXPIRED_RECOVERABLE', 'NETWORK_QUARANTINED'],
-              { status: 'ACTIVE', lastActivityAt: now, expiresAt: newExpires, error: null },
-              this.configuredActiveWorkspaceLimit()
-            );
-          } catch (error) {
-            if (error instanceof ActiveWorkspaceLimitReachedError) {
-              throw this.activeWorkspaceLimitError(error.active, error.limit);
+          // Hoist the pure expiry calculation BEFORE activation: the recoverable
+          // backend lease must carry the intended newExpires (ctx.leaseExpiresAt)
+          // before vm.start, and non-recoverable records get durable-before-store.
+          const extSec = this.idleTtlSecondsFor(rec);
+          const newExpires = Math.min(rec.hardExpiresAt, now + extSec * 1000);
+          // Same contract as workspace_lease_renew: the whole transition runs
+          // under the per-workspace lease lock and re-reads the pre-transition
+          // record inside it, so rollback can never restore older times over a
+          // newer completed transition (L2).
+          return await this.withLeaseTransitionLock(rec.id, async () => {
+            const base = this.store.byId(rec.id) ?? rec;
+            // Same publishable-from guard as workspace_lease_renew — resume
+            // additionally publishes from NETWORK_QUARANTINED.
+            if (base.status !== 'ACTIVE' && base.status !== 'EXPIRED_RECOVERABLE' && base.status !== 'NETWORK_QUARANTINED') {
+              throw new HarnessError('CONFLICT', 'workspace lifecycle changed during recovery', 409);
             }
-            throw error;
-          }
-          if (!updated) {
-            throw new HarnessError('CONFLICT', 'workspace lifecycle changed or was reaped during recovery', 409);
-          }
-          return {
-            ok: true,
-            message: 'Workspace recovered to active state',
-            data: publicRecord(updated),
-            truncated: false
-          };
+            let leasePushed = false;
+            let storePublished = false;
+            try {
+              if (!isRecoverable) {
+                await this.leaseSyncSetStrict({ ...base, expiresAt: newExpires });
+                leasePushed = true;
+              }
+              let activeRecord = base;
+              if (isRecoverable) {
+                // Pessimistic: the backend may have pushed the intended lease and
+                // started the VM before any later step fails — compensate either way.
+                leasePushed = true;
+                activeRecord = await this.ensureActiveExecutor(base, newExpires);
+              } else {
+                activeRecord = await this.ensureActiveExecutor(base);
+              }
+              let updated: WorkspaceRecord | undefined;
+              try {
+                updated = this.store.activateWithLimit(
+                  activeRecord.id,
+                  activeRecord.generation,
+                  ['ACTIVE', 'EXPIRED_RECOVERABLE', 'NETWORK_QUARANTINED'],
+                  { status: 'ACTIVE', lastActivityAt: now, expiresAt: newExpires, error: null },
+                  this.configuredActiveWorkspaceLimit()
+                );
+              } catch (error) {
+                if (error instanceof ActiveWorkspaceLimitReachedError) {
+                  throw this.activeWorkspaceLimitError(error.active, error.limit);
+                }
+                throw error;
+              }
+              if (!updated) {
+                throw new HarnessError('CONFLICT', 'workspace lifecycle changed or was reaped during recovery', 409);
+              }
+              storePublished = true;
+              await this.leaseSyncSetStrict(updated);
+              return {
+                ok: true,
+                message: 'Workspace recovered to active state',
+                data: publicRecord(updated),
+                truncated: false
+              };
+            } catch (error) {
+              if (leasePushed) {
+                // The durable lease is compensated with the row the store
+                // actually acknowledges — never a stale snapshot (R1).
+                let compensation: WorkspaceRecord | undefined = base;
+                if (storePublished) {
+                  // A concurrent touch may have committed a newer expiry inside
+                  // the publish→revert window — never restore below it.
+                  const atRevert = this.store.byId(rec.id);
+                  const concurrentExpiresAt = atRevert && atRevert.status === 'ACTIVE' && atRevert.expiresAt !== newExpires
+                    ? atRevert.expiresAt
+                    : undefined;
+                  const revertExpiresAt = concurrentExpiresAt !== undefined
+                    ? Math.max(base.expiresAt, concurrentExpiresAt)
+                    : base.expiresAt;
+                  const reverted = this.store.updateFenced(base.id, base.generation, ['ACTIVE'], isRecoverable
+                    ? { status: 'EXPIRED_RECOVERABLE', expiresAt: revertExpiresAt, lastActivityAt: base.lastActivityAt, error: base.error, expiredAt: base.expiredAt ?? null, recoverableUntil: base.recoverableUntil ?? null }
+                    : { expiresAt: revertExpiresAt, lastActivityAt: base.lastActivityAt, error: base.error, expiredAt: base.expiredAt ?? null, recoverableUntil: base.recoverableUntil ?? null });
+                  // Push the post-revert row so durable==store; a fenced-out
+                  // revert means the row moved on — only live rows are pushed.
+                  const acknowledged = reverted ?? this.store.byId(rec.id);
+                  compensation = acknowledged && (acknowledged.status === 'ACTIVE' || acknowledged.status === 'EXPIRED_RECOVERABLE' || acknowledged.status === 'NETWORK_QUARANTINED')
+                    ? acknowledged
+                    : undefined;
+                }
+                if (compensation) await this.leaseSyncSet(compensation);
+              }
+              throw error;
+            }
+          });
         } finally {
           if (isRecoverable) {
             this.store.releaseMutationLease(rec.id, rec.generation);
@@ -3232,6 +4016,8 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         };
       }
       if (mode === 'export') {
+        const vmOfflineExport = (rec.backendKind ?? 'docker') !== 'docker'
+          && (rec.hardExpiresAt <= Date.now() || rec.status !== 'ACTIVE');
         const holdExpiry = Date.now() + 300_000;
         try {
           this.store.acquireRecoverableMutationLease(rec.id, rec.generation, holdExpiry);
@@ -3239,6 +4025,12 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
           throw new HarnessError('CONFLICT', 'workspace lifecycle changed during export', 409);
         }
         try {
+          // A stopped or hard-expired VM has no exec path at any point: the
+          // checkout leaves the guest only through the supervisor's offline
+          // vm.export (phase-08 contract — never ensureActive, never guest code).
+          if (vmOfflineExport) {
+            return await this.exportVmCheckoutOffline(rec, validated, signal);
+          }
           const targetBranch = (validated.targetBranch as string | undefined) ?? await this.currentBranch(rec, signal);
           const snapshotRes = await this.runRecoveryWorker(rec, 'workspace_recover', {
             mode: 'snapshot_commit',
@@ -3275,11 +4067,16 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     if (AgentManager.isPublicOperation(operation)) {
       if (!this.agentManager) throw new HarnessError('UNAVAILABLE', 'agent execution is not configured', 503, false);
       const targetWorkspace = this.requireWorkspace(ownerId, workspaceId, false, true);
+      // Agent operations dispatch through AgentManager, not dispatchAction, so
+      // the capability gate must run here too — the classification marks every
+      // agent_* op executor-bound under 'agents'.
+      this.assertExecutorCapability(targetWorkspace, operation);
       return await this.agentManager.dispatch(ownerId, targetWorkspace, operation, validated);
     }
 
     const record = this.touch(this.requireWorkspace(ownerId, workspaceId, true, false));
     await this.enforceActiveLimits(record);
+    this.assertExecutorCapability(record, operation);
 
     const dispatchAction = async (): Promise<RunnerResponse> => {
     if (operation === 'artifacts_snapshot') {
@@ -4582,6 +5379,15 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
   ): Promise<{ ownerId: string; content: Buffer }> {
     const ownerId = this.store.resolvePrincipal(principal);
     const record = this.requireWorkspace(ownerId, input.workspaceId);
+    if ((record.backendKind ?? 'docker') !== 'docker') {
+      // The VM checkout is not host-mounted: the backend pulls the file out of
+      // the guest. The host `repo/` dir is pre-seed staging and would serve a
+      // stale snapshot, so it is never read for a VM workspace.
+      const { backend } = this.backendStack(record.backendKind ?? 'docker');
+      const guestPath = `/workspace/${input.path.replace(/^\/+/, '')}`;
+      const content = await backend.pullFile(this.provisionContextFor(record, undefined, {}), guestPath, this.config.maxArtifactBytes);
+      return { ownerId, content };
+    }
     const repositoryRoot = await realpath(join(record.workspacePath, 'repo'));
     const content = await readVerifiedWorkspaceFile(repositoryRoot, input.path, this.config.maxArtifactBytes);
     return { ownerId, content };
@@ -4783,6 +5589,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
       // Mirrors the shell_open path of execute(): an active, owned workspace with a live executor.
       const record = this.touch(this.requireWorkspace(ownerId, parsed.input.workspaceId, true, false));
       await this.enforceActiveLimits(record);
+      this.assertExecutorCapability(record, 'terminal_open');
       if (!record.containerName) throw new HarnessError('UNAVAILABLE', 'workspace executor is unavailable', 503, true);
       const terminal = await this.operations.openTerminal({
         ownerId,
@@ -4803,11 +5610,13 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     }
     if (parsed.operation === 'terminal_read') {
       const record = this.requireWorkspace(ownerId, parsed.input.workspaceId);
+      this.assertExecutorCapability(record, parsed.operation);
       const page = await this.operations.readTerminal(ownerId, record.id, parsed.input.terminalId, parsed.input.cursor, parsed.input.waitMs, signal);
       return { ok: true, message: 'Terminal output', data: page, truncated: false };
     }
     if (parsed.operation === 'terminal_input') {
       const record = this.requireWorkspace(ownerId, parsed.input.workspaceId);
+      this.assertExecutorCapability(record, parsed.operation);
       const bytes = Buffer.from(parsed.input.data, 'base64');
       if (bytes.length > TERMINAL_MAX_INPUT_BYTES) throw new HarnessError('INVALID_INPUT', 'terminal input is too large', 400, false);
       const terminal = this.operations.writeTerminal(ownerId, record.id, parsed.input.terminalId, bytes);
@@ -4815,11 +5624,13 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     }
     if (parsed.operation === 'terminal_resize') {
       const record = this.requireWorkspace(ownerId, parsed.input.workspaceId);
+      this.assertExecutorCapability(record, parsed.operation);
       const terminal = await this.operations.resizeTerminal(ownerId, record.id, parsed.input.terminalId, parsed.input.cols, parsed.input.rows);
       return { ok: true, message: 'Terminal resized', data: terminal, truncated: false };
     }
     if (parsed.operation === 'terminal_close') {
       const record = this.requireWorkspace(ownerId, parsed.input.workspaceId);
+      this.assertExecutorCapability(record, parsed.operation);
       const terminal = await this.operations.closeTerminal(ownerId, record.id, parsed.input.terminalId);
       return { ok: true, message: 'Terminal closed', data: terminal, truncated: false };
     }
@@ -4972,11 +5783,21 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         }
       }
     }
-    if (claimed.containerName) await removeContainer(claimed.containerName);
+    if (claimed.containerName) {
+      // Explicit close is the one path that destroys the executor: docker
+      // removes the container, incus-vm deletes the VM and its disk. A
+      // confirmed-remove failure must NOT be swallowed — deleting the host
+      // workspace and marking CLOSED anyway would orphan a live executor and
+      // lose recoverable work. The record stays REAPING (the claimed state)
+      // with files retained, so a retried close re-enters this path.
+      await this.destroyExecutor(claimed);
+    }
     await this.safeRemovePath(claimed.workspacePath);
     this.store.deleteSecretSnapshot(claimed.id);
     this.store.reapWorkspaceMemories(claimed.ownerId, claimed.id);
     this.redactorCache.delete(claimed.id);
+    this.envMemo.delete(claimed.id);
+    this.leaseSyncClear(claimed);
     this.guidanceCache.delete(claimed.id);
     const closed = this.store.updateFenced(claimed.id, claimed.generation, ['REAPING'], { status: 'CLOSED', containerName: null, error: reason, expiresAt: Date.now() });
     if (!closed) {
@@ -5185,21 +6006,28 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
             this.operations.stopWorkspaceTerminals(fenced.id, 'workspace quarantined');
 
             // 2. Stop and remove all containers carrying this workspace's label, including privileged ephemerals
-            const labeled = await runDocker([
-              'ps', '-a', '--filter', `label=cloud-harness.workspace=${record.id}`, '--format', '{{.Names}}'
-            ], { timeoutMs: 30_000, maxBytes: 1_048_576 }).catch(() => ({ exitCode: 1, stdout: '', stderr: '', truncated: false }));
-            const names = new Set<string>(labeled.stdout.split('\n').map((n) => n.trim()).filter(Boolean));
-            if (fenced.containerName) names.add(fenced.containerName);
             let allRemoved = true;
-            for (const name of names) {
-              try {
-                await removeContainer(name);
-              } catch {
-                allRemoved = false;
+            if ((fenced.backendKind ?? 'docker') === 'docker') {
+              const labeled = await runDocker([
+                'ps', '-a', '--filter', `label=cloud-harness.workspace=${record.id}`, '--format', '{{.Names}}'
+              ], { timeoutMs: 30_000, maxBytes: 1_048_576 }).catch(() => ({ exitCode: 1, stdout: '', stderr: '', truncated: false }));
+              const names = new Set<string>(labeled.stdout.split('\n').map((n) => n.trim()).filter(Boolean));
+              if (fenced.containerName) names.add(fenced.containerName);
+              for (const name of names) {
+                try {
+                  await removeContainer(name);
+                } catch {
+                  allRemoved = false;
+                }
               }
-            }
-            if (allRemoved) {
-              this.store.update(record.id, { containerName: null });
+              if (allRemoved) {
+                this.store.update(record.id, { containerName: null });
+              }
+            } else {
+              // Quarantine stops the executor but keeps the VM disk: the checkout
+              // lives only inside the guest, so stop — never destroy — here.
+              const { backend } = this.backendStack(fenced.backendKind ?? 'docker');
+              await backend.stop(this.provisionContextFor(fenced, undefined, {})).catch(() => undefined);
             }
 
             // 3. Emit audit event (best-effort; observability failure must not abort security fencing/cleanup)
@@ -5223,6 +6051,11 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
     // previously failed, so an unfiltered executor cannot linger.
     for (const record of this.store.active()) {
       if (record.status === 'NETWORK_QUARANTINED') {
+        if ((record.backendKind ?? 'docker') !== 'docker') {
+          const { backend } = this.backendStack(record.backendKind ?? 'docker');
+          await backend.stop(this.provisionContextFor(record, undefined, {})).catch(() => undefined);
+          continue;
+        }
         const labeled = await runDocker([
           'ps', '-a', '--filter', `label=cloud-harness.workspace=${record.id}`, '--format', '{{.Names}}'
         ], { timeoutMs: 30_000, maxBytes: 1_048_576 }).catch(() => ({ exitCode: 1, stdout: '', stderr: '', truncated: false }));
@@ -5247,7 +6080,10 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null ls-remote "$1" "$2
         if (claimed) {
           this.operations.stopWorkspaceTerminals(claimed.id, 'workspace expired');
           if (claimed.containerName) {
-            await removeContainer(claimed.containerName).catch(() => undefined);
+            // Expiry releases the executor but keeps workspace data: docker
+            // destroys the container (the checkout lives on the host mount),
+            // incus-vm stops the VM so its disk survives for recovery.
+            await this.releaseExecutor(claimed).catch(() => undefined);
           }
           this.markExpiredRecoverable(claimed, now);
         }
