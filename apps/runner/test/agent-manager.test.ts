@@ -151,19 +151,26 @@ class FakeLauncher implements AgentLauncher {
   readonly cleanups: Array<Pick<AgentLaunchSpec, 'containerName' | 'networkName'>> = [];
   readonly inputs: PassThrough[] = [];
   readonly outputs: PassThrough[] = [];
+  /** Resolvers for each launch's `exited` promise, so a test can defer the runtime exit. */
+  readonly exits: Array<(value: { code: number | null; signal: NodeJS.Signals | null }) => void> = [];
+  /** When set, launch() waits on it first, modelling a runtime that is still starting. */
+  launchGate?: Promise<void>;
   failCleanup = false;
   reconciled = false;
 
   async reconcile(): Promise<void> { this.reconciled = true; }
   async launch(spec: AgentLaunchSpec): Promise<AgentRuntimeProcess> {
     this.launches.push(spec);
+    if (this.launchGate) await this.launchGate;
     const input = new PassThrough();
     const output = new PassThrough();
     const stderr = new PassThrough();
     this.inputs.push(input);
     this.outputs.push(output);
     const process = { stdin: input, stdout: output, stderr } as unknown as ChildProcessWithoutNullStreams;
-    return { process, exited: Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>().promise };
+    const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+    this.exits.push(exited.resolve);
+    return { process, exited: exited.promise };
   }
   async cleanup(spec: Pick<AgentLaunchSpec, 'containerName' | 'networkName'>): Promise<void> {
     this.cleanups.push(spec);
@@ -1553,5 +1560,328 @@ describe('AgentManager persisted sessions', () => {
     await manager.stopWorkspace(record.ownerId, record.id, 'workspace closed');
     expect(repository.findSession(predecessorId)).toBeUndefined();
     expect((store.database.prepare('SELECT COUNT(*) AS count FROM agent_session_messages').get() as { count: number }).count).toBe(0);
+  });
+});
+
+describe('background teardown lifecycle', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('still enforces the TTL deadline through the tracked background path', async () => {
+    vi.useFakeTimers();
+    const { manager, record, repository, store } = setup();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = await waitForRunning(manager, record);
+    await vi.advanceTimersByTimeAsync(31_000);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('TIMED_OUT');
+    await manager.stop();
+    store.close();
+  });
+
+  it('disarms TTL deadlines of runtimes in workspaces outside the shutdown sweep', async () => {
+    vi.useFakeTimers();
+    const { manager, record, repository, store } = setup();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = await waitForRunning(manager, record);
+    // A workspace that already left the enumerated set is not swept by stop(),
+    // so its runtime's deadline is exactly the timer cleanup() never reaches.
+    store.database.prepare("UPDATE workspaces SET status='CLOSED' WHERE id=?").run(record.id);
+    await manager.stop();
+    // Shutdown does not cancel agents of non-enumerated workspaces; the agent
+    // stays RUNNING and only its deadline must be gone.
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('RUNNING');
+    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('RUNNING');
+    store.close();
+    // Nothing is left armed to fire cancelOne against the closed store.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('drains an in-flight background cancellation before stop() resolves', async () => {
+    vi.useFakeTimers();
+    const { manager, record, repository, gateway, store } = setup();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = await waitForRunning(manager, record);
+    let release!: () => void;
+    gateway.revokeGate = new Promise<void>((resolve) => { release = resolve; });
+    // The TTL deadline fires first and its cleanup parks inside revokeAndDrain.
+    await vi.advanceTimersByTimeAsync(31_000);
+    await vi.advanceTimersByTimeAsync(10);
+    let stopped = false;
+    const stopping = manager.stop().then(() => { stopped = true; });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(stopped).toBe(false);
+    release();
+    await stopping;
+    expect(stopped).toBe(true);
+    // The deadline's cancellation owned the terminal transition.
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('TIMED_OUT');
+    store.close();
+  });
+
+  it('drains a background interrupt in a workspace the shutdown sweep skips', async () => {
+    const { manager, record, repository, launcher, gateway, store } = setup();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = await waitForRunning(manager, record);
+    // A workspace that left the enumerated set is not swept by stop(), so the
+    // interrupt below is a cancellation only the tracked drain can wait for.
+    store.database.prepare("UPDATE workspaces SET status='CLOSED' WHERE id=?").run(record.id);
+    let release!: () => void;
+    gateway.revokeGate = new Promise<void>((resolve) => { release = resolve; });
+    // Malformed protocol output fails the channel, which interrupts the agent;
+    // its cleanup parks inside revokeAndDrain on the gate.
+    launcher.outputs[0]!.write('this is not json\n');
+    await vi.waitFor(() => expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('CANCELLING'));
+    let stopped = false;
+    const stopping = manager.stop().then(() => { stopped = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(stopped).toBe(false);
+    release();
+    await stopping;
+    expect(stopped).toBe(true);
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('INTERRUPTED');
+    store.close();
+  });
+
+  it('routes a failed background cancellation through the cleanup-retry path', async () => {
+    vi.useFakeTimers();
+    const { manager, record, repository, store } = setup();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = await waitForRunning(manager, record);
+    const findAgent = vi.spyOn(repository, 'findAgent');
+    findAgent.mockImplementationOnce(() => { throw new Error('injected store failure'); });
+    const warnings: string[] = [];
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      warnings.push(String(chunk));
+      return true;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(31_000);
+      await vi.advanceTimersByTimeAsync(10);
+      const current = repository.findAgent(record.ownerId, record.id, agentId);
+      expect(current?.status).toBe('CANCELLING');
+      const retry = repository.cleanupRetry(record.ownerId, record.id, agentId, current!.generation);
+      expect(retry?.attempts).toBe(1);
+      expect(retry?.lastError).toContain('injected store failure');
+      expect(warnings.some((line) => line.includes('background agent teardown failed'))).toBe(true);
+    } finally {
+      stderr.mockRestore();
+      findAgent.mockRestore();
+      await manager.stop().catch(() => undefined);
+      store.close();
+    }
+  });
+
+  it('joins an in-flight cleanup on a due retry instead of starting a second one', async () => {
+    vi.useFakeTimers();
+    const { manager, record, repository, gateway, store } = setup();
+    await manager.start();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = await waitForRunning(manager, record);
+    let release!: () => void;
+    gateway.revokeGate = new Promise<void>((resolve) => { release = resolve; });
+    // The TTL deadline fires and its cleanup parks inside revokeAndDrain.
+    await vi.advanceTimersByTimeAsync(31_000);
+    await vi.advanceTimersByTimeAsync(10);
+    const current = repository.findAgent(record.ownerId, record.id, agentId);
+    expect(current?.status).toBe('CANCELLING');
+    // A retry row for the same agent becomes due while that cleanup is parked.
+    repository.scheduleCleanupRetry({
+      ownerId: record.ownerId, workspaceId: record.id, agentId, agentGeneration: current!.generation,
+      attempts: 1, nextAttemptAt: Date.now(), lastError: 'injected earlier failure', updatedAt: Date.now()
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(10);
+    // The sweep must join the parked cleanup, not start a second revokeAndDrain.
+    expect(gateway.revoked).toHaveLength(1);
+    release();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(gateway.revoked).toHaveLength(1);
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('TIMED_OUT');
+    await manager.stop();
+    store.close();
+  });
+
+  it('preserves the intended TIMED_OUT terminal when teardown fails before cleanup runs', async () => {
+    vi.useFakeTimers();
+    const { manager, record, repository, store } = setup();
+    await manager.start();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = await waitForRunning(manager, record);
+    // Fail cancelOne AFTER the CANCELLING transition but BEFORE cleanup()
+    // records its terminal (the launch-await window): the retry must still
+    // land TIMED_OUT, not the INTERRUPTED fallback that mislabeled the agent
+    // outcome-unknown. launches.get is only awaited inside cancelOne, so the
+    // once-failure cannot be consumed by unrelated teardown traffic.
+    // Fail EVERY cancelOne at the launch-await window — the TTL deadline and
+    // the reaper sweep can both fire cancelInBackground for the same expiry,
+    // and a once-failure would let the second attempt heal into a clean
+    // TIMED_OUT before the retry row is ever exercised. cleanup() never
+    // consults launches, so the reaper's retry still lands the terminal.
+    const launches = (manager as unknown as { launches: Map<string, Promise<void>> }).launches;
+    const launchGet = vi.spyOn(launches, 'get');
+    launchGet.mockImplementation(() => { throw new Error('injected pre-cleanup failure'); });
+    const warnings: string[] = [];
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      warnings.push(String(chunk));
+      return true;
+    });
+    try {
+      // vi.waitFor already advanced the fake clock, so aim at the agent's own
+      // expiresAt: stop just past the TTL deadline but before the +1s retry
+      // comes due, keeping the intermediate CANCELLING + retry row observable.
+      const agent = repository.findAgent(record.ownerId, record.id, agentId);
+      await vi.advanceTimersByTimeAsync(Math.max(0, (agent?.expiresAt ?? 0) - Date.now()) + 200);
+      await vi.advanceTimersByTimeAsync(10);
+      const current = repository.findAgent(record.ownerId, record.id, agentId);
+      expect(current?.status).toBe('CANCELLING');
+      const retry = repository.cleanupRetry(record.ownerId, record.id, agentId, current!.generation);
+      expect(retry?.attempts).toBe(1);
+      // Let the reaper's retry fire; it must reuse the preserved terminal.
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('TIMED_OUT');
+    } finally {
+      stderr.mockRestore();
+      launchGet.mockRestore();
+      await manager.stop().catch(() => undefined);
+      store.close();
+    }
+  });
+
+  it('ignores a stale-generation teardown failure instead of cancelling the new generation', async () => {
+    vi.useFakeTimers();
+    const { manager, record, repository, store } = setup();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = await waitForRunning(manager, record);
+    // A restart bumped the agent's generation while the old runtime's deadline
+    // is still armed; the callback now belongs to a superseded lifecycle.
+    store.database.prepare('UPDATE agents SET generation=generation+1 WHERE id=?').run(agentId);
+    const findAgent = vi.spyOn(repository, 'findAgent');
+    findAgent.mockImplementationOnce(() => { throw new Error('injected store failure'); });
+    const warnings: string[] = [];
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      warnings.push(String(chunk));
+      return true;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(31_000);
+      await vi.advanceTimersByTimeAsync(10);
+      const current = repository.findAgent(record.ownerId, record.id, agentId);
+      expect(current?.status).toBe('RUNNING');
+      expect(current?.generation).toBe(2);
+      expect(repository.cleanupRetry(record.ownerId, record.id, agentId, 1)).toBeUndefined();
+      expect(warnings.some((line) => line.includes('background agent teardown failed'))).toBe(true);
+    } finally {
+      stderr.mockRestore();
+      findAgent.mockRestore();
+      await manager.stop().catch(() => undefined);
+      store.close();
+    }
+  });
+
+  it('drops runtime callbacks that arrive after stop() owns teardown', async () => {
+    const { manager, record, repository, launcher, store } = setup();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = await waitForRunning(manager, record);
+    // A workspace outside the shutdown sweep keeps its runtime alive past stop().
+    store.database.prepare("UPDATE workspaces SET status='CLOSED' WHERE id=?").run(record.id);
+    await manager.stop();
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('RUNNING');
+    // A runtime exit and a protocol error arriving after shutdown must not
+    // resurrect lifecycle work against the store the caller is about to close.
+    launcher.exits[0]!({ code: 0, signal: null });
+    launcher.outputs[0]!.write('this is not json\n');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('RUNNING');
+    store.close();
+  });
+
+  it('lets an in-flight launch finish inside stop() before deadlines are disarmed', async () => {
+    vi.useFakeTimers();
+    const { manager, record, repository, launcher, store } = setup();
+    let releaseLaunch!: () => void;
+    launcher.launchGate = new Promise<void>((resolve) => { releaseLaunch = resolve; });
+    const spawned = await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = (spawned.data as { agentId: string }).agentId;
+    store.database.prepare("UPDATE workspaces SET status='CLOSED' WHERE id=?").run(record.id);
+    let stopped = false;
+    const stopping = manager.stop().then(() => { stopped = true; });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(stopped).toBe(false);
+    releaseLaunch();
+    await stopping;
+    expect(stopped).toBe(true);
+    // The launch completed while stop() still owned the store, so its deadline
+    // was disarmed like every other; nothing may fire against the closed store.
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('RUNNING');
+    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('RUNNING');
+    store.close();
+    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('tolerates a repeated stop()', async () => {
+    const { manager, record, store } = setup();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    await waitForRunning(manager, record);
+    await manager.stop();
+    await manager.stop();
+    store.close();
+  });
+
+  it('drains an in-flight record producer before closing the store', async () => {
+    const { manager, record, repository, launcher, toolExecutor, store } = setup();
+    let releaseTool!: () => void;
+    const toolGate = new Promise<void>((resolve) => { releaseTool = resolve; });
+    toolExecutor.mockImplementationOnce(() => toolGate.then(() => ({
+      ok: true as const, message: 'read', data: { content: 'ok' }, truncated: false
+    })));
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    const agentId = await waitForRunning(manager, record);
+    // A proxied tool call parks inside the executor; its onRecord is in flight.
+    launcher.outputs[0]!.write(`${JSON.stringify({
+      type: 'tool_request', requestId: 'req-parked', toolCallId: 'call-parked', operation: 'files_read', input: { path: 'README.md' }
+    })}\n`);
+    await vi.waitFor(() => expect(toolExecutor).toHaveBeenCalled());
+    // Moving the workspace out of the shutdown sweep leaves this runtime live,
+    // so only producer tracking keeps its in-flight record inside stop()'s window.
+    store.database.prepare("UPDATE workspaces SET status='CLOSED' WHERE id=?").run(record.id);
+    let stopped = false;
+    const stopping = manager.stop().then(() => { stopped = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(stopped).toBe(false);
+    releaseTool();
+    await stopping;
+    expect(stopped).toBe(true);
+    // Every store write the producer owed already happened inside stop(); a spy
+    // attached now must see nothing more from it.
+    const addUsage = vi.spyOn(repository, 'addUsage');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(addUsage).not.toHaveBeenCalled();
+    expect(repository.findAgent(record.ownerId, record.id, agentId)?.status).toBe('RUNNING');
+    store.close();
+  });
+
+  it('shares one shutdown across concurrent stop() callers', async () => {
+    const { manager, record, gateway, store } = setup();
+    await manager.dispatch(record.ownerId, record, 'agent_spawn', spawnInput(record));
+    await waitForRunning(manager, record);
+    let release!: () => void;
+    gateway.revokeGate = new Promise<void>((resolve) => { release = resolve; });
+    const first = manager.stop();
+    const second = manager.stop();
+    expect(second).toBe(first);
+    release();
+    await Promise.all([first, second]);
+    store.close();
   });
 });

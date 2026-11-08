@@ -191,6 +191,18 @@ export class AgentManager {
   /** Durable lineages whose sessions are all purged but whose store removal has not succeeded yet. */
   private readonly purgedLineageStores = new Set<string>();
   private spendSweep?: Promise<void> | undefined;
+  /** Background cancellations/interrupts no caller awaits; stop() disarms their timers and drains them before returning. */
+  private readonly pendingCancellations = new Set<Promise<void>>();
+  /** In-flight onRecord/onStorage invocations the channel is awaiting; stop() drains them before closing the store. */
+  private readonly pendingProducers = new Set<Promise<void>>();
+  /** The shared shutdown promise, so concurrent stop() callers join one teardown. */
+  private stopPromise?: Promise<void> | undefined;
+  /** The in-flight reaper sweep, so stop() can wait for it before draining callbacks. */
+  private reapInFlight?: Promise<void> | undefined;
+  /** Set once stop() has drained every producer; late callbacks must not touch the store. */
+  private producersClosed = false;
+  /** Set when stop() has returned; a repeated stop() is a no-op. */
+  private stopped = false;
   private readonly runtimes = new Map<string, RuntimeContext>();
   private readonly launches = new Map<string, Promise<void>>();
   private readonly cleanupTargets = new Map<string, TerminalAgentStatus>();
@@ -249,6 +261,9 @@ export class AgentManager {
   async start(): Promise<void> {
     this.accepting = false;
     this.stopping = false;
+    this.stopped = false;
+    this.producersClosed = false;
+    this.stopPromise = undefined;
     this.epoch = this.repository.bumpEpoch(this.store.instanceId(), this.now());
     // Sized before any admission, so the session budgets count the durable stores already on disk.
     await this.durableSessions.measure();
@@ -285,20 +300,78 @@ export class AgentManager {
     // The sweep may wait on the gateway for each row, so it runs in the background, never
     // delaying admission or failing startup.
     void this.sweepSpend(0);
-    this.reaper = setInterval(() => { void this.reap().catch(() => undefined); }, 1_000);
+    this.reaper = setInterval(() => {
+      if (this.reapInFlight) return;
+      this.reapInFlight = this.reap().catch(() => undefined).finally(() => { this.reapInFlight = undefined; });
+    }, 1_000);
     this.reaper.unref();
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    return (this.stopPromise ??= this.performStop());
+  }
+
+  private async performStop(): Promise<void> {
+    if (this.stopped) return;
     this.fence();
     this.stopping = true;
     clearInterval(this.reaper);
+    // In-flight launches still own store writes — runtime registration, deadline
+    // arming, the start record — so they finish while stop() still owns the store.
+    // A launch completing afterwards would arm a deadline no disarm pass reaches.
+    await Promise.allSettled([...this.launches.values()]);
+    // Disarm every armed TTL deadline before teardown begins: cleanup() only
+    // clears the deadlines of agents it reaches, so a timer belonging to an
+    // agent outside the shutdown sweep (an inactive workspace, a failed
+    // cleanup) would otherwise fire against a store the caller is about to
+    // close. The reaper owns TTL enforcement after a restart.
+    for (const runtime of this.runtimes.values()) clearTimeout(runtime.deadline);
     // Promise.allSettled keeps teardown non-throwing: one workspace failing to stop must not abort
     // the rest. The callback returns the promise explicitly so that intent is unambiguous.
     await Promise.allSettled(this.store.active().map((workspace) => this.stopWorkspaceForShutdown(workspace)));
     // A sweep never rejects; waiting keeps it from touching the store after shutdown.
     await this.spendSweep;
+    // An in-flight reap keeps reading and writing the store until it returns.
+    await this.reapInFlight;
+    // Drain every tracked background cancellation/interrupt — including ones the
+    // shutdown sweep or a late callback spawned — so no callback can touch the
+    // store once stop() resolves and the caller closes it. The loop repeats
+    // because a settling callback can enqueue another (a cancel cascading into
+    // descendant interrupts).
+    while (this.pendingCancellations.size > 0) {
+      await Promise.allSettled([...this.pendingCancellations]);
+    }
+    // From here on no lifecycle callback may touch the store: producers (channel
+    // errors, runtime exit, late stderr, stragglers) are dropped at the
+    // trackTeardown gate, and remaining runtimes get their stdin closed so they
+    // stop producing. Agents outside the shutdown sweep stay in their persisted
+    // state for the next runner's restart reconciliation.
+    this.producersClosed = true;
+    // An in-flight proxied call can be parked on an executor gate that only an
+    // abort releases — a runtime whose agent was reconciled by another runner
+    // never reaches cleanup(), so nothing else would fire its controller. Abort
+    // every remaining registration so the tracked producers below can unwind
+    // and finish the store writes they owe; cleanup() already drained the ones
+    // it owned, and aborting a settled controller is a no-op.
+    for (const runtime of this.runtimes.values()) {
+      for (const pending of runtime.proxy.values()) pending.controller.abort('runner stopping');
+    }
+    for (const runtime of this.runtimes.values()) {
+      try {
+        runtime.channel.closeInput();
+      } catch {
+        // A channel already torn down needs no producer shutdown.
+      }
+    }
+    // An onRecord/onStorage already in flight when producers closed still owes
+    // the store writes it started with; drain it before the session store closes.
+    // The entry gate keeps the set from growing, so one pass settles it — the
+    // loop stays for symmetry with the cancellation drain.
+    while (this.pendingProducers.size > 0) {
+      await Promise.allSettled([...this.pendingProducers]);
+    }
     await this.durableSessions.close();
+    this.stopped = true;
   }
 
   private async stopWorkspaceForShutdown(workspace: WorkspaceRecord): Promise<void> {
@@ -627,15 +700,22 @@ export class AgentManager {
         runtime.process.stdout,
         runtime.process.stderr,
         async (output) => {
-          if (!contextRef.current) throw new Error('agent runtime emitted output before initialization');
-          await this.onRecord(contextRef.current, output);
+          if (this.producersClosed) return;
+          const context = contextRef.current;
+          if (!context) throw new Error('agent runtime emitted output before initialization');
+          await this.trackProducer(() => this.onRecord(context, output));
         },
-        async (content) => { this.appendLogOrLimit(record, 'stderr', content); },
-        (error) => { void this.interrupt(record, error.message); },
+        async (content) => {
+          if (this.producersClosed) return;
+          this.appendLogOrLimit(record, 'stderr', content);
+        },
+        (error) => { this.interruptInBackground(record, error.message); },
         record.runtime === 'pi-durable'
           ? async (request) => {
-            if (!contextRef.current) throw new Error('agent runtime emitted output before initialization');
-            await this.onStorage(contextRef.current, request);
+            if (this.producersClosed) return;
+            const context = contextRef.current;
+            if (!context) throw new Error('agent runtime emitted output before initialization');
+            await this.trackProducer(() => this.onStorage(context, request));
           }
           : undefined
       );
@@ -661,7 +741,7 @@ export class AgentManager {
       if (!running) throw new HarnessError('CONFLICT', 'agent launch lost its lifecycle fence', 409, true);
       context.record = running;
       const deadlineMs = Math.max(1_000, running.expiresAt - this.now());
-      context.deadline = setTimeout(() => { void this.cancelOne(running, 'agent TTL expired', 'TIMED_OUT'); }, deadlineMs);
+      context.deadline = setTimeout(() => { this.cancelInBackground(running, 'agent TTL expired', 'TIMED_OUT'); }, deadlineMs);
       context.deadline.unref();
       // A coding continuation learns what became of the tool calls its predecessor left unanswered
       // before its first turn, so it never issues an applied mutation again under a new tool call
@@ -672,8 +752,8 @@ export class AgentManager {
       const toolOutcomes = sessionLog ? await this.danglingToolOutcomes(context, sessionLog.messages) : [];
       await channel.send(this.startRecord(running, initialPrompt, profile, lease, session, toolOutcomes));
       void runtime.exited.then(({ code }) => {
-        if (!context.terminalSeen) void this.interrupt(running, `agent runtime exited before terminal record (${code ?? 'signal'})`);
-      }).catch((error: unknown) => { void this.interrupt(running, error instanceof Error ? error.message : 'agent runtime failed'); });
+        if (!context.terminalSeen) this.interruptInBackground(running, `agent runtime exited before terminal record (${code ?? 'signal'})`);
+      }).catch((error: unknown) => { this.interruptInBackground(running, error instanceof Error ? error.message : 'agent runtime failed'); });
     } catch (error) {
       if (!leaseMayExist) {
         // No lease can exist, so the reservation is released at zero now instead of waiting for a
@@ -724,7 +804,7 @@ export class AgentManager {
   private async onStorage(context: RuntimeContext, request: AgentStorageRequestRecord): Promise<void> {
     const { response, limitExceeded } = await context.session.handleStorage(request);
     if (!context.channel.isClosed) await context.channel.send(response);
-    if (limitExceeded) void this.cancelOne(context.record, 'durable agent session exceeded its size limit or a session byte budget', 'LIMIT_EXCEEDED').catch(() => undefined);
+    if (limitExceeded) this.cancelInBackground(context.record, 'durable agent session exceeded its size limit or a session byte budget', 'LIMIT_EXCEEDED');
   }
 
   private stillSpawning(record: AgentRecord): boolean {
@@ -1273,6 +1353,105 @@ export class AgentManager {
     for (const descendant of descendants) await this.cancelOne(descendant, reason, 'CANCELLED', false);
   }
 
+  /**
+   * Runs a lifecycle callback no caller awaits — the TTL deadline, a storage-limit
+   * cancel, a runtime-exit or channel-error interrupt. The task is tracked so
+   * stop() can disarm timers before teardown and drain every callback before it
+   * returns; a caller may then close the store without a stray write racing it.
+   */
+  private cancelInBackground(record: AgentRecord, reason: string, terminal: 'CANCELLED' | 'TIMED_OUT' | 'LIMIT_EXCEEDED' | 'FAILED'): Promise<void> {
+    return this.trackTeardown(record, () => this.cancelOne(record, reason, terminal), terminal);
+  }
+
+  private interruptInBackground(record: AgentRecord, reason: string): Promise<void> {
+    return this.trackTeardown(record, () => this.interrupt(record, reason), 'INTERRUPTED');
+  }
+
+  /**
+   * Runs a lifecycle callback no caller awaits — the TTL deadline, a storage-limit
+   * cancel, a runtime-exit or channel-error interrupt. The task is tracked so
+   * stop() can disarm timers before teardown and drain every callback before it
+   * returns; a caller may then close the store without a stray write racing it.
+   * The returned promise never rejects: failures route through noteTeardownFailure.
+   * Once stop() has drained its producers, late callbacks are dropped — the
+   * persisted state they would mutate is owned by the next runner's restart
+   * reconciliation, and the store may already be closed.
+   */
+  private trackTeardown(record: AgentRecord, task: () => Promise<void>, terminal?: TerminalAgentStatus): Promise<void> {
+    if (this.producersClosed) return Promise.resolve();
+    const pending = task()
+      .then(() => undefined, (error: unknown) => {
+        try {
+          this.noteTeardownFailure(record, error, terminal);
+        } catch {
+          // noteTeardownFailure warns on its own failures; a throw here would
+          // reject the tracked promise and abort the reaper's awaited sweep.
+        }
+      })
+      .finally(() => { this.pendingCancellations.delete(pending); });
+    this.pendingCancellations.add(pending);
+    return pending;
+  }
+
+  /**
+   * Registers an in-flight protocol producer — an onRecord or onStorage
+   * invocation the channel is still awaiting — so stop() can drain it before
+   * closing the store. Unlike trackTeardown the returned promise is the task
+   * itself: its rejection still reaches the channel unchanged.
+   */
+  private trackProducer(task: () => Promise<void>): Promise<void> {
+    const pending = task();
+    this.pendingProducers.add(pending);
+    void pending.then(
+      () => { this.pendingProducers.delete(pending); },
+      () => { this.pendingProducers.delete(pending); }
+    );
+    return pending;
+  }
+
+  /**
+   * Routes a background teardown failure through the same durable path cleanup()
+   * uses for its own failures: the agent is left CANCELLING and a cleanup retry
+   * row lets the reaper finish enforcement with backoff, instead of the rejection
+   * vanishing into the void. When the failure is the store itself there is
+   * nothing durable left to write; the sanitized stderr warning is then the only
+   * evidence. Never throws — it runs inside a tracked promise that must not
+   * reject.
+   */
+  private noteTeardownFailure(record: AgentRecord, error: unknown, terminal?: TerminalAgentStatus): void {
+    try {
+      reportTeardownWarning('background agent teardown failed', record.id, error);
+      const current = this.repository.findAgent(record.ownerId, record.workspaceId, record.id);
+      if (!current || terminalStatuses.has(current.status)) return;
+      // The callback was captured under record.generation; a newer generation is
+      // a different lifecycle whose own callbacks own its teardown. Mutating it
+      // here would let a stale failure cancel a healthy replacement agent.
+      if (current.generation !== record.generation) return;
+      // Preserve the intended terminal for the reaper's retry: cleanup() only
+      // records it once it actually runs, so a failure BEFORE that point (a
+      // rejected launch await or descendant cancel) would otherwise retry as
+      // INTERRUPTED and mislabel e.g. a TIMED_OUT agent as outcome-unknown.
+      if (terminal) this.cleanupTargets.set(record.id, terminal);
+      if (current.status !== 'CANCELLING') {
+        this.repository.transitionStatus({
+          ownerId: current.ownerId, workspaceId: current.workspaceId, agentId: current.id, generation: current.generation,
+          expectedStatuses: current.status === 'SPAWNING' ? ['SPAWNING'] : ['RUNNING'], status: 'CANCELLING', now: this.now(),
+          cleanupReason: `background teardown failed: ${safeError(error).slice(0, 500)}`
+        });
+      }
+      // cleanup() schedules its own retry before rethrowing; a second row would
+      // only double-count the same failure.
+      if (this.repository.cleanupRetry(record.ownerId, record.workspaceId, record.id, record.generation)) return;
+      this.repository.scheduleCleanupRetry({
+        ownerId: record.ownerId, workspaceId: record.workspaceId, agentId: record.id, agentGeneration: record.generation,
+        attempts: 1, nextAttemptAt: this.now() + 1_000,
+        lastError: safeError(error).slice(0, 2_000), updatedAt: this.now()
+      });
+    } catch (retryError) {
+      reportTeardownWarning('background agent teardown failure could not be persisted', record.id, retryError);
+    }
+  }
+
   private async cleanup(
     record: AgentRecord,
     runtime: RuntimeContext | undefined,
@@ -1405,6 +1584,12 @@ export class AgentManager {
       if (!cancelling) return;
       await this.cancelDescendants(cancelling, reason);
       const runtime = this.runtimes.get(record.id);
+      // A cleanup already in flight owns this agent's teardown; join it rather
+      // than starting a second concurrent cleanup under a different terminal.
+      if (runtime?.cleanup) {
+        await runtime.cleanup.catch(() => undefined);
+        return;
+      }
       const cleanup = this.cleanup(cancelling, runtime, reason, 'INTERRUPTED');
       if (runtime) runtime.cleanup = cleanup;
       await cleanup.catch(() => undefined);
@@ -1429,13 +1614,24 @@ export class AgentManager {
       const records = this.repository.listActiveAgents(workspace.ownerId, workspace.id, generation);
       for (const record of records) {
         if (record.status !== 'CANCELLING' && record.expiresAt <= now) {
-          await this.cancelOne(record, 'agent TTL expired', 'TIMED_OUT').catch(() => undefined);
+          // Awaited like the original cancelOne sweep: the tracked promise never
+          // rejects (failures route through noteTeardownFailure), so one bad
+          // agent cannot abort the rest of the sweep.
+          await this.cancelInBackground(record, 'agent TTL expired', 'TIMED_OUT');
         }
       }
       for (const retry of this.repository.listCleanupRetries(workspace.ownerId, workspace.id, now, 100)) {
         const record = this.repository.findAgent(retry.ownerId, retry.workspaceId, retry.agentId);
         if (record?.status !== 'CANCELLING') continue;
         const runtime = this.runtimes.get(record.id);
+        if (runtime?.cleanup) {
+          // A cleanup is already in flight for this agent — a tracked background
+          // cancel or an earlier retry. Join it instead of starting a second
+          // concurrent cleanup; if it settled without ending the agent, the
+          // retry below still runs this sweep's attempt.
+          await runtime.cleanup.catch(() => undefined);
+          if (this.repository.findAgent(record.ownerId, record.workspaceId, record.id)?.status !== 'CANCELLING') continue;
+        }
         const cleanup = this.cleanup(
           record,
           runtime,
@@ -1535,7 +1731,7 @@ export class AgentManager {
       this.repository.appendLog(record.ownerId, record.workspaceId, record.id, record.generation, type, content.slice(0, 65_536), this.now());
     } catch (error) {
       if (error instanceof HarnessError && error.code === 'LIMIT_EXCEEDED') {
-        void this.cancelOne(record, error.message, 'LIMIT_EXCEEDED');
+        this.cancelInBackground(record, error.message, 'LIMIT_EXCEEDED');
         return;
       }
       throw error;
@@ -1813,6 +2009,10 @@ function redactLease(text: string, lease: string): string {
 }
 
 function reportDurableWarning(msg: string, agentId: string, error: unknown): void {
+  process.stderr.write(`${JSON.stringify({ level: 'warn', time: Date.now(), msg, agentId, error: safeError(error).slice(0, 500) })}\n`);
+}
+
+function reportTeardownWarning(msg: string, agentId: string, error: unknown): void {
   process.stderr.write(`${JSON.stringify({ level: 'warn', time: Date.now(), msg, agentId, error: safeError(error).slice(0, 500) })}\n`);
 }
 
