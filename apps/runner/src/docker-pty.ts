@@ -19,6 +19,15 @@ export type PtyOpenRequest = {
   workingDir: string;
   cols: number;
   rows: number;
+  /**
+   * When non-empty, the PTY runs this argv verbatim (still under the
+   * pid-recording session wrapper so killSession works) instead of the
+   * interactive login shell. Used by spawnStream({pty}); terminal open()
+   * omits it.
+   */
+  argv?: string[];
+  /** Caller env merged over TERM/COLORTERM — caller keys win. */
+  environment?: Record<string, string>;
 };
 
 export type PtyEnd = { error?: Error | undefined };
@@ -66,6 +75,22 @@ export function terminalCommand(terminalId: string): string[] {
       + ` && printf '%s\\n' "$$" > "$pid_file.$$" && ln "$pid_file.$$" "$pid_file"; recorded=$?; rm -f -- "$pid_file.$$"`
       + '; ((recorded == 0)) && exec /bin/bash -i',
     'terminal', terminalId
+  ];
+}
+
+/**
+ * Same pid-file session recording as {@link terminalCommand}, then `exec`s the
+ * caller argv (`"${@:2}"` skips $0='terminal' and $1=terminalId) so a PTY stream
+ * runs the requested command — not a shell — while killSession still finds the
+ * recorded session pid.
+ */
+export function ptyArgvCommand(terminalId: string, argv: string[]): string[] {
+  return [
+    '/bin/bash', '-c',
+    `pid_file=${TERMINAL_PID_DIR}/"$1".pid; mkdir -p ${TERMINAL_PID_DIR} /tmp/cloud-harness-home`
+      + ` && printf '%s\\n' "$$" > "$pid_file.$$" && ln "$pid_file.$$" "$pid_file"; recorded=$?; rm -f -- "$pid_file.$$"`
+      + '; ((recorded == 0)) && exec "${@:2}"',
+    'terminal', terminalId, ...argv
   ];
 }
 
@@ -247,6 +272,12 @@ export class DockerPtyClient implements PtyTransport {
 
   async open(input: PtyOpenRequest): Promise<PtyConnection> {
     const consoleSize = [input.rows, input.cols];
+    const env = new Map<string, string>([
+      ['TERM', 'xterm-256color'],
+      ['COLORTERM', 'truecolor'],
+      ...Object.entries(input.environment ?? {})
+    ]);
+    const useArgv = input.argv !== undefined && input.argv.length > 0;
     const created = await this.json('POST', `/containers/${encodeURIComponent(input.container)}/exec`, {
       AttachStdin: true,
       AttachStdout: true,
@@ -254,8 +285,8 @@ export class DockerPtyClient implements PtyTransport {
       Tty: true,
       User: '10001:10001',
       WorkingDir: input.workingDir,
-      Env: ['TERM=xterm-256color', 'COLORTERM=truecolor'],
-      Cmd: terminalCommand(input.terminalId),
+      Env: [...env].map(([key, value]) => `${key}=${value}`),
+      Cmd: useArgv ? ptyArgvCommand(input.terminalId, input.argv!) : terminalCommand(input.terminalId),
       ConsoleSize: consoleSize
     });
     if (created.status !== 201) throw engineError(created.status, created.body);
