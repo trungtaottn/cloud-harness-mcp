@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { AgentIdSchema, IdempotencyKeySchema, WorkspaceIdSchema, WorkspaceNetworkExposureSchema } from './identifiers.js';
+import { ExecutorBackendKindSchema, WorkspaceBackendInfoSchema } from './executor-backend.js';
 import { ToolResultSchema } from './mcp-results.js';
 import { GitHubRepositoryCreateCapabilitySchema } from './github-repository-schemas.js';
 export const RunnerOperationSchema = z.enum([
@@ -154,7 +155,11 @@ export const WorkspaceCapabilityResultSchema = z.object({
     gated: z.array(z.string())
   }).strict().optional().describe('Which GitHub actions are read-only (callable through github_read without approval) and which stay gated on github_action'),
   githubRepositoryCreate: GitHubRepositoryCreateCapabilitySchema.optional()
-    .describe('Principal-level availability of github_repository_create; independent of the workspace repository')
+    .describe('Principal-level availability of github_repository_create; independent of the workspace repository'),
+  executionBackend: ExecutorBackendKindSchema.optional()
+    .describe("Executor backend the workspace runs on; 'docker' or absent for Docker workspaces, 'incus-vm' for Incus VM workspaces"),
+  backend: WorkspaceBackendInfoSchema.optional()
+    .describe('Structured backend identity and per-capability support matrix for this workspace')
 }).passthrough();
 
 /**

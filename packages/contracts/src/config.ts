@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ExecutorNetworkProfileSchema } from './identifiers.js';
+import { VmTemplateDigestSchema, VmTemplateIdSchema } from './executor-backend.js';
 import { AgentProxyOperationSchema } from './runner-api.js';
 import { BUILDABLE_PACKAGE_ECOSYSTEMS, BuildablePackageEcosystemSchema } from './package-schemas.js';
 import { SecretNameSchema } from './secret-policy.js';
@@ -514,6 +515,35 @@ export const RunnerConfigSchema = z.object({
     /** The provider's longest grant, in seconds. Defaults to the documented Cloudflare maximum. */
     maxGrantSeconds: z.coerce.number().int().min(3_600).max(315_360_000).optional()
   }).strict().optional(),
+  // Incus VM executor backend (opt-in). Off by default: `workspace_open`
+  // `executionBackend: 'incus-vm'` is refused with VM_BACKEND_DISABLED until the
+  // operator enables it here. Runner-side keys only — the VM supervisor owns its
+  // own network/guard/pool configuration (documented alongside these keys in
+  // .env.example). VM_CPUS/VM_MEMORY_BYTES/VM_DISK_BYTES are EXPECTED values the
+  // runner asserts on supervisor read-back; the supervisor owns the actuals.
+  vmBackendEnabled: enabled,
+  vmSupervisorSocket: z.string().min(1).max(1_024)
+    .refine((value) => value.startsWith('/') && !value.includes('\0'), 'VM supervisor socket must be an absolute path without NUL bytes')
+    .default('/run/cloud-harness-vm/supervisor.sock'),
+  vmSupervisorToken: token.optional(),
+  vmTemplateId: VmTemplateIdSchema.optional(),
+  vmTemplateDigest: VmTemplateDigestSchema.optional(),
+  // Runner-side pre-check only; supervisor admission stays authoritative.
+  // CH-VM-SCOPE-2026-11-07 approved initial envelope: ONE active VM globally
+  // at exactly 4 vCPU / 8 GiB / 20 GiB disk. These are PINNED values, not
+  // ceilings — any deviation (above OR below) is rejected until a measured
+  // capacity review changes the approved shape.
+  vmMaxActive: z.coerce.number().int().min(1).max(1).default(1),
+  vmCpus: z.coerce.number().int().min(4).max(4).default(4),
+  vmMemoryBytes: z.coerce.number().int().min(8_589_934_592).max(8_589_934_592).default(8_589_934_592),
+  vmDiskBytes: z.coerce.number().int().min(21_474_836_480).max(21_474_836_480).default(21_474_836_480),
+  // Host statfs floor the supervisor admission check must preserve.
+  vmPoolReserveBytes: z.coerce.number().int().min(0).max(1_099_511_627_776).default(10_737_418_240),
+  // Soft ceiling over the guest /workspace + /opt/user-tools + /var/cache/harness
+  // paths; deliberately separate from the Docker maxWorkspaceBytes (2 GiB).
+  vmMaxWorkspaceBytes: z.coerce.number().int().min(104_857_600).max(68_719_476_736).default(12_884_901_888),
+  // Inline vs session-framed-stream threshold for supervisor file transfers.
+  vmInlineMaxBytes: z.coerce.number().int().min(1_024).max(134_217_728).default(8_388_608),
   agents: RunnerAgentsConfigSchema.optional()
 }).superRefine((config, context) => {
   const mode = config.authMode ?? 'owner-bearer';
@@ -548,6 +578,17 @@ export const RunnerConfigSchema = z.object({
   }
   if (config.maxArtifactBytes > config.maxPrincipalArtifactBytes) {
     context.addIssue({ code: 'custom', path: ['maxArtifactBytes'], message: 'per-artifact quota cannot exceed principal quota' });
+  }
+  if (config.vmBackendEnabled) {
+    if (config.vmSupervisorToken === undefined) {
+      context.addIssue({ code: 'custom', path: ['vmSupervisorToken'], message: 'VM_SUPERVISOR_TOKEN is required when VM_BACKEND_ENABLED is on' });
+    }
+    if (config.vmTemplateId === undefined) {
+      context.addIssue({ code: 'custom', path: ['vmTemplateId'], message: 'VM_TEMPLATE_ID is required when VM_BACKEND_ENABLED is on' });
+    }
+    if (config.vmTemplateDigest === undefined) {
+      context.addIssue({ code: 'custom', path: ['vmTemplateDigest'], message: 'VM_TEMPLATE_DIGEST is required when VM_BACKEND_ENABLED is on' });
+    }
   }
 });
 
