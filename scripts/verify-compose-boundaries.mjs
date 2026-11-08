@@ -111,6 +111,38 @@ const packagesMount = runnerMounts.find((mount) => mount.target === '/var/lib/cl
 requireBoundary(packagesMount?.source === '/var/lib/cloud-harness/packages' && packagesMount.read_only !== true, 'runner managed-toolbox packages mount is missing or its host path differs from the runner path');
 requireBoundary(Object.entries(services).every(([name, service]) => name === 'runner' || !(service.volumes ?? []).some((mount) => mount.target.includes('/packages') || String(mount.source ?? '').includes('/cloud-harness/packages'))), 'only the runner may mount the managed-toolbox packages root');
 
+// Incus VM backend (opt-in): the DEFAULT stack must not mount the supervisor
+// socket directory at all — an unconditional mount would let Docker create
+// the host path even with the backend disabled. The mount exists only in
+// compose.vm.yaml, applied via an explicit extra -f. The supervisor bearer
+// token must never reach the API, ingress, or any other service.
+const vmSocketMount = '/run/cloud-harness-vm';
+requireBoundary(Object.values(services).every((service) => !(service.volumes ?? []).some((mount) => mount.target === vmSocketMount || String(mount.source ?? '') === vmSocketMount)), 'default compose must not mount the VM supervisor socket directory — opt in via compose.vm.yaml');
+
+const vmResult = spawnSync('docker', [
+  'compose', '--profile', 'gateway-test', '-f', 'compose.yaml', '-f', 'compose.production.yaml', '-f', 'compose.vm.yaml', 'config', '--format', 'json'
+], {
+  cwd: process.cwd(),
+  encoding: 'utf8',
+  env: { ...process.env, CLOUD_HARNESS_ENV_FILE: '.env.example', PROVISIONING_PROXY_ENV_FILE: ABSENT_PROXY_ENV_FILE }
+});
+if (vmResult.status !== 0) throw new Error(vmResult.stderr || 'VM-overlay Compose config failed');
+const vmServices = JSON.parse(vmResult.stdout).services;
+const vmRunnerMounts = vmServices.runner.volumes ?? [];
+const vmSocketMountEntry = vmRunnerMounts.find((mount) => mount.target === vmSocketMount);
+requireBoundary(vmSocketMountEntry !== undefined, 'compose.vm.yaml must mount the VM supervisor socket into the runner');
+requireBoundary(vmSocketMountEntry.read_only !== true, 'runner VM supervisor socket mount must be writable');
+requireBoundary(Object.entries(vmServices).every(([name, service]) => name === 'runner' || !(service.volumes ?? []).some((mount) => mount.target === vmSocketMount || String(mount.source ?? '') === vmSocketMount)), 'only the runner may mount the VM supervisor socket directory');
+requireBoundary(vmServices.api.environment?.VM_SUPERVISOR_TOKEN === '' && vmServices.api.environment?.VM_SUPERVISOR_TOKEN_FILE === '', 'API must still blank VM supervisor token vars under the VM overlay');
+for (const name of ['VM_SUPERVISOR_TOKEN', 'VM_SUPERVISOR_TOKEN_FILE']) {
+  requireBoundary(services.api.environment?.[name] === '', `API must explicitly blank ${name}`);
+}
+for (const [serviceName, service] of Object.entries(services)) {
+  if (serviceName === 'runner' || serviceName === 'api') continue;
+  requireBoundary(!Object.keys(service.environment ?? {}).some((name) => name === 'VM_SUPERVISOR_TOKEN' || name === 'VM_SUPERVISOR_TOKEN_FILE'), `${serviceName} must not receive the VM supervisor token`);
+}
+requireBoundary(!Object.keys(services.ingress.environment ?? {}).some((name) => name.startsWith('VM_SUPERVISOR_')), 'ingress must not receive VM supervisor settings');
+
 // The provisioning proxy gets only its own static settings, never the runtime env file, and its default
 // allow-list reaches no package registry: npm and PyPI egress is an explicit operator opt-in.
 const proxy = services['provisioning-proxy'];
@@ -175,7 +207,7 @@ const tunnelResult = spawnSync('docker', [
 ], {
   cwd: process.cwd(),
   encoding: 'utf8',
-  env: { ...process.env, CLOUD_HARNESS_ENV_FILE: '.env.example', CLOUDFLARE_TUNNEL_TOKEN: 'dummy-token' }
+  env: { ...process.env, CLOUD_HARNESS_ENV_FILE: '.env.example', CLOUDFLARE_TUNNEL_TOKEN: 'dummy-token', PROVISIONING_PROXY_ENV_FILE: ABSENT_PROXY_ENV_FILE }
 });
 
 if (tunnelResult.status !== 0) throw new Error(tunnelResult.stderr || 'tunnel Compose config failed');

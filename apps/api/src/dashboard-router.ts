@@ -2,7 +2,7 @@ import express, { Router, type NextFunction, type Response } from 'express';
 import { InstanceSettingsUpdateInputSchema, OAuthGrantSettingsUpdateInputSchema, TOOL_SCHEMA_BY_NAME, type ApiConfig, type RunnerOperation, type RunnerPrincipalSelector, type RunnerResponse } from '@cloud-harness/contracts';
 import { z } from 'zod';
 import { principalFromAuthInfo } from './auth.js';
-import { agentNeedsAttention, buildActivityProjection, buildMetricsProjection, buildOverviewProjection, buildReliabilityProjection, METRIC_WINDOWS, mapDashboardData, sendRunnerResponse, type DashboardResponseOperation } from './dashboard-response.js';
+import { agentNeedsAttention, buildActivityProjection, buildMetricsProjection, buildOverviewProjection, buildReliabilityProjection, mapDashboardData, mergeWorkspaceBackend, METRIC_WINDOWS, sendRunnerResponse, type DashboardResponseOperation } from './dashboard-response.js';
 import { dashboardSecurity, requireJson, SKILL_ARCHIVE_PATH } from './dashboard-security.js';
 import { createDashboardSessions } from './dashboard-session.js';
 import type { DashboardRequest, DashboardRunnerClient } from './dashboard-types.js';
@@ -298,7 +298,15 @@ export function createDashboardRouter(config: ApiConfig, runner: DashboardRunner
         response.status(503).json({ error: 'detail_unavailable', message: 'Workspace detail is temporarily unavailable.' });
         return;
       }
-      sendRunnerResponse(response, 'workspace_detail', await runner.callInternal('workspace_detail', { workspaceId: workspaceId.parse(request.params.workspaceId) }, selected));
+      const id = workspaceId.parse(request.params.workspaceId);
+      // `workspace_detail` is the internal projection; the public `workspace_status`
+      // record carries the executor backend block. The merge keeps detail
+      // authoritative and treats a failed status read as "no backend fields".
+      const [detail, status] = await Promise.all([
+        runner.callInternal('workspace_detail', { workspaceId: id }, selected),
+        runner.call('workspace_status', input('workspace_status', { workspaceId: id }), selected).catch(() => undefined)
+      ]);
+      sendRunnerResponse(response, 'workspace_detail', mergeWorkspaceBackend(detail, status));
     } catch (error) { next(error); }
   });
   router.get('/api/v1/workspaces/:workspaceId/files', async (request: DashboardRequest, response, next) => {

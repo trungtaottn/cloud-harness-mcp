@@ -9,7 +9,7 @@ import { MetadataStore } from '../src/metadata-store.js';
 import { SecretKeyring } from '../src/secret-keyring.js';
 import { StateStore } from '../src/state-store.js';
 
-const INSTALLATION_TOKEN = 'ghs_serviceLevelInstallationToken0123456789';
+const INSTALLATION_TOKEN = 'fake-installation-token-not-a-credential';
 
 vi.mock('../src/docker-engine.js', () => ({
   runDocker: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0, truncated: false })),

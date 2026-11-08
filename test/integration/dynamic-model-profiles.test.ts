@@ -73,7 +73,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
 
   it('ensures sentinel API key is encrypted in SQLite and never leak in plaintext', () => {
     const { repo, p, store } = setup();
-    const sentinelKey = 'sk-test-secret-canary-never-leak-998877';
+    const sentinelKey = 'test-canary-value-never-leak-998877';
 
     const cred = repo.createCredential(p, {
       label: 'OpenAI Secret',
@@ -133,7 +133,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
 
   it('spawns subagent using a dashboard-created dynamic profile and enforces its revision limits and proxy tools', async () => {
     const { repo, p, store } = setup();
-    const cred = repo.createCredential(p, { label: 'OpenAI Prod', provider: 'openai', apiKey: 'sk-key-123' });
+    const cred = repo.createCredential(p, { label: 'OpenAI Prod', provider: 'openai', apiKey: 'test-key-123' });
 
     // 1. Create dynamic profile
     const profile = repo.createProfile(p, {
@@ -282,8 +282,8 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
     const key = readFileSync(keyFile);
 
     // Create two separate credentials
-    const cred1 = repo.createCredential(p, { label: 'Key 1', provider: 'openai', apiKey: 'sk-secret-key-1111' });
-    const cred2 = repo.createCredential(p, { label: 'Key 2', provider: 'openai', apiKey: 'sk-secret-key-2222' });
+    const cred1 = repo.createCredential(p, { label: 'Key 1', provider: 'openai', apiKey: 'test-secret-key-1111' });
+    const cred2 = repo.createCredential(p, { label: 'Key 2', provider: 'openai', apiKey: 'test-secret-key-2222' });
 
     // Create profile bound to credential 1
     const profile = repo.createProfile(p, {
@@ -368,8 +368,8 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
     const snapshot = repo.getExportSnapshot(p);
     expect(snapshot.profiles[rev1Id]?.credentialId).toBe(cred1.id);
     expect(snapshot.profiles[rev2Id]?.credentialId).toBe(cred2.id);
-    expect(snapshot.credentials[cred1.id]?.secret).toBe('sk-secret-key-1111');
-    expect(snapshot.credentials[cred2.id]?.secret).toBe('sk-secret-key-2222');
+    expect(snapshot.credentials[cred1.id]?.secret).toBe('test-secret-key-1111');
+    expect(snapshot.credentials[cred2.id]?.secret).toBe('test-secret-key-2222');
 
     // Setup mock TLS upstream server capturing auth header
     let lastAuth = '';
@@ -416,13 +416,13 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
       const lease1 = gwRuntime.issueLease({ leaseId: 'l1', agentId: 'agent_01234567890123456789', profileId: rev1Id, ttlMs: 30000, maxInputTokens: 1000, maxOutputTokens: 500, maxCostMicros: 1000 });
       const req1 = httpRequest({ host: '127.0.0.1', port: gwAddress.port, path: '/v1/chat/completions', method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${lease1}`, 'x-model-profile': rev1Id, 'x-agent-id': 'agent_01234567890123456789', 'x-request-id': 'req_012345678901234567891' } });
       await new Promise<void>((res, rej) => { req1.on('response', (r) => { r.resume(); r.on('end', () => res()); }); req1.on('error', rej); req1.write('{}'); req1.end(); });
-      expect(lastAuth).toBe('Bearer sk-secret-key-1111');
+      expect(lastAuth).toBe('Bearer test-secret-key-1111');
 
       // Request using rev2 lease -> routes with Key 2
       const lease2 = gwRuntime.issueLease({ leaseId: 'l2', agentId: 'agent_01234567890123456789', profileId: rev2Id, ttlMs: 30000, maxInputTokens: 1000, maxOutputTokens: 500, maxCostMicros: 1000 });
       const req2 = httpRequest({ host: '127.0.0.1', port: gwAddress.port, path: '/v1/chat/completions', method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${lease2}`, 'x-model-profile': rev2Id, 'x-agent-id': 'agent_01234567890123456789', 'x-request-id': 'req_012345678901234567892' } });
       await new Promise<void>((res, rej) => { req2.on('response', (r) => { r.resume(); r.on('end', () => res()); }); req2.on('error', rej); req2.write('{}'); req2.end(); });
-      expect(lastAuth).toBe('Bearer sk-secret-key-2222');
+      expect(lastAuth).toBe('Bearer test-secret-key-2222');
     } finally {
       await gwRuntime.close();
       await new Promise<void>((res) => upstreamServer.close(() => res()));
@@ -470,7 +470,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
       const cred = repo.createCredential(p, {
         label: 'Dynamic Key',
         provider: 'openai',
-        apiKey: 'sk-dynamic-secret-key-445566'
+        apiKey: 'test-dynamic-secret-key-445566'
       });
 
       const chatProfile = repo.createProfile(p, {
@@ -555,7 +555,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
       const chatResponse = await chatPromise;
       expect(chatResponse.status).toBe(200);
       expect(chatResponse.body).toContain('dynamic reply for /v1/chat/completions');
-      expect(lastReceivedAuth).toBe('Bearer sk-dynamic-secret-key-445566');
+      expect(lastReceivedAuth).toBe('Bearer test-dynamic-secret-key-445566');
       expect(lastReceivedPath).toBe('/v1/chat/completions');
 
       // 6. Test Mode 2: responses (/v1/responses)
@@ -597,7 +597,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
       const respResponse = await respPromise;
       expect(respResponse.status).toBe(200);
       expect(respResponse.body).toContain('dynamic reply for /v1/responses');
-      expect(lastReceivedAuth).toBe('Bearer sk-dynamic-secret-key-445566');
+      expect(lastReceivedAuth).toBe('Bearer test-dynamic-secret-key-445566');
       expect(lastReceivedPath).toBe('/v1/responses');
     } finally {
       await gwRuntime.close();
@@ -608,7 +608,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
   it('automatically re-hydrates Gateway RAM when Gateway restarts while Runner remains up', async () => {
     const { repo, p, store } = setup();
 
-    const cred = repo.createCredential(p, { label: 'OpenAI Test', provider: 'openai', apiKey: 'sk-secret-rehydrate' });
+    const cred = repo.createCredential(p, { label: 'OpenAI Test', provider: 'openai', apiKey: 'test-secret-rehydrate' });
     const profile = repo.createProfile(p, {
       profileId: ModelProfileIdSchema.parse('auto-rehydrate'),
       displayName: 'Auto Rehydrate Agent',
@@ -795,7 +795,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
     const gwAddress = gwRuntime.httpServer.address() as AddressInfo;
 
     try {
-      const cred = repo.createCredential(p, { label: 'OpenRouter', provider: 'openrouter', apiKey: 'sk-or-priced-778899' });
+      const cred = repo.createCredential(p, { label: 'OpenRouter', provider: 'openrouter', apiKey: 'test-or-priced-778899' });
       const profile = repo.createProfile(p, {
         profileId: ModelProfileIdSchema.parse('priced-tiers'),
         displayName: 'Priced Tiers',
@@ -869,7 +869,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
 
   it('never lets an older snapshot build evict a revision that a newer push delivered, and keeps static gateway profiles', async () => {
     const { repo, p } = setup();
-    const cred = repo.createCredential(p, { label: 'OpenAI Ordering', provider: 'openai', apiKey: 'sk-secret-ordering' });
+    const cred = repo.createCredential(p, { label: 'OpenAI Ordering', provider: 'openai', apiKey: 'test-secret-ordering' });
     const profileInput = (profileId: string) => ({
       profileId: ModelProfileIdSchema.parse(profileId),
       displayName: profileId,
@@ -968,7 +968,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
 
   it('keeps the spawned revision in the gateway when a profile edit pushes between resolving the revision and reserving the agent', async () => {
     const { repo, p, store } = setup();
-    const cred = repo.createCredential(p, { label: 'OpenAI Race', provider: 'openai', apiKey: 'sk-secret-race' });
+    const cred = repo.createCredential(p, { label: 'OpenAI Race', provider: 'openai', apiKey: 'test-secret-race' });
     const profile = repo.createProfile(p, {
       profileId: ModelProfileIdSchema.parse('race-profile'),
       displayName: 'Race Profile',
@@ -1094,7 +1094,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
    */
   async function postReservationFixture(name: string, gateway: AgentGatewayControl, launcher: Partial<AgentLauncher>) {
     const { repo, p, store } = setup();
-    const cred = repo.createCredential(p, { label: `OpenAI ${name}`, provider: 'openai', apiKey: `sk-secret-${name}` });
+    const cred = repo.createCredential(p, { label: `OpenAI ${name}`, provider: 'openai', apiKey: `test-secret-${name}` });
     repo.createProfile(p, {
       profileId: ModelProfileIdSchema.parse('post-reservation'),
       displayName: 'Post Reservation',
@@ -1322,7 +1322,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
     const gwAddress = gwRuntime.httpServer.address() as AddressInfo;
 
     try {
-      const cred = repo.createCredential(p, { label: 'OpenCode Go', provider: 'opencode-go', apiKey: 'sk-opencode-go-445566' });
+      const cred = repo.createCredential(p, { label: 'OpenCode Go', provider: 'opencode-go', apiKey: 'test-opencode-go-445566' });
       const profile = repo.createProfile(p, {
         profileId: ModelProfileIdSchema.parse('opencode-go-coding'),
         displayName: 'OpenCode Go coding',
@@ -1377,7 +1377,7 @@ describe('Dynamic Model Profiles & Secret Isolation Integration', () => {
       expect(received).toEqual([{
         path: '/inference/go/openai/v1/chat/completions',
         session: agentId,
-        authorization: 'Bearer sk-opencode-go-445566',
+        authorization: 'Bearer test-opencode-go-445566',
         custom: undefined
       }]);
     } finally {
@@ -1470,7 +1470,7 @@ describe('model spend policies over the dashboard API', () => {
     const { store, repo, port, close } = await startDashboard();
     try {
       const principalId = store.resolvePrincipal(dashboardPrincipal);
-      const credential = repo.createCredential(principalId, { label: 'OpenAI', provider: 'openai', apiKey: 'sk-key-123' });
+      const credential = repo.createCredential(principalId, { label: 'OpenAI', provider: 'openai', apiKey: 'test-key-123' });
       repo.createProfile(principalId, {
         profileId: ModelProfileIdSchema.parse('coding'), displayName: 'Coding', credentialId: credential.id, model: 'gpt-5',
         apiMode: 'chat-completions', pricing: { inputMicrosPerMillionTokens: 1_000, outputMicrosPerMillionTokens: 2_000 },
@@ -1547,7 +1547,7 @@ describe('model spend policies over the dashboard API', () => {
     const { store, metadata, repo, port, close } = await startDashboard();
     try {
       const principalId = store.resolvePrincipal(dashboardPrincipal);
-      const credential = repo.createCredential(principalId, { label: 'OpenAI', provider: 'openai', apiKey: 'sk-validate-key-123' });
+      const credential = repo.createCredential(principalId, { label: 'OpenAI', provider: 'openai', apiKey: 'test-validate-key-123' });
       const saved = repo.createProfile(principalId, {
         profileId: ModelProfileIdSchema.parse('coding'), displayName: 'Coding', credentialId: credential.id, model: 'gpt-5',
         apiMode: 'chat-completions', pricing: { inputMicrosPerMillionTokens: 1_000, outputMicrosPerMillionTokens: 2_000 },
@@ -1571,7 +1571,7 @@ describe('model spend policies over the dashboard API', () => {
       // Nothing was written or audited, and the key never left the runner.
       expect(repo.listProfiles(principalId)).toEqual([expect.objectContaining({ generation: 1, activeRevisionId: saved.activeRevisionId })]);
       expect(metadata.listAudit(principalId).filter((event) => event.action.startsWith('model_profile.'))).toEqual([]);
-      expect(JSON.stringify([validated.json, stale.json])).not.toContain('sk-validate-key-123');
+      expect(JSON.stringify([validated.json, stale.json])).not.toContain('test-validate-key-123');
     } finally {
       await close();
     }
@@ -1581,7 +1581,7 @@ describe('model spend policies over the dashboard API', () => {
     const { store, metadata, repo, controls, port, close } = await startDashboard();
     try {
       const principalId = store.resolvePrincipal(dashboardPrincipal);
-      const credential = repo.createCredential(principalId, { label: 'OpenAI', provider: 'openai', apiKey: 'sk-mcp-profile-key-123' });
+      const credential = repo.createCredential(principalId, { label: 'OpenAI', provider: 'openai', apiKey: 'test-mcp-profile-key-123' });
       const limits = { maxInputTokens: 100_000, maxOutputTokens: 20_000, maxCostMicros: 2_000_000 };
       const created = await controls.executeModelTool(dashboardPrincipal, 'model_profile_create', {
         profileId: 'coding', displayName: 'Coding', credentialId: credential.id, model: 'gpt-5', apiMode: 'chat-completions',
@@ -1652,7 +1652,7 @@ describe('model spend policies over the dashboard API', () => {
           ['model_profile.created', 'mcp'], ['model_profile.activated', 'dashboard'],
           ['model_profile.change_refused', 'mcp'], ['model_profile.updated', 'dashboard']
         ]);
-        expect(JSON.stringify([created, activated.json, raised.json])).not.toContain('sk-mcp-profile-key-123');
+        expect(JSON.stringify([created, activated.json, raised.json])).not.toContain('test-mcp-profile-key-123');
       } finally {
         await manager.stop();
       }

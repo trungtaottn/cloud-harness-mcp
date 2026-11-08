@@ -32,6 +32,18 @@ compose() {
       fi
     fi
   fi
+  # Same opt-in rule as service-compose.sh: the operator-created vm.enabled
+  # marker persists the supervisor socket mount, but only while the active
+  # checkout ships compose.vm.yaml — a rollback to a pre-overlay release must
+  # keep working for Docker instead of failing on a missing -f file.
+  local vm_marker="${config_root:-/etc/cloud-harness-mcp}/vm.enabled"
+  if [[ -f "$vm_marker" ]]; then
+    if [[ -f compose.vm.yaml ]]; then
+      compose_files+=(-f compose.vm.yaml)
+    else
+      echo "cloud-harness: $vm_marker is set but this checkout has no compose.vm.yaml; the VM backend mount stays absent" >&2
+    fi
+  fi
   CLOUD_HARNESS_ENV_FILE="$env_file" HOST_JOBS_ROOT="$state/jobs" HOST_STATE_ROOT="$state/state" HOST_ARTIFACT_ROOT="$state/artifacts" \
     docker compose "${compose_files[@]}" "$@"
 }

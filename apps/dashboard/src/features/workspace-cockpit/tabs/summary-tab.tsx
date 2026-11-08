@@ -1,7 +1,10 @@
 import { useQuery } from '@tanstack/react-query';
 import { DetailList } from '@/components/data/detail-list';
 import { Section } from '@/components/data/section';
-import { workspaceHasAction, networkLabel, workspaceStatusLabel } from '@/features/workspaces/workspace-model';
+import {
+  backendKindOf, backendLabel, backendTemplateId, capabilityLabel, networkLabel, unsupportedBackendCapabilities,
+  workspaceHasAction, workspaceStatusLabel
+} from '@/features/workspaces/workspace-model';
 import { bffPath, bffQuery } from '@/lib/bff-query';
 import { rec } from '@/lib/format';
 import type { CockpitTabProps } from '../cockpit-tab-registry';
@@ -27,6 +30,13 @@ export default function SummaryTab({ workspaceId, workspace }: CockpitTabProps) 
   const attention = workspaceAttention(workspace);
   const pendingContext = contextAvailable && context.isPending;
   const itemCount = typeof manifest?.itemCount === 'number' ? `${manifest.itemCount} attributable item(s)${manifest.truncated === true ? ' (truncated)' : ''}` : 'Not reported';
+  const backendKind = backendKindOf(workspace);
+  const templateId = backendTemplateId(workspace);
+  const unsupported = unsupportedBackendCapabilities(workspace);
+  const backendSummary = `${backendLabel(backendKind)}${templateId ? ` · ${templateId}` : ''}`;
+  const unsupportedSummary = workspace.backend?.capabilities
+    ? (unsupported.length ? unsupported.map(capabilityLabel).join(', ') : 'None declared')
+    : 'Not reported';
   return (
     <div className="grid gap-(--stack-gap)">
       <Section title="Needs attention" id="attention">
@@ -45,9 +55,11 @@ export default function SummaryTab({ workspaceId, workspace }: CockpitTabProps) 
         <div aria-busy={pendingContext || undefined}>
           <DetailList items={[
             { label: 'Status', value: workspaceStatusLabel(workspace.status) },
+            { label: 'Backend', value: backendSummary },
             { label: 'Branch', value: pendingContext ? 'Loading…' : data?.branch ?? workspace.ref ?? 'Default branch' },
             { label: 'Repository context', value: pendingContext ? 'Loading…' : itemCount },
             { label: 'Capabilities', value: pendingContext ? 'Loading…' : capabilities.length ? capabilities.join(', ') : 'Not reported' },
+            { label: 'Not supported on this backend', value: unsupportedSummary },
             { label: 'Network posture', value: networkLabel(workspace.networkProfile) },
             { label: 'Cost used', value: 'Not reported for workspaces yet' }
           ]} />

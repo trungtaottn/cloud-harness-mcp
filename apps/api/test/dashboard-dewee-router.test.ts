@@ -200,7 +200,7 @@ describe('Dashboard webchat BFF: chat', () => {
   it('streams the gateway reply as SSE and prepends a sanitized page block', async () => {
     const headers = await chatHeaders();
     const actions = [{ name: 'navigate', description: 'Open a page', sensitivity: 'navigate', parameters: { type: 'object', properties: { route: { type: 'string' } } } }];
-    const pageContext = { route: '/workspaces', apiKey: 'chm_key_abcdefghijkl', note: 'Bearer abcdefghijklmnop', count: 3 };
+    const pageContext = { route: '/workspaces', apiKey: 'fixture-key-value-not-real', note: 'Bearer fake-bearer-token', count: 3 };
     const reply = await send('/api/v1/dewee/chat', { method: 'POST', headers, body: JSON.stringify({ message: '  hello  ', conversationId: 'conv-123', actions, pageContext }) });
     expect(reply.status).toBe(200);
     expect(reply.headers['content-type']).toBe('text/event-stream; charset=utf-8');
@@ -224,21 +224,21 @@ describe('Dashboard webchat BFF: chat', () => {
     expect(message.endsWith('[[/dewee-page]]\n\nhello')).toBe(true);
     expect(message).toContain('"name":"navigate"');
     expect(message).toContain('Page context: {"route":"/workspaces","apiKey":"[redacted]","note":"[redacted]","count":3}');
-    expect(message).not.toContain('chm_key_abcdefghijkl');
+    expect(message).not.toContain('fixture-key-value-not-real');
     expect(reply.text).not.toContain('LEAK');
     expect(reply.text).not.toContain('UNKEYED');
   });
 
   it('redacts secret-shaped content in action-result blocks but leaves the visitor\'s words as typed', async () => {
     const headers = await chatHeaders();
-    const result = { id: 'call-1', name: 'prepare_project_create', status: 'error', error: 'upstream said: sk-SENTINELabcdefghijklmnop', result: { token: 'plain', id: `prj_${'a'.repeat(32)}` } };
-    const message = `\`\`\`dewee-action-result\n${JSON.stringify(result)}\n\`\`\`\n\n\`\`\`dewee-action-result\nnot json Bearer abcdefghijklmnop\n\`\`\`\nmy words`;
+    const result = { id: 'call-1', name: 'prepare_project_create', status: 'error', error: 'upstream said: chm_key_SentinelFixture123', result: { token: 'plain', id: `prj_${'a'.repeat(32)}` } };
+    const message = `\`\`\`dewee-action-result\n${JSON.stringify(result)}\n\`\`\`\n\n\`\`\`dewee-action-result\nnot json Bearer fake-bearer-token\n\`\`\`\nmy words`;
     const reply = await send('/api/v1/dewee/chat', { method: 'POST', headers, body: JSON.stringify({ message }) });
     expect(reply.status).toBe(200);
     const forwarded = String(stub.requests.find((entry) => entry.method === 'chat.send')!.params.message);
-    expect(forwarded).not.toContain('sk-SENTINEL');
+    expect(forwarded).not.toContain('SentinelFixture123');
     expect(forwarded).not.toContain('"token":"plain"');
-    expect(forwarded).not.toContain('Bearer abcdefghijklmnop');
+    expect(forwarded).not.toContain('Bearer fake-bearer-token');
     expect(forwarded).toContain('"error":"upstream said: [redacted]"');
     expect(forwarded).toContain(`"id":"prj_${'a'.repeat(32)}"`);
     expect(forwarded.endsWith('```\nmy words')).toBe(true);
@@ -466,13 +466,19 @@ describe('Dashboard webchat BFF: disabled', () => {
 });
 
 describe('Dashboard webchat page context sanitizer', () => {
+  const randomSecret = () => {
+    let value = '';
+    do { value = randomBytes(24).toString('base64url'); } while (!/[a-z]/.test(value) || !/[A-Z]/.test(value) || !/\d/.test(value));
+    return value;
+  };
+
   it('redacts secret-named fields and secret-shaped values at any depth', () => {
     expect(sanitizeDeweePageContext({
       route: '/settings',
-      nested: { password: 'p', items: [{ github: 'ghp_abcdefghijklmnopqrstuvwxyz0123' }, 'https://user:pass@example.com/repo'] },
-      jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvcGVyYXRvciJ9.c2lnbmF0dXJlLXZhbHVl',
-      openai: 'sk-abcdefghijklmnopqrstuv',
-      pem: '-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----',
+      nested: { password: 'p', items: [{ github: 'ghp_abcdefghijklmnopqrst' }, 'https://user:pass@example.com/repo'] },
+      jwt: 'eyJaaaaaaaa.bbbbbbbb.cccccccc',
+      openai: 'sk-abcdefghijklmnop',
+      pem: '-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----',
       count: 2
     })).toEqual({
       route: '/settings',
@@ -486,7 +492,7 @@ describe('Dashboard webchat page context sanitizer', () => {
 
   it('redacts generic secret keys and long random strings but keeps ordinary values', () => {
     const hex64 = 'a3f1'.repeat(16);
-    const base64 = 'Zk9xR2b7Tq1LmN4pWv8Yc3Hs6Ju0Ke5Dg2Fa9Xo';
+    const base64 = randomSecret();
     expect(sanitizeDeweePageContext({
       key: 'k', value: 'v', pwd: 'p', accessKey: 'a', signature: 's',
       digest: `sha256:${hex64}`, blob: `token=${base64}`,
@@ -511,8 +517,8 @@ describe('Dashboard webchat page context sanitizer', () => {
 
   it('still redacts random tokens beside ids and credential-bearing prefixes', () => {
     const workspaceId = `ws_${randomBytes(24).toString('base64url')}`;
-    const token = 'Zk9xR2b7Tq1LmN4pWv8Yc3Hs6Ju0Ke5Dg2Fa9Xo';
-    const lease = 'lease_Qm3xT8vLk2Rz7Wn4Yp9Hc6Js1Fd5Gb0A';
+    const token = randomSecret();
+    const lease = `lease_${randomSecret()}`;
     expect(sanitizeDeweePageContext({ route: `/dashboard/workspaces/${workspaceId}/${token}`, bare: token, lease, accessKey: 'a', value: 'v' })).toEqual({
       route: `/dashboard/workspaces/${workspaceId}/[redacted]`, bare: '[redacted]', lease: '[redacted]', accessKey: '[redacted]', value: '[redacted]'
     });
@@ -535,7 +541,7 @@ describe('Dashboard webchat page context sanitizer', () => {
   });
 
   it('gives no id pass to look-alike keys or over-long ids', () => {
-    const random = 'Zk9xR2b7Tq1LmN4pWv8Yc3Hs6Ju0Ke5Dg2Fa9Xo';
+    const random = randomSecret();
     expect(sanitizeDeweePageContext({
       live: `sk_live_${random}`, test: `sk_test_${random}`, long: `ws_${random}${random.slice(0, 24)}`
     })).toEqual({ live: '[redacted]', test: '[redacted]', long: '[redacted]' });
