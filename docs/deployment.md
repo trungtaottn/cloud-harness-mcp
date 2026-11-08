@@ -34,6 +34,86 @@ or target filenames already belong to another service. If this project was
 previously installed, back up those two exact files/symlinks before continuing
 instead of treating failed `test` commands as permission to overwrite them.
 
+### Optional: Incus VM executor backend
+
+The `incus-vm` workspace backend is opt-in and stays off until an operator
+enables it; it changes nothing for Docker workspaces. Enabling it is a live,
+owner-authorized operation with host prerequisites beyond this runbook's
+scope: an Incus install with the extension-gated build, the VM supervisor and
+egress-guard systemd units, a dedicated storage pool, and the opt-in
+`compose.vm.yaml` overlay that mounts the supervisor socket into the runner —
+the default Compose stack never sees `/run/cloud-harness-vm`. The guard's
+mutation mutex additionally needs util-linux `flock` at `/usr/bin/flock` —
+an owner-prepared prerequisite the units verify and never install; if it is
+absent the guard fails closed until the owner completes environment
+preparation. The guard lock file's
+never-unlink invariant and the coordinated-stop migration for hosts upgrading
+from the retired directory-lock protocol are operator runbook steps in
+[operations](operations.md#incus-vm-backend-operations). On a deployed
+host the service wrapper (`cloud-harness-service-compose`) and the deploy
+runtime's compose path append the overlay automatically on every Compose
+invocation — `up`, `down`, `build`, `ps`, deploy, restart, and rollback —
+while the operator-created marker `/etc/cloud-harness-mcp/vm.enabled` exists
+in the root-owned config directory; create it once as root with
+`install -m 0644 /dev/null /etc/cloud-harness-mcp/vm.enabled`. Automation never
+creates the marker. A checkout that predates `compose.vm.yaml` (for example a
+rollback target) skips the overlay with a stderr warning instead of failing —
+Docker rollback and stop keep working — so the marker only takes effect on
+releases that ship the overlay. For local development include the file
+explicitly: `docker compose -f compose.yaml -f compose.vm.yaml up -d`. The
+egress guard additionally
+requires **nftables ≥ 1.0.7 and kernel ≥ 6.3**: it probes `nft --version`
+and `uname -r` before writing any payload, refuses to start below that
+floor, and above it replaces its nft table atomically (`destroy table` plus
+the canonical ruleset in a single `nft -f` transaction after `nft -c`).
+Verify the host's `nft --version` and kernel
+release live before enabling — these docs describe the source contract, not a
+completed deployment. Runner-side keys
+(`VM_BACKEND_ENABLED`, `VM_SUPERVISOR_SOCKET`, `VM_SUPERVISOR_TOKEN`,
+`VM_TEMPLATE_ID`, `VM_TEMPLATE_DIGEST`, and the sizing/admission bounds) are
+described in [configuration](configuration.md#incus-vm-executor-backend-opt-in);
+the supervisor's own Incus/pool/guard configuration lives with
+[`apps/vm-supervisor/`](../apps/vm-supervisor/) and its units under
+`deploy/vm-supervisor/`. Do not enable the backend on a host that has not completed those
+steps — `workspace_open` with `executionBackend: 'incus-vm'` then fails closed
+with `VM_BACKEND_DISABLED` or `VM_SUPERVISOR_UNAVAILABLE`.
+
+### Building and publishing the VM template image
+
+`scripts/vm-template-build.sh` owns the template lifecycle end to end; its
+header comment is the command authority. The offline subcommands need no
+Incus: `check` runs the static payload gate, `stage --out DIR` assembles the
+payload plus `manifest.txt` (per-file sha256+mode), `render-network` renders
+a `.network` fragment from explicit values, `diff-inventory` compares two
+inventory captures, and `scan-secrets` sweeps a tree for credential-shaped
+material.
+
+`build --output DIR` is the live path: it launches a disposable Incus VM
+from the resolved base **fingerprint** (the mutable `images:debian/13`
+alias is resolved once via `image info` and the launch pins
+`<remote>:<fingerprint>` so a moved alias cannot change base content),
+provisions the guest, publishes the image under `template.json`'s
+`publishAlias`, and writes `manifest.json` (template id/version, alias,
+base alias + resolved base fingerprint, published image fingerprint,
+inventory/template digest, payload manifest digest). `--output` must be a
+fresh or empty directory — the script refuses non-empty output rather than
+risking stale artifacts — and staging lives in a per-run temp dir that is
+always cleaned. `--base-image`, `--expect-base-fingerprint` /
+`VM_TEMPLATE_BASE_FP`, `template.json baseImageFingerprint`, and
+`VM_TEMPLATE_BASE_IMAGE` control base selection and pinning;
+`--replace-alias` is the explicit opt-in for overwriting an existing
+publish alias (otherwise the build fails closed). `VM_TEMPLATE_PROJECT`,
+`VM_TEMPLATE_PROFILE`, `VM_TEMPLATE_BUILD_{CPU,MEMORY,DISK}` and
+`VM_TEMPLATE_AGENT_WAIT_SECONDS` tune the build VM itself.
+
+After a successful build, record `manifest.json`'s
+`baseImageFingerprint` into `template.json` (or pass the pin) so later
+builds resolve identical base content, and set the runner's
+`VM_TEMPLATE_ID`/`VM_TEMPLATE_DIGEST` from the manifest. Rebuilding the
+same inputs must yield a byte-identical `inventory.txt` — that digest is
+the `templateDigest` the runner attests against live instances; the
+script deliberately does not claim the two-build reproducibility gate.
+
 ## First install
 
 From a reviewed checkout:

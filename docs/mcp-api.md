@@ -1222,6 +1222,45 @@ The executable owners are
 [`local-http-server.ts`](../apps/api/src/local/local-http-server.ts), and
 [`test/integration/mcp-local-multi-workspace.test.ts`](../test/integration/mcp-local-multi-workspace.test.ts).
 
+## Executor backend selection
+
+`workspace_open` accepts an optional `executionBackend` of `'docker'` or
+`'incus-vm'`. Docker is the default and the only backend existing workspaces
+carry; `incus-vm` is opt-in for **newly opened** workspaces and requires the
+operator to have enabled the backend (`VM_BACKEND_ENABLED` plus the supervisor
+stack — see [configuration](configuration.md)). There is no in-place backend
+conversion: a workspace's kind is fixed at admit.
+
+- Omitting `executionBackend` and passing `'docker'` explicitly are the same
+  request for idempotency purposes: the open fingerprint includes the backend
+  only for `incus-vm`, so pre-backend keys replay byte-identically.
+- `workspace_list`, `workspace_status`, `workspace_open`, `workspace_close`,
+  `workspace_context`, and `workspace_capabilities` results carry
+  `executionBackend` (the kind) and, when the backend resolves, a structured
+  `backend` block: `{ kind, templateId?, capabilities }`. `capabilities` is the
+  backend's declared support matrix (`'supported' | 'unsupported'` per
+  capability id); clients should check it before calling an operation, but the
+  runner re-checks every call — the matrix is intent, not proof.
+- On `incus-vm`, `packages-bind` and `dashboard-repo-skills` are
+  `unsupported`: host package mounts have no guest path, and the dashboard's
+  workspace-tier repository skill reads are served from a host checkout a
+  guest cannot have. The `skills` capability stays supported — `skills_list`,
+  `skills_read`, `skills_run`, and `skill_suggest` are unaffected. A refused
+  operation fails with `VM_CAPABILITY_UNSUPPORTED` (400, terminal).
+- VM lifecycle and failure codes, with retryability per the contract:
+  `VM_BACKEND_DISABLED` (503, terminal — the kind is not enabled),
+  `VM_QUOTA_EXCEEDED` (429), `VM_UNKNOWN_STATE` (503, **retryable** — a
+  mutation's outcome is unknown; reconcile via `workspace_status` before
+  retrying blindly), `VM_GENERATION_MISMATCH` and `VM_IDENTITY_MISMATCH`
+  (409, terminal — the workspace identity/generation fence moved),
+  `VM_ATTESTATION_FAILED` (503, terminal), and `VM_SUPERVISOR_UNAVAILABLE`
+  (503, **retryable** — the supervisor could not be reached or broke protocol).
+  `VM_UNKNOWN_STATE` workspaces are retained and never auto-deleted.
+- Fixed v1 sizing is one VM globally at 4 CPUs / 8 GiB memory / 20 GiB disk;
+  the boundary's honest limits (guest-root secret visibility, untrusted guest
+  state, external-only network enforcement, git-native import with no freeze)
+  are documented in [security-model](security-model.md#incus-vm-executor-backend).
+
 ## Repository opening policy
 
 The runner accepts credential-free HTTPS URLs on configured allowlisted hosts,

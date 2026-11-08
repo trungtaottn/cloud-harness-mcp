@@ -39,6 +39,7 @@ Clone an approved HTTPS repository and start an owner-bound, TTL-limited coding 
 | `fetchDepth` | `integer` | No | Commits of history to clone; 0 clones full history. Omitted keeps the default single-commit clone. (range: 0–100000) |
 | `shallowSince` | string \| string | No | Clone history newer than this ISO date or datetime instead of a commit count. |
 | `networkProfile` | `"network-none"` \| `"dependency-access"` | No | — |
+| `executionBackend` | `"docker"` \| `"incus-vm"` | No | Executor backend for the new workspace; omitted or 'docker' keeps the Docker default, 'incus-vm' opens a disposable Incus VM (opt-in, gated by runner configuration). |
 | `networkMode` | `any` · **Deprecated** | No | Retired and rejected: this field was replaced by networkProfile. |
 | `environmentId` | `string` | No | pattern: `^env_[A-Za-z0-9_-]{20,80}$` |
 | `confirmEnvironmentInjection` | `true` | No | — |

@@ -22,6 +22,85 @@ The systemd and Compose owners are
 [`compose.yaml`](../compose.yaml), and
 [`compose.production.yaml`](../compose.production.yaml).
 
+### Incus VM backend operations
+
+When `VM_BACKEND_ENABLED` is on, the runner depends on the host-side VM
+supervisor and egress guard (their own systemd units under
+`deploy/vm-supervisor/`, not the Compose stack). Check them alongside the
+Compose services:
+
+```bash
+sudo systemctl status cloudharness-vm-supervisor.service cloud-harness-vm-guard.service
+sudo journalctl -u cloudharness-vm-supervisor.service --since "30 minutes ago"
+sudo journalctl -u cloud-harness-vm-guard.service --since "30 minutes ago"
+incus list   # VM instances named chm-vm-<hash>
+```
+
+The runner's `/run/cloud-harness-vm` mount exists only while the
+`/etc/cloud-harness-mcp/vm.enabled` marker is present and the active release
+ships `compose.vm.yaml`; a marker set on a pre-overlay release logs a
+`vm.enabled`/`compose.vm.yaml` warning on Compose invocations and the mount
+stays absent until a capable release runs again.
+
+The guard needs **nftables ≥ 1.0.7 and kernel ≥ 6.3** on the host: it probes
+`nft --version` and `uname -r` before writing any payload, refuses to start
+below that floor, and above it commits `destroy table` plus the canonical
+ruleset as one `nft -f` transaction after `nft -c`. Confirm the floor live
+with `nft --version` and `uname -r`; a guard unit that exits at startup with
+`prerequisites unmet` means the host is below the floor and the backend
+cannot attest workspaces.
+
+A workspace stuck in `VM_UNKNOWN_STATE` is **retained, never auto-deleted** —
+reconcile it through `workspace_status`/`workspace_recover` rather than
+removing the Incus instance by hand. Post-hard-expiry recovery is an offline
+`vm.export` clean-check through an isolated libguestfs appliance; the guest
+filesystem is never mounted in the host kernel. Failure codes and retryability
+are listed in [mcp-api](mcp-api.md#executor-backend-selection) and
+[troubleshooting](troubleshooting.md#workspace-opening).
+
+#### Guard lock file and upgrade migration
+
+The supervisor and egress guard serialize every kernel/claim mutation through
+a kernel `flock(2)` mutex on `/run/cloud-harness-vm/guard.flock` — a regular
+file the code creates once and never unlinks or renames (the state dir is the
+shared systemd `RuntimeDirectory`; claims, verdict, and attestation JSON are
+unchanged). The helper is the trusted absolute `/usr/bin/flock` from
+util-linux — its availability is an owner-prepared prerequisite the units
+verify (stat + executable) at acquire time and never install themselves; if
+it is absent or not executable the guard fails closed with
+`guard-lock-helper-missing` until the owner completes environment
+preparation through the approved channel. A bounded wait expires as
+`guard-lock-timeout`, a same-context re-entry as `guard-lock-reentrant`, and
+an inode/mode change detected during acquire as `guard-lock-replaced`. That
+re-check covers the acquire window only — it cannot prevent a later
+unlink/recreate by host root, which remains outside the guard's guarantee.
+
+`guard.flock` must never be removed while the units are running: deleting
+the inode orphans the lock description, and a recreated file is a different
+mutex. The retired directory-protocol lock `guard.lock` is likewise never
+touched automatically — **any** presence of that name (directory, file, or
+symlink) makes the units refuse mutations with `guard-lock-legacy-present`
+until an operator completes the migration below, which **preserves** the
+directory aside for review rather than deleting it.
+
+Upgrading a host that ran the pre-flock guard requires a coordinated stop —
+the legacy check cannot see old workers still holding the directory mutex:
+
+1. `sudo systemctl stop cloudharness-vm-supervisor.service cloud-harness-vm-guard.service`
+2. Verify both units are inactive and that no other process holds the state
+   dir — manually invoked old workers count as holders too.
+3. Inspect `/run/cloud-harness-vm/guard.lock`: if present it is the retired
+   protocol's directory. After step 2 is confirmed, rename it aside for
+   operator review — `sudo mv /run/cloud-harness-vm/guard.lock /run/cloud-harness-vm/guard.lock.retired-<timestamp>`
+   — choosing a timestamp that does not collide with an existing archive;
+   never overwrite an existing `*.retired-*` path and never broad-delete.
+   The upgraded code never moves or deletes it for you.
+4. Start the upgraded units. `guard.flock` is created on first acquire; no
+   claims/verdict/state migration is needed.
+
+Never run pre-flock and flock builds against the same state dir
+concurrently, and never remove `guard.flock` during operation.
+
 ## Persistent and ephemeral data
 
 The production defaults place:

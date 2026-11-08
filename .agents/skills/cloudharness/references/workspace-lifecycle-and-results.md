@@ -113,6 +113,16 @@ Clone an approved repository and start its bounded executor.
   TCP 80/443 through an attested host firewall). Pass
   `networkProfile: "network-none"` only when the owner asks for isolation; it
   blocks all executor egress. The legacy `networkMode` field is rejected.
+- Optional: `executionBackend` (`"docker"` or `"incus-vm"`). Docker is the
+  default; `incus-vm` is opt-in for newly opened workspaces only — there is no
+  in-place conversion — and fails with `VM_BACKEND_DISABLED` unless the
+  operator enabled it. Omitting it and passing `"docker"` are
+  idempotent-equivalent (the open fingerprint includes the backend only for
+  `incus-vm`). On an `incus-vm` workspace, `packages-bind` and dashboard
+  repository-skill browsing (`dashboard-repo-skills`) are unsupported and
+  refuse with `VM_CAPABILITY_UNSUPPORTED`; the `skills_*` MCP tools remain
+  supported. Open a Docker workspace for the refused operations. See
+  [Executor backend](executor-backend.md).
 - Returns workspace metadata including opaque `workspaceId`, status, network
   profile, timestamps, and expiry. A fresh open usually also returns a
   content-free `repositoryContext` summary (digest, discovered guidance paths,
