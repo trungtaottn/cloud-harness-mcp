@@ -187,6 +187,20 @@ export function loadRunnerConfigWithReadiness(): RunnerConfigLoadResult {
     minFreeBytes: process.env.MIN_FREE_BYTES,
     maxWorkspaceBytes: process.env.MAX_WORKSPACE_BYTES,
     maxActiveWorkspacesPerOwner: process.env.MAX_ACTIVE_WORKSPACES_PER_OWNER,
+    // Incus VM backend (opt-in). Runner-side keys only; supervisor networking keys
+    // (VM_BRIDGE_PATTERN, VM_SUBNET_PLAN, ...) belong to the host supervisor process.
+    vmBackendEnabled: process.env.VM_BACKEND_ENABLED,
+    vmSupervisorSocket: process.env.VM_SUPERVISOR_SOCKET,
+    vmSupervisorToken: secret('VM_SUPERVISOR_TOKEN'),
+    vmTemplateId: process.env.VM_TEMPLATE_ID,
+    vmTemplateDigest: process.env.VM_TEMPLATE_DIGEST,
+    vmMaxActive: process.env.VM_MAX_ACTIVE,
+    vmCpus: process.env.VM_CPUS,
+    vmMemoryBytes: process.env.VM_MEMORY_BYTES,
+    vmDiskBytes: process.env.VM_DISK_BYTES,
+    vmPoolReserveBytes: process.env.VM_POOL_RESERVE_BYTES,
+    vmMaxWorkspaceBytes: process.env.VM_MAX_WORKSPACE_BYTES,
+    vmInlineMaxBytes: process.env.VM_INLINE_MAX_BYTES,
     // An empty value must not coerce to 0, which would select immediate auto-close.
     recoverableGraceSeconds: process.env.WORKSPACE_RECOVERABLE_GRACE_SECONDS || undefined,
     lifecycleEnvironmentKeys: lifecycleEnvironmentKeys(),

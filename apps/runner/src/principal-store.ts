@@ -360,12 +360,17 @@ export function migratePrincipalSchema(database: DatabaseSync): void {
             mutation_lock_count INTEGER NOT NULL DEFAULT 0,
             generation INTEGER NOT NULL DEFAULT 1,
             error TEXT,
+            backend_kind TEXT NOT NULL DEFAULT 'docker' CHECK(backend_kind IN ('docker','incus-vm')),
+            vm_name TEXT,
+            backend_instance_id TEXT,
+            template_id TEXT,
+            template_digest TEXT,
             UNIQUE(owner_id, idempotency_key),
             UNIQUE(owner_id, id)
           );
 
           INSERT INTO workspaces_v6
-            (id, owner_id, idempotency_key, repository_url, repository_ref, container_name, workspace_path, environment_id, status, network_profile, created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, mutation_lock_count, generation, error)
+            (id, owner_id, idempotency_key, repository_url, repository_ref, container_name, workspace_path, environment_id, status, network_profile, created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, mutation_lock_count, generation, error, backend_kind, vm_name, backend_instance_id, template_id, template_digest)
           SELECT
             id, owner_id, idempotency_key, repository_url, repository_ref, container_name, workspace_path, environment_id, status,
             CASE
@@ -374,7 +379,8 @@ export function migratePrincipalSchema(database: DatabaseSync): void {
               WHEN network_mode = 'dependency-access' THEN 'dependency-access'
               WHEN network_mode = 'network-none' THEN 'network-none'
             END,
-            created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, COALESCE(mutation_lock_count, 0), generation, error
+            created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, COALESCE(mutation_lock_count, 0), generation, error,
+            backend_kind, vm_name, backend_instance_id, template_id, template_digest
           FROM workspaces;
 
           DROP TABLE workspaces;
@@ -1695,19 +1701,25 @@ export function downgradeStateSchemaToV5(database: DatabaseSync, allowDataLoss =
           mutation_lock_count INTEGER NOT NULL DEFAULT 0,
           generation INTEGER NOT NULL DEFAULT 1,
           error TEXT,
+          backend_kind TEXT NOT NULL DEFAULT 'docker' CHECK(backend_kind IN ('docker','incus-vm')),
+          vm_name TEXT,
+          backend_instance_id TEXT,
+          template_id TEXT,
+          template_digest TEXT,
           UNIQUE(owner_id, idempotency_key),
           UNIQUE(owner_id, id)
         );
 
         INSERT INTO workspaces_v5
-          (id, owner_id, idempotency_key, repository_url, repository_ref, container_name, workspace_path, environment_id, status, network_mode, created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, mutation_lock_count, generation, error)
+          (id, owner_id, idempotency_key, repository_url, repository_ref, container_name, workspace_path, environment_id, status, network_mode, created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, mutation_lock_count, generation, error, backend_kind, vm_name, backend_instance_id, template_id, template_digest)
         SELECT
           id, owner_id, idempotency_key, repository_url, repository_ref, container_name, workspace_path, environment_id, status,
           CASE
             WHEN network_profile = 'dependency-access' THEN 'bridge'
             ELSE 'none'
           END,
-          created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, mutation_lock_count, generation, error
+          created_at, last_activity_at, expires_at, hard_expires_at, git_author_name, git_author_email, mutation_locked_until, mutation_lock_count, generation, error,
+          backend_kind, vm_name, backend_instance_id, template_id, template_digest
         FROM workspaces;
 
         DROP TABLE workspaces;
