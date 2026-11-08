@@ -179,8 +179,11 @@ describe('managed package dispatch', () => {
     const f = setup(true);
     const releaseId = await install(f);
 
-    await (f.service as unknown as { createExecutor: (record: WorkspaceRecord, path: string) => Promise<string> })
-      .createExecutor(f.record, join(f.record.workspacePath, 'repo'));
+    // Phase-03 renamed the provisioning seam: the backend adapter now owns the
+    // docker create+start argv (package mounts, PATH, managed-path env), so the
+    // test drives provisionExecutor with an empty env — no env file, baked env.
+    await (f.service as unknown as { provisionExecutor: (record: WorkspaceRecord, environment: Record<string, string>) => Promise<string> })
+      .provisionExecutor(f.record, {});
 
     const create = docker.runDocker.mock.calls.map(([args]) => args).find((args) => args[0] === 'create')!;
     const target = `/opt/chm-packages/${releaseId}`;

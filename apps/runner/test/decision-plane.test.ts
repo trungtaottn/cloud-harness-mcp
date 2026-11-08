@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { RunnerConfigSchema, type DecisionAnswer, type DecisionRequest } from '@cloud-harness/contracts';
 import { DecisionPlane, type DecisionProvider, type DecisionTrace, type ProviderEvaluation } from '../src/decision-plane/decision-plane.js';
@@ -153,7 +154,7 @@ describe('JevDecisionProvider', () => {
     const provider = new JevDecisionProvider({ apiKey: () => 'ts_key', secrets: () => ({ OWNER: 'owner-secret-value' }), fetchImpl });
     const result = await provider.evaluate({
       purpose: 'failure-classification',
-      state: 'stderr: token owner-secret-value and ghp_abcdefghijklmnopqrstuvwxyz0123',
+      state: 'stderr: token owner-secret-value and ghp_abcdefghijklmnop',
       questions: [
         { kind: 'choice', key: 'pick', question: 'Which?', options: { a: 'workspace-secret-value', b: 'other' } },
         { kind: 'boolean', key: 'clear', question: 'Clear?' },
@@ -163,7 +164,7 @@ describe('JevDecisionProvider', () => {
     const wire = JSON.stringify(bodies[0]);
     expect(wire).not.toContain('owner-secret-value');
     expect(wire).not.toContain('workspace-secret-value');
-    expect(wire).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123');
+    expect(wire).not.toContain('ghp_abcdefghijklmnop');
     expect(bodies[0]).toMatchObject({
       model: 'jev-latest',
       questions: {
@@ -338,7 +339,7 @@ describe('decision plane review hardening', () => {
   };
 
   it('redacts output before cutting the tail, so a secret straddling the boundary leaves no fragment', async () => {
-    const secret = 'Q7wZr2Lp9XvK4mTn8BcY1dHs6JfG3aEu';
+    const secret = randomBytes(16).toString('hex');
     const bodies: string[] = [];
     const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
       bodies.push(String(init?.body));
@@ -372,7 +373,7 @@ describe('decision plane review hardening', () => {
   });
 
   it('keeps redacting the plane key when a caller secret reuses its name', async () => {
-    const planeKey = 'Pl4neKeyValueThatMustNeverLeave99';
+    const planeKey = 'plane-key-fixture-value-that-stays';
     let seen = '';
     const provider: DecisionProvider = {
       name: 'capture',
@@ -397,7 +398,7 @@ describe('decision plane review hardening', () => {
   });
 
   it('redacts the plane-owned secrets from tool descriptions before they are shortened', async () => {
-    const secret = 'Hk3Vn8Qz1Wr5Ty7Ui9Op2As4Df6Gh0Jl';
+    const secret = randomBytes(16).toString('hex');
     let seen = '';
     const provider: DecisionProvider = {
       name: 'capture',

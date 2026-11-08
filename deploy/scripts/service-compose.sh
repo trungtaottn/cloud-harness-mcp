@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_DIR=/etc/cloud-harness-mcp
+CONFIG_DIR="${CLOUD_HARNESS_CONFIG_DIR:-/etc/cloud-harness-mcp}"
 STATE_DIR=/var/lib/cloud-harness
 ENV_FILE="${CLOUD_HARNESS_ENV_FILE:-$CONFIG_DIR/runtime.env}"
 
@@ -17,6 +17,20 @@ if [[ -f "$CONFIG_DIR/ingress.conf" ]]; then
       source "$CONFIG_DIR/tunnel.env"
       export CLOUDFLARE_TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-}"
     fi
+  fi
+fi
+
+# Operator opt-in for the Incus VM backend: a marker file in the root-owned
+# config directory keeps the supervisor socket mount across deploys, restarts,
+# and rollbacks (creation is an operator action; the check is existence-only).
+# The overlay file must exist in the active checkout — releases predating it
+# stay Docker-only instead of failing every compose call, and the warning
+# keeps the absent mount visible rather than silently advertising VM support.
+if [[ -f "$CONFIG_DIR/vm.enabled" ]]; then
+  if [[ -f compose.vm.yaml ]]; then
+    compose_files+=("-f" "compose.vm.yaml")
+  else
+    echo "cloud-harness: $CONFIG_DIR/vm.enabled is set but this checkout has no compose.vm.yaml; the VM backend mount stays absent" >&2
   fi
 fi
 

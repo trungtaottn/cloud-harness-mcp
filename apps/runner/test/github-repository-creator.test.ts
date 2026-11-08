@@ -8,8 +8,8 @@ import { GitHubRepositoryCreator } from '../src/github-repository-creator.js';
 import { InMemoryGitHubInstallationStore, type VerifiedGitHubInstallation } from '../src/github-installation-store.js';
 import { StateStore } from '../src/state-store.js';
 
-const INSTALLATION_TOKEN = 'ghs_installationTokenSecretValue0123456789';
-const APP_JWT = 'eyJhbGciOiJSUzI1NiJ9.app-jwt-secret.signature';
+const INSTALLATION_TOKEN = 'fake-installation-token-not-a-credential';
+const APP_JWT = 'fake-app-jwt-not-a-credential';
 const githubApp = { appId: 123, privateKey: '-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----' } as NonNullable<RunnerConfig['githubApp']>;
 
 type Handler = (init: RequestInit) => Response | Promise<Response>;
@@ -347,11 +347,11 @@ describe('github_repository_create broker', () => {
   });
 
   it('never falls back to an operator GH_TOKEN when no GitHub App is configured', async () => {
-    const { creator, ownerId, calls } = fixture({ authMode: 'owner-bearer', githubApp: undefined, githubToken: 'ghp_operatorWideFallbackToken0123456789' });
+    const { creator, ownerId, calls } = fixture({ authMode: 'owner-bearer', githubApp: undefined, githubToken: 'operator-fallback-token-not-a-credential' });
     const result = await creator.create(ownerId, input());
     expect(result).toMatchObject({ ok: false, error: { code: 'NOT_SUPPORTED' } });
     expect(calls).toHaveLength(0);
-    expect(JSON.stringify(result)).not.toContain('ghp_operatorWideFallbackToken');
+    expect(JSON.stringify(result)).not.toContain('operator-fallback-token');
     expect(creator.capability(ownerId)).toMatchObject({ available: false, organizations: [] });
   });
 });

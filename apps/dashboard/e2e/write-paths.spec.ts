@@ -7,7 +7,7 @@ import { stubBff, watchForLeaks, writesTo } from './write-support';
 
 const CONFLICT = 'This item changed after you opened it. The latest version is loaded: review it before trying again.';
 const SECRET_VALUE = 'e2e-secret-value-not-real-91c4';
-const API_KEY = 'sk-e2e-wizard-key-not-real-5d20';
+const API_KEY = 'e2e-wizard-key-not-a-real-credential';
 
 const secret = (generation: number) => ({ id: 'sec_1', name: 'STRIPE_API_KEY', description: 'Payments', state: 'ACTIVE', version: generation, generation, createdAt: 1, updatedAt: 1 });
 const SECRETS = (generation: number) => answer(200, { data: { secrets: [secret(generation)], readiness: { ready: true } } });

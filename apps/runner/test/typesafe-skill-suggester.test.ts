@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { TypesafeSkillSuggester, parseAnswer, redactPrompt, type RosterEntry } from '../src/typesafe-skill-suggester.js';
 import { GATE_THRESHOLD, MAX_EGRESS_BYTES } from '../src/typesafe-questions.js';
 
-/** A provider key in the shape model-profile-state-repository would decrypt for the redactor. */
-const PROVIDER_KEY = 'sk-proj-abcdefghijklmnopqrstuvwxyz012345';
+/** The value model-profile-state-repository would decrypt for the redactor. */
+const PROVIDER_KEY = 'provider-key-fixture-not-a-real-credential';
 const WORKSPACE_SECRET = 'super-secret-workspace-value';
 const LONG_PROMPT = 'Refactor the authentication middleware so the deprecated option is removed.';
 
@@ -84,7 +84,7 @@ describe('answer parsing', () => {
 describe('prompt redaction', () => {
   it('replaces a known secret value and a recognisable key shape', () => {
     const result = redactPrompt({
-      prompt: `Use ${WORKSPACE_SECRET} and Bearer abcdefghijklmnopqrst for the call`,
+      prompt: `Use ${WORKSPACE_SECRET} and Bearer fake-bearer-token-123 for the call`,
       secrets: { WORKSPACE_TOKEN: WORKSPACE_SECRET }
     });
 

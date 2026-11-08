@@ -1,0 +1,18 @@
+# Opt-in Incus VM backend overlay. The supervisor socket mount exists ONLY
+# when this file is included — the Docker-default deployment never sees
+# /run/cloud-harness-vm and cannot create it.
+#
+#   # development
+#   docker compose -f compose.yaml -f compose.vm.yaml up -d
+#   # production (compose.production.yaml inherits the base file)
+#   docker compose -f compose.yaml -f compose.production.yaml -f compose.vm.yaml up -d
+#
+# The runner reaches the host vm-supervisor only through this socket
+# directory. The bearer token (VM_SUPERVISOR_TOKEN / VM_SUPERVISOR_TOKEN_FILE
+# in the shared env file) stays runner-only — compose.yaml blanks it for the
+# API regardless of this overlay. An absent supervisor stack simply leaves
+# the VM backend unavailable; Docker remains the default executor.
+services:
+  runner:
+    volumes:
+      - /run/cloud-harness-vm:/run/cloud-harness-vm

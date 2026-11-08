@@ -16,6 +16,8 @@ import { type BffEnvelope, bffPath } from '@/lib/bff-query';
 import { useBffMutation } from '@/lib/bff-mutation';
 import { pageReadQuery } from '@/lib/page-read';
 import { networkLabel, repositoryName, type Workspace, workspaceHasAction, workspaceStatusLabel } from '@/features/workspaces/workspace-model';
+import { BackendBadge } from '@/features/workspaces/backend-badge';
+import { backendKindOf, backendLabel, backendTemplateId } from '@/features/workspaces/workspace-model';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { COCKPIT_TABS, type CockpitSearch } from './cockpit-tab-registry';
 import { CockpitTabNav } from './cockpit-tab-nav';
@@ -130,6 +132,7 @@ function CockpitHeader({ workspace }: { workspace: Workspace }) {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <StatusBadge status={workspace.status} label={workspaceStatusLabel(workspace.status)} />
+          <BackendBadge workspace={workspace} />
           {canOpen ? (
             <Button asChild variant="outline" size="sm"><Link to="/workspaces">Open new workspace</Link></Button>
           ) : (
@@ -150,6 +153,7 @@ function CockpitHeader({ workspace }: { workspace: Workspace }) {
       </div>
       <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-4">
         <div><dt className="text-xs text-muted-foreground">Ref</dt><dd className="truncate">{workspace.ref ?? 'Default branch'}</dd></div>
+        <div><dt className="text-xs text-muted-foreground">Backend</dt><dd className="truncate">{backendLabel(backendKindOf(workspace))}{backendTemplateId(workspace) ? ` · ${backendTemplateId(workspace)}` : ''}</dd></div>
         <div><dt className="text-xs text-muted-foreground">Network</dt><dd>{networkLabel(workspace.networkProfile)}</dd></div>
         <div><dt className="text-xs text-muted-foreground">Lease</dt><dd data-lease={lease.state} className={lease.state === 'expired' ? 'font-medium text-destructive' : lease.state === 'soon' ? 'font-medium text-warning' : undefined}>{lease.label}</dd></div>
         <div><dt className="text-xs text-muted-foreground">Attention</dt><dd>{attention.length ? `${attention.length} item(s) need attention` : 'Nothing needs attention'}</dd></div>

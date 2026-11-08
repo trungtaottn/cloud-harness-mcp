@@ -18,15 +18,17 @@ export default tseslint.config(
     ...reactHooks.configs.flat['recommended-latest']
   },
   {
-    files: ['worker/**/*.mjs', 'scripts/**/*.mjs', 'deploy/**/*.mjs', 'apps/dashboard/scripts/**/*.mjs', 'apps/dashboard/e2e/**/*.mjs'],
+    files: ['worker/**/*.mjs', 'scripts/**/*.mjs', 'deploy/**/*.mjs', 'apps/dashboard/scripts/**/*.mjs', 'apps/dashboard/e2e/**/*.mjs', 'apps/vm-supervisor/**/*.mjs'],
     languageOptions: {
       globals: {
         Buffer: 'readonly',
+        clearInterval: 'readonly',
         clearTimeout: 'readonly',
         console: 'readonly',
         fetch: 'readonly',
         process: 'readonly',
         Response: 'readonly',
+        setInterval: 'readonly',
         setTimeout: 'readonly',
         URL: 'readonly'
       }

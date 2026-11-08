@@ -112,7 +112,7 @@ test('a prepared mutation stays blocked until the owner confirms the exact reque
 
 test('a failed send tells the agent a fixed reason, never the server message', async ({ page }) => {
   const problems = watchConsole(page, { allow: [/status of 500/] });
-  const SERVER_SECRET = 'sk-e2eSENTINELabcdefghijklmnop';
+  const SERVER_SECRET = 'e2e-fake-server-secret-not-real';
   const recorded = await stubBff(page, {
     reads: { '/projects': answer(200, projects) },
     writes: { 'POST /projects': answer(500, { error: 'internal_error', message: `upstream said: ${SERVER_SECRET}` }) }
@@ -128,7 +128,7 @@ test('a failed send tells the agent a fixed reason, never the server message', a
   // The owner sees the server's message; the agent gets fixed text with the status and code.
   await expect(page.getByRole('region', { name: /Notifications/ }).getByText(`upstream said: ${SERVER_SECRET}`)).toBeVisible();
   await expect.poll(async () => (await gatewayMessages(page)).some((message) => message.includes('dewee-action-result') && message.includes('HTTP 500, internal_error'))).toBe(true);
-  expect((await gatewayMessages(page)).filter((message) => message.includes('SENTINEL'))).toEqual([]);
+  expect((await gatewayMessages(page)).filter((message) => message.includes(SERVER_SECRET))).toEqual([]);
   expect(problems).toEqual([]);
 });
 

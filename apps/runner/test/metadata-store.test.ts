@@ -309,7 +309,7 @@ describe('MetadataStore', () => {
     expect(rotated.version).toBe(2);
 
     const bulkResults = store.secrets.bulkApply(owner, environment.id, [
-      { name: 'STRIPE_KEY', value: 'sk_test_123', description: 'Stripe API key', action: 'create', expectedGeneration: 0 },
+      { name: 'STRIPE_KEY', value: 'stripe-test-key-fixture-value', description: 'Stripe API key', action: 'create', expectedGeneration: 0 },
       { name: 'DB_PASS', value: 'bulk_rotated_pass', description: 'Bulk rotated', action: 'rotate', expectedGeneration: rotated.generation }
     ]);
     expect(bulkResults).toHaveLength(2);

@@ -1,0 +1,61 @@
+[Unit]
+Description=Cloud Harness VM supervisor (Incus backend control plane)
+Documentation=https://github.com/lebear/cloudharness-vm
+# The supervisor is the ONLY component that talks to Incus: it owns the
+# runner-facing Unix socket, the durable journal, admission, leases, exec/PTY
+# proxying, file transfer, vm.export, and the in-process network-guard hooks.
+# It starts after Incus is up. Ordering vs cloud-harness-vm-guard.service is
+# soft: the supervisor's vm.start gate performs its own LIVE attestation and
+# never treats the guard-state.json file as start authorization. The guard
+# unit filename uses a hyphen (cloud-harness-vm-guard.service) — keep this
+# reference in sync or the ordering silently no-ops.
+After=network-online.target incus.service cloud-harness-vm-guard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+# Supervisor-scoped VM_* configuration. Required keys: VM_SUPERVISOR_TOKEN
+# (or VM_SUPERVISOR_TOKEN_FILE pointing at a root-owned 0600 file),
+# VM_INCUS_PROJECT (dedicated project, never "default"), VM_TEMPLATE_ID and
+# VM_TEMPLATE_DIGEST (the trusted template allowlist). Optional overrides:
+# VM_SUPERVISOR_SOCKET (default /run/cloud-harness-vm/supervisor.sock),
+# VM_SUPERVISOR_STATE_DIR (default /var/lib/cloud-harness-vm),
+# VM_INCUS_SOCKET (default /var/lib/incus/unix.socket),
+# VM_GUARD_STATE_PATH, VM_BRIDGE_PATTERN, VM_SUBNET_PLAN, VM_UPLINK,
+# VM_DNS_RESOLVERS, VM_NONPUBLIC_CIDRS, VM_POOL_PATH, VM_MAX_TTL_SECONDS,
+# VM_MAX_ACTIVE, VM_CPUS, VM_MEMORY_BYTES, VM_DISK_BYTES,
+# VM_POOL_RESERVE_BYTES.
+EnvironmentFile=-/etc/cloud-harness-vm/supervisor.env
+ExecStart=/usr/bin/node /opt/cloud-harness-vm/repo/apps/vm-supervisor/dist/index.js
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+# The supervisor needs Incus unix-socket access and CAP_NET_ADMIN for the
+# in-process guard hooks (nft/iptables/ip); it must NOT gain privileges it
+# does not need.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+# /run is a tmpfs wiped on reboot and install-time mkdir does not survive it.
+# The supervisor binds /run/cloud-harness-vm/supervisor.sock and its
+# in-process guard hooks share claims/verdict/guard.flock in the same
+# directory — it must exist at unit start EVEN WHEN THE GUARD IS ABSENT,
+# masked, failed, or below its nft floor (the supervisor never Requires the
+# guard). RuntimeDirectory creates it before ExecStart; Preserve=yes is
+# mandatory because the directory is SHARED — without it a supervisor stop
+# would delete the guard's live claims/lock/socket. The guard unit declares
+# the same pair; whichever unit starts first creates it and neither stop
+# removes it before the next boot.
+RuntimeDirectory=cloud-harness-vm
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/cloud-harness-vm /var/lib/cloud-harness-vm
+# If VM_SUPERVISOR_SOCKET, VM_SUPERVISOR_STATE_DIR, VM_GUARD_STATE_PATH or
+# VM_POOL_PATH live outside those two directories, add a drop-in with the
+# matching RuntimeDirectory/ReadWritePaths entries.
+
+[Install]
+WantedBy=multi-user.target
