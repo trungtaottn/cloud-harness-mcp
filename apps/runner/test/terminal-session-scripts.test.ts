@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { KILL_SESSION_SCRIPT, TERMINAL_PID_DIR, terminalCommand } from '../src/docker-pty.js';
+import { KILL_SESSION_SCRIPT, TERMINAL_PID_DIR, ptyArgvCommand, terminalCommand } from '../src/docker-pty.js';
 
 /**
  * Runs the real shell launcher and session-kill scripts on the host, with the executor's fixed paths moved into
@@ -61,6 +61,21 @@ async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
+
+describe('ptyArgvCommand', () => {
+  it('keeps session-pid recording, then execs the caller argv verbatim', () => {
+    const command = ptyArgvCommand('term_argv', ['/bin/bash', '-lc', 'npm test']);
+    expect(command[0]).toBe('/bin/bash');
+    expect(command[1]).toBe('-c');
+    const script = command[2]!;
+    // $0='terminal' and $1=terminalId are positional params; "${@:2}" is the argv.
+    expect(command[3]).toBe('terminal');
+    expect(command[4]).toBe('term_argv');
+    expect(command.slice(5)).toEqual(['/bin/bash', '-lc', 'npm test']);
+    expect(script).toContain('exec "${@:2}"');
+    expect(script).toContain(`${TERMINAL_PID_DIR}/"$1".pid`);
+  });
+});
 
 describe.skipIf(process.platform === 'win32')('terminal session scripts', () => {
   beforeEach(() => {
