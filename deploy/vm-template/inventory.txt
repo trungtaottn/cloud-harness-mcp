@@ -1,0 +1,95 @@
+# inventory.txt — canonical inventory contract for cloudharness-vm guests.
+#
+# This committed file is the SPECIFICATION, not a captured inventory: a real
+# inventory only exists after a live build (phase-11 gate). inventory.sh
+# inside the payload must emit every section and key listed here, in this
+# order, deterministically (LC_ALL=C, sorted tabular sections). Two builds
+# from identical inputs must produce byte-identical inventory output; the
+# sha256 of that output is the templateDigest recorded in the build
+# manifest (scripts/vm-template-build.sh build).
+#
+# Format: '## <section>' headers mirror `section <name>` calls in
+# inventory.sh; '- <key>' bullets are scalar keys the section must emit;
+# '- <rows>' marks a tabular section that must be non-empty.
+
+## template
+- template_id
+- template_version
+
+## os
+- id
+- version
+- codename
+- arch
+- kernel_release_host_visible
+
+## dpkg
+- rows
+
+## apt-mark-manual
+- rows
+
+## guest-files
+- rows
+
+## systemd-units
+- incus-agent.service
+- systemd-networkd.service
+- systemd-resolved.service
+- docker.service
+- containerd.service
+- ssh.service
+- cloud-init.service
+- qemu-guest-agent.service
+
+## network
+- resolv_conf_symlink
+- networkd_dir_listing
+- incus_agent_path
+
+## tools
+- node
+- npm
+- npx
+- bun
+- bunx
+- uv
+- uvx
+- pnpm
+- wrangler
+- gh
+- ak
+- git
+- docker
+- docker-buildx
+- docker-compose
+- go
+- python3
+- pip3
+- bwrap
+- jq
+- rg
+- ctags
+- make
+- gcc
+- psql
+- setsid
+- timeout
+- tar
+- unzip
+
+## identity
+- harness_passwd
+- harness_group
+- harness_in_docker_group
+- harness_sudo_nopasswd
+- workspace_mode
+- workspace_owner
+- opt_user_tools_mode
+- opt_user_tools_owner
+- var_cache_harness_mode
+- var_cache_harness_owner
+- tmp_cloud_harness_home_mode
+- tmp_cloud_harness_home_owner
+- profile_path_export
+- template_identity_file

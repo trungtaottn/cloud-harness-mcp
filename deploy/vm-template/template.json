@@ -1,0 +1,9 @@
+{
+  "templateId": "cloudharness-vm-debian13",
+  "version": "1",
+  "baseImage": "images:debian/13",
+  "baseImageFingerprint": "",
+  "publishAlias": "cloudharness-vm-debian13",
+  "architectures": ["amd64"],
+  "notes": "Clean Debian 13 VM template for the incus-vm executor backend. templateDigest is the sha256 of the canonical guest inventory produced by inventory.sh at build time; two builds must produce identical inventories. baseImage is a rolling alias: after the first live build records manifest.json baseImageFingerprint, pin it here (or pass --base-image/--expect-base-fingerprint) so reproducible builds resolve identical base content; build warns loudly while unpinned."
+}
