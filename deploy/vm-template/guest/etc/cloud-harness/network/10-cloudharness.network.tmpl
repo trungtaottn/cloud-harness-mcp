@@ -1,0 +1,26 @@
+# Cloud Harness workspace link — format template for the per-instance
+# systemd-networkd unit. At workspace provision time the cloud-harness-vm
+# supervisor renders the real unit from supervisor-owned settings and pushes
+# it to /etc/systemd/network/10-cloudharness.network inside the guest
+# (apps/vm-supervisor/src/guest-network.ts). This file documents that format
+# and backs the offline `vm-template-build.sh render-network` subcommand; it
+# is never installed as a live config inside a running guest.
+#
+# {{GUEST_MATCH_MAC}}  permanent MAC of the per-VM tap device
+# {{GUEST_CIDR}}       guest address/prefix, e.g. 10.203.71.2/30
+# {{GATEWAY}}          point-to-point gateway inside the /30
+# {{DNS_SERVERS}}      space-separated approved resolvers
+[Match]
+MACAddress={{GUEST_MATCH_MAC}}
+
+[Network]
+DHCP=no
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+DNS={{DNS_SERVERS}}
+
+[Address]
+Address={{GUEST_CIDR}}
+
+[Route]
+Gateway={{GATEWAY}}
