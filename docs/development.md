@@ -239,6 +239,20 @@ docker compose down
 Do not leave watch processes or Compose stacks running after the task that
 started them.
 
+### Incus VM backend development
+
+The `incus-vm` executor backend is opt-in and off by default; focused unit
+tests cover its contracts without Incus:
+`apps/runner/test/vm-capabilities.test.ts`,
+`apps/runner/test/vm-supervisor-client.test.ts`, the supervisor suites under
+`apps/vm-supervisor/test/` (including `test/network/` for the egress guard's
+nft/iptables programming), the API projection tests
+`apps/api/test/dashboard-vm-backend.test.ts`, and the deploy-wrapper overlay
+fixtures in `test/deploy-vm-overlay.test.ts`. Live Incus, firewall, supervisor,
+and workspace gates are owner-authorized operations described in
+[deployment](deployment.md) and [operations](operations.md); do not run them
+from an ordinary code task.
+
 ## Contribution boundary
 
 This is a public MIT-licensed repository. Keep behavior changes in source and

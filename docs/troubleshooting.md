@@ -133,6 +133,47 @@ Never paste tokens, authorization codes, or callback URLs carrying `code` or
 - Private clone failure requires all GitHub App settings, installation access
   to the repository, and a valid PEM key. The optional path is not considered
   live-verified merely because configuration loads.
+- `VM_BACKEND_DISABLED` on `workspace_open` means `executionBackend:
+  'incus-vm'` was requested but the operator has not enabled the backend (or
+  the runner cannot resolve its supervisor stack). Docker workspaces are
+  unaffected; ask the operator to enable it per
+  [configuration](configuration.md#incus-vm-executor-backend-opt-in) or open
+  without the parameter.
+- `VM_CAPABILITY_UNSUPPORTED` means the operation is declared unsupported on
+  that workspace's backend — on `incus-vm` v1 that is `packages-bind` and
+  dashboard repository-skill browsing (`dashboard-repo-skills`); the `skills_*`
+  MCP tools remain supported. Open a Docker workspace for the refused
+  operations.
+- `VM_QUOTA_EXCEEDED` means the single-VM admission bound is full; close the
+  active VM workspace or wait for it to expire.
+- `VM_UNKNOWN_STATE` and `VM_SUPERVISOR_UNAVAILABLE` are retryable: reconcile
+  with `workspace_status` first — `VM_UNKNOWN_STATE` means a mutation's outcome
+  is unknown and the record is retained, never auto-deleted.
+- `VM_GENERATION_MISMATCH`/`VM_IDENTITY_MISMATCH` (409) mean the workspace's
+  identity or generation fence moved; refetch `workspace_status` rather than
+  replaying the mutation.
+- `VM_ATTESTATION_FAILED` means the supervisor could not verify the VM
+  against the pinned template digest; treat the workspace as suspect and
+  contact the operator — do not retry blindly. One operator-side cause is a
+  host below the guard's floor (**nftables ≥ 1.0.7, kernel ≥ 6.3**): the
+  guard probes those versions before writing any payload and refuses to
+  start (`vm-guard-service prerequisites unmet`), so attestation can never
+  pass. Check `journalctl -u cloud-harness-vm-guard.service` for the
+  prerequisite failure and confirm `nft --version`/`uname -r` on the host.
+- `guard-lock-legacy-present` in the supervisor or guard journal means the
+  retired directory-protocol lock `/run/cloud-harness-vm/guard.lock` still
+  exists — the units refuse to mutate until an operator completes the
+  coordinated-stop migration in
+  [operations](operations.md#incus-vm-backend-operations), which preserves
+  the directory aside for review (rename to a unique
+  `guard.lock.retired-<timestamp>` path; never overwrite an existing archive,
+  never broad-delete). The code never moves or deletes it automatically.
+  `guard-lock-timeout` means a live holder exceeded
+  the bounded wait (a wedged holder frees the lock when its process exits);
+  `guard-lock-helper-missing` means `/usr/bin/flock` (util-linux) is absent
+  or not executable — an owner-prepared prerequisite the units verify but
+  never install, so resolution is owner-approved environment preparation.
+  Both fail closed by design.
 - In Access mode, GitHub login is not repository authorization. If the
   dashboard shows no grant, complete the principal-bound GitHub App setup:
   **Connect GitHub App**, then authorize with GitHub as the installation's

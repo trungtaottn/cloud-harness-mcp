@@ -87,6 +87,29 @@ Copy `.env.example` to `.env` and replace all `change-me` placeholder secrets be
 | `WORKSPACE_IDLE_TTL_SECONDS` | `300` | **Required** | Idle timeout: a workspace without tool activity for this long expires (30..43200, always capped by the wall TTL). |
 | `WORKSPACE_RECOVERABLE_GRACE_SECONDS` | `3600` | Optional | How long an expired workspace stays recoverable before auto-close (0..86400, default 3600). 0 closes clean expired workspaces on the next reaper pass; work that is not pushed is always retained. |
 | `MAX_ACTIVE_WORKSPACES_PER_OWNER` | `3` | **Required** | Concurrent active workspaces allowed per principal. Defaults to 3 when unset; set 1 to restore single-workspace behaviour. Each counted workspace can use up to 1 GiB of container memory, one CPU, and 256 pids, so size host memory for this limit times the expected simultaneous builds. |
+| `VM_BACKEND_ENABLED` | `false` | Optional | Incus VM backend (runner). Opt-in for NEWLY opened workspaces via workspace_open executionBackend='incus-vm'; Docker stays the default and existing Docker workspaces are unaffected. Enabling requires the supervisor token, template id, and template digest below or the runner refuses to start. At most one Incus VM is active globally; VM_MAX_ACTIVE is only an early UX pre-check — the host supervisor's own admission is authoritative. |
+| `VM_SUPERVISOR_SOCKET` | `/run/cloud-harness-vm/supervisor.sock` | Optional | Host supervisor Unix socket the runner dials for every VM operation. |
+| `VM_SUPERVISOR_TOKEN` | `—` | Optional | Shared secret authenticating runner -> supervisor calls. Runner and supervisor only; the api never receives it (blanked in Compose). Supports _FILE. |
+| `VM_TEMPLATE_ID` | `—` | Optional | Approved VM template identity; persisted on each VM workspace at admit and attested against the live Incus instance before use. Required when enabled. |
+| `VM_TEMPLATE_DIGEST` | `—` | Optional | Optional configuration. |
+| `VM_MAX_ACTIVE` | `1` | Optional | Early pre-check for concurrent VM workspaces (default 1; v1 admits at most one active VM globally until measured capacity permits more). |
+| `VM_CPUS` | `4` | Optional | EXPECTED guest sizing sent for attestation — the supervisor owns the actuals. |
+| `VM_MEMORY_BYTES` | `8589934592` | Optional | Optional configuration. |
+| `VM_DISK_BYTES` | `21474836480` | Optional | Optional configuration. |
+| `VM_POOL_RESERVE_BYTES` | `10737418240` | Optional | Host pool free-space floor at VM admission, in bytes. |
+| `VM_MAX_WORKSPACE_BYTES` | `12884901888` | Optional | Soft ceiling for guest-path workspace data (guest dockerd/PostgreSQL legitimately exceed the Docker maxWorkspaceBytes default); independent of MAX_WORKSPACE_BYTES. |
+| `VM_INLINE_MAX_BYTES` | `8388608` | Optional | Inline vs streamed file-transfer threshold for VM file operations. |
+| `VM_BRIDGE_PATTERN` | `chmbr%d` | Optional | Supervisor-side per-VM Linux bridge name pattern (exactly one %d slot for the subnet index). Like the remaining VM_* keys below, it is consumed by the host supervisor process, NOT the runner config schema; documented here because they share the VM_* namespace. |
+| `VM_SUBNET_PLAN` | `10.240.0.0/16` | Optional | Optional configuration. |
+| `VM_UPLINK` | `—` | Optional | Optional configuration. |
+| `VM_DNS_RESOLVERS` | `1.1.1.1,8.8.8.8` | Optional | Optional configuration. |
+| `VM_NONPUBLIC_CIDRS` | `—` | Optional | Optional configuration. |
+| `VM_POOL_PATH` | `/var/lib/incus-pool` | Optional | Optional configuration. |
+| `VM_MAX_TTL_SECONDS` | `—` | Optional | Optional configuration. |
+| `VM_SUPERVISOR_STATE_DIR` | `/var/lib/cloud-harness-vm` | Optional | Durable private state dir for the supervisor (holds the generated HMAC key). |
+| `VM_INCUS_SOCKET` | `/var/lib/incus/unix.socket` | Optional | Incus server socket and the dedicated managed project VMs are created in. |
+| `VM_INCUS_PROJECT` | `—` | Optional | Optional configuration. |
+| `VM_GUARD_STATE_PATH` | `/run/cloud-harness-vm/guard-state.json` | Optional | Guard attestation state the supervisor rewrites each pass. |
 | `DOCKER_ON_DEMAND` | `false` | Optional | Remote Docker host (runner): stop listing containers on the reaper once no workspace or toolbox call is live. |
 | `AGENT_GATEWAY_CONTAINER` | `—` | Optional | Model gateway container name to exec into directly when Compose project labels are unavailable. |
 | `TERMINAL_MAX_PER_WORKSPACE` | `4` | Optional | Dashboard Terminal (runner): live PTYs one workspace may hold; another open is refused with 429. |
